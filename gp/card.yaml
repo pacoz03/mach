@@ -1,15 +1,14 @@
-agent_id: agent:q8tmh75ewzbv
+agent_id: agent:ck9w60ejwnvw
 team: team:the-promptfather-s
 name: gp
-version: 1.0.0
+version: 1.0.1
 cap_versions:
   - "1.0"
 profiles:
   - mhm/1.0
-role: # TODO: assign a role to the agent
+role: gp
 capabilities:
-  - # TODO: assign capabilities to the agent
-  - # TODO: assign capabilities to the agent
+  - gp
 no_clinical_advice: true
 endpoints:
-  mailbox: agent:q8tmh75ewzbv
+  mailbox: agent:ck9w60ejwnvw
