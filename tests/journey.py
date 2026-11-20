@@ -75,6 +75,8 @@ AGENT_DIRS = {str(REPO / f / "agent") for f in FOLDERS}
 START = datetime(2026, 11, 23, 8, tzinfo=UTC)  # lunedì 08:00 di agenda
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CIT, NEED = "citizen:T-1", "N-2026-11-23-0001"
+# Centro prenotazioni di un'altra ASST: fuori dal bus, scriptato in Bus.foreign (R:191-195).
+FOREIGN = "agent:asst-altra-booking"
 MAX_TURNS = 200
 
 
@@ -133,7 +135,7 @@ class Ledger:
               "checkin": FACILITIES, "report": {"specialist_care"}}
 
     def __init__(self, sc: dict, ids: dict[str, str]) -> None:
-        self.now = START
+        self.now = START + timedelta(days=sc.get("late_days", 0))  # late_days: slot tutti passati
         self.rules = {"P1": "off", "P2": "off", "P3": "off", **sc.get("rules", {})}
         self.folder = {v: k for k, v in ids.items()}
         self.slots = {s["slot_id"]: s for s in make_slots(ids)}
@@ -279,6 +281,8 @@ class Agent:
                 for k in ("_PULL_PAUSE", "LEDGER_WAIT_SECONDS"):
                     if hasattr(m, k):
                         setattr(m, k, 0)
+                if hasattr(m, "_LLM_TIMEOUT"):  # il modello "timeout" non deve fermare la suite
+                    m._LLM_TIMEOUT = 0.2
             self.main = mod.main
         except Exception as exc:  # un brain rotto non deve fermare gli altri scenari
             self.error = f"{type(exc).__name__}: {exc}"
@@ -331,6 +335,23 @@ class Port:
     async def search(self, query):
         return [Peer(a.id, role=a.role, capabilities=a.caps)
                 for a in self.bus.agents.values() if a.id not in self.bus.down]
+
+
+class Llm:
+    """city.llm finto: la prima chiave di sc["llm"] contenuta nel messaggio dell'utente decide il
+    contenuto della risposta. Senza sc["llm"] il City non ha llm (CapError KEY_UNKNOWN, come senza
+    chiave del Gateway); "timeout" simula un modello lento."""
+
+    def __init__(self, bus: "Bus", script: dict[str, str]) -> None:
+        self.bus, self.script = bus, script
+
+    async def complete(self, sent, *, need_id=None):
+        user = next((m["content"] for m in reversed(sent) if m["role"] == "user"), "")
+        self.bus.llm_calls.append(user)
+        content = next((v for k, v in self.script.items() if k in user), "{}")
+        if content == "timeout":
+            await asyncio.sleep(30)
+        return {"model": "city-default", "content": content}
 
 
 class Citizen:
@@ -419,6 +440,9 @@ class Bus:
         self.oos: set[str] = set()
         self.crashes: list[str] = []
         self.turn, self.ledger_turns = 0, ledger_turns
+        self.llm = Llm(self, sc["llm"]) if "llm" in sc else None
+        self.llm_calls: list[str] = []
+        self.confirmed = False  # il centro dell'altra ASST ha già confermato
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -436,7 +460,7 @@ class Bus:
             self.crashes.append(f"{a.folder}: import fallito: {a.error}")
             return
         port = Port(self, a.id)
-        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m)
+        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm)
         with a.active():
             try:
                 await a.main(Need(summary=m.text, message=m), city)
@@ -446,14 +470,35 @@ class Bus:
                 self.crashes.append(f"crash {a.folder}: {traceback.format_exc().strip().splitlines()[-1]}")
 
     async def run(self, start: tuple[str, str]) -> None:
-        self.citizen.say(self.ids[start[0]], start[1])
-        while self.queue and self.turn < MAX_TURNS:
-            m = self.queue.popleft()
-            self.turn += 1
-            if m.recipient == CIT:
-                self.citizen.react(m)
-            elif m.recipient in self.agents and m.recipient not in self.down:
-                await self.deliver(m)
+        # sc["after"]: messaggi che il cittadino scrive al gp a percorso fermo (livello 3: grazie,
+        # domande, un secondo disturbo, un rinnovo chiesto a parole).
+        for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ()))):
+            if self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
+                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
+            else:
+                self.citizen.say(self.ids[to], text)
+            while self.queue and self.turn < MAX_TURNS:
+                m = self.queue.popleft()
+                self.turn += 1
+                if m.recipient == CIT:
+                    self.citizen.react(m)
+                elif m.recipient == FOREIGN:
+                    self.foreign(m)
+                elif m.recipient in self.agents and m.recipient not in self.down:
+                    await self.deliver(m)
+
+    def foreign(self, m: Message) -> None:
+        """Il centro di un'altra ASST (R:191-195): alla prima offerta rimanda la stessa richiesta
+        (consegna doppia: la struttura risponde una volta sola), poi conferma con il consenso."""
+        offers = parse_offers(m.text) if act(m) == "offer" else []
+        if not offers or self.confirmed:
+            return
+        self.confirmed = True
+        o = offers[0]
+        confirm = (f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen={CIT} "
+                   "consent_ref=cons-X-1 prescription_number=RX-X-1")
+        for text in (self.citizen.sc["start"][1], confirm):
+            self.queue.append(self.add(FOREIGN, m.sender, {"text": text}))
 
 
 # --- asserzioni --------------------------------------------------------------------------------
@@ -479,6 +524,8 @@ def general(b: Bus) -> list[str]:
         f, kind = fields(m.text), act(m)
         if kind == "booking.receipt" and not before("commit", "hold_id", f.get("booking_id"), i):
             errs.append(f"{b.name(m.sender)}: booking.receipt booking_id={f.get('booking_id')} senza commit prima (R:241)")
+        if m.recipient == FOREIGN and kind == "offer":  # offerte cross-ASST (R:192)
+            offered.update(o.get("slot_id") for o in parse_offers(m.text))
         if m.recipient != CIT:
             continue
         if f.get("booking_id") and f["booking_id"] not in L.holds:
@@ -538,6 +585,38 @@ def never_told(folder: str, *subs: str, cite: str):
         for m in b.log:
             if m.sender == b.ids[folder] and m.recipient == CIT and any(s in m.text for s in subs):
                 return f"{folder} ha detto «{m.text[:60]}» ({cite})"
+    return check
+
+
+def told_text(folder: str, sub: str, cite: str):
+    def check(b: Bus) -> str | None:
+        if not any(m.sender == b.ids[folder] and m.recipient == CIT and sub in m.text for m in b.log):
+            return f"{folder} non ha mai scritto «{sub}» al cittadino ({cite})"
+    return check
+
+
+def llm_read(text: str, times: int):
+    """Quante volte il modello ha letto ``text``: 0 = le regole bastavano (regole prima, R:LLM)."""
+    def check(b: Bus) -> str | None:
+        n = sum(text in call for call in b.llm_calls)
+        if n != times:
+            return f"city.llm ha letto «{text[:40]}» {n} volte invece di {times}"
+    return check
+
+
+def writes(op: str, n: int, cite: str):
+    def check(b: Bus) -> str | None:
+        got = sum(w["op"] == op and not w["code"] for w in b.ledger.writes)
+        if got != n:
+            return f"{got} {op} accettati sul Ledger invece di {n} ({cite})"
+    return check
+
+
+def asked_ledger(folder: str, *tokens: str):
+    """Una lettura sul Ledger (le letture non finiscono in ledger.writes)."""
+    def check(b: Bus) -> str | None:
+        if not any(m.sender == b.ids[folder] and m.recipient == LEDGER and has(m.text, tokens) for m in b.log):
+            return f"{folder} non ha mai chiesto «{' '.join(tokens)}» al Ledger"
     return check
 
 
@@ -612,11 +691,78 @@ def checkin_refused(b: Bus) -> str | None:
         return f"hospital non ha dato il motivo del rifiuto: «{after[0].text[:80]}»"
 
 
+# Chiave dell'offerta -> campo dello slot del Ledger: ogni altro attributo è inventato (R:243).
+SLOT_KEYS = {"slot_id": "slot_id", "doctor_id": "doctor_id", "facility": "facility", "procedure": "procedure",
+             "agenda_date": "at", "expiry": "at", "agenda_day": "day"}
+
+
+def cross_reply(rid: str, priority: str | None):
+    """R:191-192: una sola risposta dell'ospedale al centro dell'altra ASST per ``rid``.
+    ``priority``: le offerte attese (1-3 slot suoi, solo campi del Ledger); None: il cancel."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        got = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN and f"request_id={rid}" in m.text.split()]
+        if len(got) != 1:
+            return f"hospital ha risposto {len(got)} volte alla richiesta {rid} invece di una (R:192)"
+        m, offers = got[0], parse_offers(got[0].text)
+        if re.search(r"\b(?:prescription_number|citizen|patient)=", m.text):
+            return f"dati del cittadino nella risposta cross-ASST: «{m.text[:80]}» (R:191)"
+        if priority is None:
+            if act(m) != "cancel" or offers or not has(m.text, ("reason=no_availability",)):
+                return f"atteso cancel reason=no_availability request_id={rid}: «{m.text[:80]}»"
+            return None
+        if act(m) != "offer" or not 1 <= len(offers) <= 3:
+            return f"hospital non ha offerto da 1 a 3 slot: «{m.text[:80]}»"
+        for o in offers:
+            s = b.ledger.slots.get(o.get("slot_id", ""))
+            if s is None or s["facility"] != hosp:
+                return f"offerto uno slot non dell'ospedale: {o.get('slot_id')}"
+            if o.get("request_id") != rid or o.get("priority") != priority or not o.get("offer_id"):
+                return f"offerta senza request_id={rid}, priority={priority} o offer_id: {o}"
+            for k, v in o.items():
+                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                    return f"attributo {k}={v} non dal Ledger (R:243)"
+    return check
+
+
+def hospital_to_gp(expected: bool):
+    """Il gp sa della prenotazione solo se è del nostro centro: il cittadino di un'altra ASST
+    non è suo paziente (R:243 over-disclosure)."""
+    def check(b: Bus) -> str | None:
+        sent = any(m.sender == b.ids["hospital"] and m.recipient == b.ids["gp"] for m in b.log)
+        if sent and not expected:
+            return "hospital ha scritto al nostro gp per una prenotazione di un'altra ASST (R:243)"
+        if expected and not sent:
+            return "hospital non ha avvisato il nostro gp della prenotazione del nostro centro (R:249)"
+    return check
+
+
+def receipt_to_foreign(b: Bus) -> str | None:
+    if not any(m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+               and has(m.text, ("booking.receipt", "booking_id=", "ledger_ref=")) for m in b.log):
+        return "hospital non ha mandato booking.receipt al centro dell'altra ASST (R:195)"
+
+
+def no_world_of(proc: str):
+    def check(b: Bus) -> str | None:
+        if any(m.sender == b.ids["hospital"] and m.recipient == LEDGER and f"procedure={proc}" in m.text.split() for m in b.log):
+            return f"hospital ha letto world procedure={proc}: slot di un'altra struttura"
+    return check
+
+
+XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={rid} Buongiorno, cerchiamo disponibilità."
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
 ARRIVO = "Buongiorno, sono arrivata per la visita di fisiatria."
 ORARIO = "A che ora devo presentarmi?"
 # Livello 3, check-in in ospedale (il testo `checkin booking_id=` è felice_fisiatria).
 CHECKED_IN = [wrote("checkin", "R:219/234", citizen=CIT), told("hospital", "checkin", "booking_id=", cite="R:234")]
+LOMBARE = "Mi fa malissimo la zona lombare quando mi alzo dal letto"
+KNEE_EN = "Hello, I twisted it while running and now it is swollen and I limp"
+PECHO = "Tengo un dolor muy fuerte en el pecho desde esta mañana"
+RODILLA = "Me duele la rodilla cuando subo escaleras"
+GRAZIE = "Grazie mille! E adesso cosa devo fare?"
+RINNOVO = "Il centro prenotazioni dice che la ricetta è scaduta, me la può rinnovare?"
+NONE_IT = '{"code": "NONE", "red_flag": false, "lang": "it"}'
 SCENARIOS: dict[str, dict] = {
     "felice_fisiatria": dict(start=BACK, expect=[
         wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), wrote("checkin", "R:234")]),
@@ -641,11 +787,57 @@ SCENARIOS: dict[str, dict] = {
     "injection_slot": dict(start=BACK, inject=True, expect=[wrote("commit", "R:243")]),
     "gp_handoff": dict(start=BACK, handoff=True, expect=[
         handed_over, wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
-    "checkin_body": dict(start=BACK, checkin="body", expect=CHECKED_IN),
+    "checkin_body": dict(start=BACK, checkin="body", expect=[*CHECKED_IN, hospital_to_gp(True)]),
     "checkin_libero": dict(start=BACK, checkin="libero", expect=CHECKED_IN),
     "domanda_orario": dict(start=BACK, checkin="orario", expect=[answered_time, *CHECKED_IN]),
     "checkin_rifiutato": dict(start=BACK, refuse_checkin=CHECKIN_REFUSED, expect=[
         wrote("commit", "R:241"), checkin_refused]),
+    # Livello 3: il cittadino scrive con parole sue. Le regole non trovano il sintomo, il modello sì.
+    "gp_testo_libero": dict(start=("gp", LOMBARE), llm={LOMBARE: '{"code": "SYM-BACK", "red_flag": false, "lang": "it"}'},
+                            expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"),
+                                    wrote("checkin", "R:234"), llm_read(LOMBARE, 1)]),
+    "gp_testo_libero_en": dict(start=("gp", KNEE_EN), llm={KNEE_EN: '<think>knee</think> {"code":"SYM-KNEE","red_flag":false,"lang":"en"}'},
+                               expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
+                                       told_text("gp", "I understand your concern", cite="lang en")]),
+    "gp_regole_prima": dict(start=BACK, llm={BACK[1]: '{"code": "SYM-KNEE"}'}, expect=[
+        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 0)]),
+    "gp_red_flag_modello": dict(start=("gp", PECHO), llm={PECHO: '{"code": "NONE", "red_flag": true, "lang": "es"}'},
+                                expect=[told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442")]),
+    # Codice inventato dal modello o Gateway giù: nessuna ricetta, il gp chiede il motivo (mai muto).
+    "gp_modello_inventa": dict(start=("gp", LOMBARE), llm={LOMBARE: '{"code": "SYM-HEAD", "red_flag": "no"}'},
+                               expect=[no_write("prescribe", "AGENT.md 9"), told_text("gp", "disturbo", cite="R:248")]),
+    "gp_modello_lento": dict(start=("gp", LOMBARE), llm={LOMBARE: "timeout"},
+                             expect=[no_write("prescribe", "AGENT.md 9"), told_text("gp", "disturbo", cite="R:248")]),
+    "gp_senza_modello": dict(start=("gp", LOMBARE), expect=[no_write("prescribe", "AGENT.md 9"),
+                                                             told_text("gp", "disturbo", cite="R:248")]),
+    # Livello 3, dopo la ricetta: il cittadino riscrive al gp. Mai muto, mai una ricetta di troppo.
+    "gp_dopo_grazie": dict(start=BACK, handoff=True, after=[GRAZIE], llm={GRAZIE: NONE_IT}, expect=[
+        writes("prescribe", 1, "una sola ricetta"), told_text("gp", "già pronta", cite="R:248"),
+        told_text("gp", "centro prenotazioni l'ha già ricevuta", cite="handoff")]),
+    "gp_stesso_sintomo": dict(start=BACK, after=["Il mal di schiena non passa, quando mi chiamano?"], expect=[
+        writes("prescribe", 1, "stesso motivo"), told_text("gp", "già pronta", cite="R:248")]),
+    "gp_secondo_sintomo": dict(start=BACK, handoff=True, after=["Ho anche male al ginocchio, serve un'altra ricetta?"],
+                               expect=[writes("prescribe", 2, "motivo nuovo"),
+                                       wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D")]),
+    "gp_rinnovo_a_parole": dict(start=BACK, handoff=True, after=[RINNOVO], llm={RINNOVO: NONE_IT}, expect=[
+        writes("prescribe", 2, "P1 a parole"), asked_ledger("gp", "prescription", "prescription_number=")]),
+    "gp_lingua_es": dict(start=("gp", RODILLA), llm={RODILLA: '{"code": "SYM-KNEE", "red_flag": false, "lang": "es"}'},
+                         expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
+                                 told_text("gp", "I understand your concern", cite="lingua")]),
+    "gp_red_flag_en": dict(start=("gp", "I have a crushing chest pain since this morning"), expect=[
+        told_text("gp", "Call 112", cite="R:242"), no_write("prescribe", "R:442")]),
+    # Cross-ASST (R:191-195): il centro di un'altra ASST chiede slot all'ospedale, poi conferma.
+    "cross_asst_prenota": dict(
+        start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-1")), foreign=True,
+        expect=[cross_reply("R-1", "B"), wrote("hold", "R:194", citizen=CIT),
+                wrote("commit", "R:194", consent_ref="cons-X-1"), receipt_to_foreign, hospital_to_gp(False),
+                *CHECKED_IN]),
+    "cross_asst_nessuno": dict(
+        start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-2")), foreign=True,
+        late_days=15, expect=[cross_reply("R-2", None), no_write("hold", "R:192")]),
+    "cross_asst_altra_struttura": dict(
+        start=("hospital", XREQ.format(svc="specialist_care.cardiology", proc="VIS-CARD", rid="R-3")),
+        foreign=True, expect=[cross_reply("R-3", None), no_world_of("VIS-CARD")]),
 }
 
 
