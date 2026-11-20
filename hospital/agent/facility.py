@@ -254,6 +254,23 @@ def fields_of(text: str) -> dict[str, str]:
     return found
 
 
+_IT_DAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri", "sab": "sat", "dom": "sun"}
+
+
+def _slot(line: str) -> dict[str, str]:
+    """A Ledger slot row with our keys ``at``/``day``/``free``, from the kit example's format or
+    the Ledger schema's ``agenda_date``/``agenda_day``/``capacity`` (ledger.py Slot)."""
+
+    slot = fields_of(line)
+    for key, alias in (("at", "agenda_date"), ("day", "agenda_day"), ("free", "capacity")):
+        if key not in slot and alias in slot:
+            slot[key] = slot[alias]
+    if "day" in slot:
+        day = slot["day"].lower()[:3]  # Monday, MON, lunedì -> mon
+        slot["day"] = _IT_DAYS.get(day, day)
+    return slot
+
+
 def _fields(row: Message) -> dict[str, str]:
     fields = fields_of(row.text)
     for key, value in row.body.items():
@@ -414,7 +431,7 @@ def fitting(
     earliest = now + _LEAD
     chosen: list[tuple[datetime, dict[str, str]]] = []
     for line in lines:
-        slot = fields_of(line)
+        slot = _slot(line)
         slot_id = slot.get("slot_id")
         doctor = slot.get("doctor_id")
         at = _when(slot.get("at", ""))
@@ -452,13 +469,21 @@ def _ledger(chat: list[Message], head: str) -> dict[str, str] | None:
     for row in chat:
         if row.sender == LEDGER and first_word(row.text) == head:
             found = fields_of(row.text)
+    if found is not None and head == "agenda" and "agenda_now" not in found:
+        found["agenda_now"] = found.get("agenda_date", "")
     return found
 
 
 def _latest_slots(chat: list[Message]) -> str | None:
+    """The latest ``world`` answer: ``slots page=N/M`` (kit example) or ``world slots=N``
+    (Ledger schema, city_sdk ports.py), then one ``slot_id=`` row per slot."""
+
     found: str | None = None
     for row in chat:
-        if row.sender == LEDGER and first_word(row.text) == "slots":
+        head = first_word(row.text)
+        if row.sender == LEDGER and (head == "slots" or head == "world" and (
+            "slots" in fields_of(row.text.split("\n", 1)[0]) or "slot_id=" in row.text
+        )):
             found = row.text
     return found
 
@@ -1177,7 +1202,7 @@ async def _on_held(city: City, message: Message, chat: list[Message]) -> None:
 
 async def _on_committed(city: City, message: Message, chat: list[Message]) -> None:
     fields = fields_of(message.text)
-    booking_id = fields.get("booking_id", "")
+    booking_id = fields.get("booking_id") or fields.get("hold_id", "")
     ledger_ref = fields.get("ledger_ref", "")
     if not booking_id or not ledger_ref:
         return

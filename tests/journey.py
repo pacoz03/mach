@@ -1,6 +1,6 @@
 """Percorsi multi-agente in locale: i 5 brain veri in un processo, bus in memoria, Ledger finto.
 
-    ~/.local/share/uv/tools/city-cli/bin/python -B tests/journey.py [-k nome] [-v] [--ledger-turns]
+    ~/.local/share/uv/tools/city-cli/bin/python -B tests/journey.py [-k nome] [-v] [--ledger-turns] [--ledger-format sdk]
 
 Ogni scenario ricarica i brain, fa parlare un cittadino scriptato e controlla le scritture sul
 Ledger e i messaggi contro la rubrica. R:<riga> = mach-hackathon-kit/docs/kit/e19-rules.md.
@@ -47,6 +47,13 @@ REPLY = {
     "checked_in": "checked_in booking_id={booking_id} citizen={citizen} slot_id={slot_id}",
     "reported": "reported booking_id={booking_id} outcome_code={outcome_code} shared={shared}",
     "refused": "refused {op} code={code}",  # + i token identificativi della richiesta
+}
+# --ledger-format sdk: `world slots=N` (city_sdk/ports.py:107) e lo Slot dello schema
+# (ledger.py:107-121, capacity>=1: gli slot presi non compaiono).
+SDK_REPLY = {
+    "slots": "world slots={count} page={page}/{pages}",
+    "slot": "slot_id={slot_id} doctor_id={doctor_id} facility={facility} procedure={procedure} "
+    "agenda_date={at} agenda_day={day} capacity={free}",
 }
 DOCTOR_ID = "D-{key}"  # i brain usano l'ultimo pezzo dopo '-' come chiave di _DOCTORS
 # Medici e giorni copiati da _DOCTORS dei brain, procedure dal PROTOCOL del gp: anche questi
@@ -232,7 +239,8 @@ class Ledger:
         if op == "world":
             rows = sorted((s for s in self.slots.values()
                            if f.get("procedure", s["procedure"]) == s["procedure"]
-                           and f.get("facility", s["facility"]) == s["facility"]),
+                           and f.get("facility", s["facility"]) == s["facility"]
+                           and not (REPLY["slots"] == SDK_REPLY["slots"] and self.taken(s["slot_id"]))),
                           key=lambda s: (s["at"], s["slot_id"]))
             page = int(f["page"]) if f.get("page", "").isdigit() else 1
             pages = max(1, -(-len(rows) // PAGE))
@@ -572,7 +580,11 @@ def main() -> int:
     ap.add_argument("-k", help="solo gli scenari il cui nome contiene questo testo")
     ap.add_argument("-v", action="store_true", help="stampa il trascritto")
     ap.add_argument("--ledger-turns", action="store_true", help="la risposta del Ledger apre anche un turno")
+    ap.add_argument("--ledger-format", choices=("kit", "sdk"), default="kit",
+                    help="sdk: risposta a world nel formato dello schema del Ledger")
     args = ap.parse_args()
+    if args.ledger_format == "sdk":
+        REPLY.update(SDK_REPLY)
     for k in ("CITY_ENV", "TEAM_MEMORY"):
         os.environ.pop(k, None)
     failed = 0
