@@ -874,44 +874,26 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     )
 
 
-_RECEIPT_TRIES = 8  # two seconds
-_RECEIPT_RACE = 30.0  # seconds between a receipt and a cancel that are one event
-
-
-def _just_booked(chat: list[Message], cancel: Message) -> bool:
-    """The facility that sent ``cancel`` also sent a receipt for this case around the same time.
-    A cancel long after the receipt is a real one (the facility dropped a booked visit)."""
-
-    at = _stamp(cancel.sent_at)
-    for row in chat:
-        if row.sender == cancel.sender and first_word(row.text) == "booking.receipt":
-            then = _stamp(row.sent_at)
-            if at is None or then is None or (at - then).total_seconds() < _RECEIPT_RACE:
-                return True
-    return False
-
-
-def _stamp(text: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
-
-
 async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> None:
     offer_id = fields_of(message.text).get("offer_id", "")
     citizen = _citizen(chat)
     # P1: the Ledger refused the commit because the prescription expired. The GP renews it.
     expired = "PRESCRIPTION_EXPIRED" in message.text.upper()
     told = _sent(message.need_id or message.msg_id).cancelled
-    if not expired and citizen:
-        # A facility can refuse a second hold on the slot it is committing for this same citizen
-        # (journey 0112: its cancel and its receipt left in the same second, and we offered six
-        # more slots to someone already booked). Give the receipt a moment, then believe it.
-        booked = lambda rows: _just_booked(rows, message)  # noqa: E731
-        if not booked(chat):
-            chat = await _until(city, message.need_id, chat, booked, tries=_RECEIPT_TRIES)
-        if booked(chat):
+    if fields_of(message.text).get("reason", "").upper() == "DUPLICATE":
+        # The Ledger refused a second commit on a prescription it has already booked (journey
+        # 0112: the facility sent this with its receipt, and we offered six more slots to a
+        # booked citizen). The visit stands: nothing to tell, nothing to offer. A cancel with
+        # any other reason is a real one (from level 6 the city cancels the first booking).
+        # With no receipt in the case after a short wait, the booking is not ours to trust:
+        # then this is handled as any other cancel.
+        def booked(rows: list[Message]) -> bool:
+            return any(
+                row.sender.startswith("agent:") and first_word(row.text) == "booking.receipt"
+                for row in rows
+            )
+
+        if booked(chat) or booked(await _until(city, message.need_id, chat, booked, tries=8)):
             return
     if (
         offer_id
@@ -938,15 +920,47 @@ _SERVICES = {
     "CTRL-CARD": "specialist_care.cardiology",
     "CONS-GIN": "family_counseling.gynecology",
 }
-# The rare language of each ASST's third hospital doctor, as the teams shared it (asst name in
-# the doctor id -> language). Unknown ASSTs are judged by the offer's own doctor_lang, if any.
-_RARE_BY_ASST = {"gorla": "sq", "giambellino": "ka", "nord": "ur"}
-# Facilities the other teams published (asst-nord, team agentic-paguri): asked even when the
-# Index does not list them, and first when the citizen speaks that ASST's rare language.
+# The rare language of each ASST's third hospital doctor, as the teams shared it on Discord
+# (asst name in the doctor id -> language). Unknown ASSTs: only the offer's own doctor_lang.
+_RARE_BY_ASST = {
+    "gorla": "sq", "giambellino": "ka", "nord": "ur", "lambrate": "ja", "greco": "si",
+    "bicocca": "ti", "corvetto": "fr", "brera": "fa", "isola": "tl", "ortica": "wo",
+    "forlanini": "de",
+}
+# Facilities the other teams published on Discord (table of 21/11, against impostor agents):
+# facility -> its ASST's rare language ("" = not published, or not a physiatry doctor). Only
+# these are asked: an agent the teams did not publish may be an impostor, and a false
+# attribute in an offer we pass on costs -2.
 _KNOWN_PARTNERS = {
-    "hospital.physiatry": {"agent:gpr1zqe343gb": "ur"},
-    "specialist_care.cardiology": {"agent:zand0f57ec1j": ""},
-    "family_counseling.gynecology": {"agent:ccjzqm7yekwx": ""},
+    "hospital.physiatry": {
+        "agent:h6r1v45esk77": "ka",  # Giambellino, RED-AGENT
+        "agent:nanpr5mgm2py": "ja",  # Lambrate, LTF-JECATT
+        "agent:gpr1zqe343gb": "ur",  # Nord, agentic-paguri
+        "agent:xtj1dk9x3qej": "si",  # Greco, tartufi-pazzi
+        "agent:bb01ggxymm05": "ti",  # Bicocca, p4radigm
+        "agent:tmt0bcv0st1f": "",    # Lorenteggio, RASPBERRY
+        "agent:gxq3vzgt3h5t": "",    # Bovisa, prompt-soccorso
+    },
+    "specialist_care.cardiology": {
+        "agent:hnpe58epeyh1": "",  # Giambellino
+        "agent:pky3vqyqbepa": "",  # Lambrate
+        "agent:zand0f57ec1j": "",  # Nord
+        "agent:q18es2d82f8r": "",  # Greco
+        "agent:sh35cbsy287d": "",  # Bicocca
+        "agent:n9bf9y6670hp": "",  # Lorenteggio
+        "agent:tty8erdj6t41": "",  # Bovisa
+        "agent:etpwrfmfa8hm": "",  # Isola, Diuo
+    },
+    "family_counseling.gynecology": {
+        "agent:bzs050xacs1m": "",  # Giambellino
+        "agent:atp772whjkgd": "",  # Lambrate
+        "agent:ccjzqm7yekwx": "",  # Nord
+        "agent:pxvd2kk2yx5j": "",  # Greco
+        "agent:nkh372rd16yq": "",  # Bicocca
+        "agent:mcppmrbjvxag": "",  # Lorenteggio
+        "agent:txar5994gbkj": "",  # Bovisa
+        "agent:mkfzagfe8jtt": "",  # Isola
+    },
 }
 _MAX_PARTNERS = 3
 _PARTNER_TRIES = 48  # x _PULL_PAUSE: about 12 seconds, the partners promise 10
@@ -1014,7 +1028,8 @@ def _partner_speaks(slot: dict[str, str], lang: str) -> bool:
     if "*" not in spec[0]:
         return False
     known = next((rare for name, rare in _RARE_BY_ASST.items() if f"-{name}-" in f"-{doctor}-"), None)
-    return known == lang if known else True  # unknown ASST: only its rare-language doctor can
+    # Unknown ASST: its rare language is unknown, so we never claim it (a false attribute is -2).
+    return known == lang
 
 
 def _partner_fit(
@@ -1109,7 +1124,8 @@ async def _ask_partners(
             key=lambda peer: -float(peer.reputation or 0),
         )
         known = _KNOWN_PARTNERS.get(service, {})
-        found = [peer.agent_id for peer in ranked]
+        # Only the published partners: an agent outside the teams' list may be an impostor.
+        found = [peer.agent_id for peer in ranked if peer.agent_id in known]
         # The ASST whose doctor speaks the citizen's rare language first, then the Index's best,
         # then the published ones the Index did not return. The language itself is never sent.
         first = [agent_id for agent_id, rare in known.items() if rare and rare == lang]
