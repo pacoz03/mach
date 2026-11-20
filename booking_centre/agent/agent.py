@@ -63,26 +63,47 @@ ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
 # One short courteous sentence after the act and its tokens, in the case's language.
 _PHRASES: dict[str, dict[str, str]] = {
     "it": {
-        "number": "Per prenotare mi serve il numero della ricetta del medico di base: può indicarmelo?",
-        "unknown_rx": "Non trovo una ricetta con questo numero: può ricontrollarlo?",
+        "number": (
+            "Volentieri, la aiuto io a prenotare: mi serve solo il numero della ricetta del medico "
+            "di base. Me lo può indicare?"
+        ),
+        "unknown_rx": (
+            "Mi scusi, non trovo una ricetta con questo numero: può ricontrollarlo? Appena ce l'ho, "
+            "prenotiamo."
+        ),
         "renewal": (
-            "La ricetta non è più valida: il suo medico di base può rinnovarla con lo stesso "
-            "numero. Poi mi mandi il numero nuovo e prenotiamo."
+            "Mi dispiace, la ricetta non è più valida: il suo medico di base può rinnovarla con lo "
+            "stesso numero. Appena mi manda il numero nuovo, prenotiamo insieme."
         ),
-        "offers": "Ecco i posti disponibili: mi dica quale preferisce.",
+        "offers": "Ecco i posti disponibili che le propongo: mi dica pure quale preferisce e procedo io.",
         "relaxed": (
-            "Non ci sono posti entro la scadenza della priorità: queste sono le prime "
-            "alternative disponibili."
+            "Mi dispiace, entro la scadenza della priorità non ci sono posti liberi: queste sono le "
+            "prime alternative disponibili. Mi dica pure quale preferisce."
         ),
-        "waiting": "Al momento non ci sono posti disponibili: le propongo la lista d'attesa.",
-        "waiting_p": "Per la priorità P la prenotazione passa dalla lista d'attesa.",
-        "which": "Non trovo questa scelta tra le offerte che le ho mandato: quale offerta sceglie?",
-        "consent": "Per prenotare mi serve il suo consenso: può confermarlo?",
-        "no_consent": "Senza il consenso non posso completare questa prenotazione.",
-        "down": "La struttura non è raggiungibile in questo momento: annullo questa offerta.",
-        "cancelled": "La struttura ha annullato questo posto: cerco un'alternativa.",
-        "expired": "La struttura segnala che la ricetta è scaduta.",
-        "receipt": "La prenotazione è confermata.",
+        "waiting": "Mi dispiace, al momento non ci sono posti disponibili: le propongo la lista d'attesa.",
+        "waiting_p": "Per la priorità P la prenotazione passa dalla lista d'attesa: gliela propongo qui.",
+        "which": "Mi scusi, non trovo questa scelta tra le offerte che le ho mandato: quale offerta sceglie?",
+        "consent": "Perfetto. Per completare la prenotazione mi serve il suo consenso: può confermarlo?",
+        "no_consent": (
+            "Capisco. Senza il consenso non posso completare questa prenotazione: se cambia idea, "
+            "sono qui."
+        ),
+        "down": (
+            "Mi scusi, la struttura non è raggiungibile in questo momento: annullo questa offerta e "
+            "cerco subito un'alternativa."
+        ),
+        "cancelled": "Mi dispiace, la struttura ha annullato questo posto: cerco subito un'alternativa per lei.",
+        "expired": "Mi dispiace, la struttura segnala che la ricetta è scaduta.",
+        "receipt": "La prenotazione è confermata: conservi questa ricevuta per il check-in in struttura.",
+        "prefs": (
+            "Per proporle i posti più comodi: ha giorni preferiti (lunedì-venerdì) o preferisce un "
+            "medico donna o uomo? Se non ha preferenze, me lo dica pure e procedo."
+        ),
+        "hello": (
+            "Buongiorno, sono il centro prenotazioni: il suo medico di base mi ha inoltrato la "
+            "ricetta, così posso cercarle subito un posto."
+        ),
+        "handoff": "Grazie, prendo in carico io la prenotazione e contatto subito il paziente.",
         "redirect": (
             "Su questo non posso darle un'informazione sicura. Può rivolgersi a: medico di base "
             "(sintomi, ricette e rinnovi); ospedale (visite di fisiatria e check-in); specialista "
@@ -91,26 +112,44 @@ _PHRASES: dict[str, dict[str, str]] = {
         ),
     },
     "en": {
-        "number": "To book I need the prescription number from your GP: could you share it?",
-        "unknown_rx": "I cannot find a prescription with this number: could you check it?",
+        "number": (
+            "Happy to help you book: I just need the prescription number from your GP. Could you "
+            "share it?"
+        ),
+        "unknown_rx": (
+            "Sorry, I cannot find a prescription with this number: could you check it? As soon as "
+            "I have it, we book."
+        ),
         "renewal": (
-            "The prescription is no longer valid: your GP can renew it with the same number. "
-            "Then send me the new number and we book."
+            "I am sorry, the prescription is no longer valid: your GP can renew it with the same "
+            "number. As soon as you send me the new number, we book together."
         ),
-        "offers": "Here are the available slots: tell me which one you prefer.",
+        "offers": "Here are the available slots I can offer you: just tell me which one you prefer and I will take care of it.",
         "relaxed": (
-            "There are no slots within the deadline of your priority: these are the first "
-            "alternatives available."
+            "I am sorry, there are no slots within the deadline of your priority: these are the "
+            "first alternatives available. Just tell me which one you prefer."
         ),
-        "waiting": "There are no free slots right now: I can put you on the waiting list.",
-        "waiting_p": "For priority P the booking goes through the waiting list.",
-        "which": "I cannot match this choice with the slots I sent you: which one do you choose?",
-        "consent": "To book I need your agreement: could you give it?",
-        "no_consent": "Without your agreement I cannot complete this booking.",
-        "down": "The facility cannot be reached right now, so this slot is withdrawn.",
-        "cancelled": "The facility withdrew this slot: I am looking for an alternative.",
-        "expired": "The facility reports that the prescription has expired.",
-        "receipt": "Your booking is confirmed.",
+        "waiting": "I am sorry, there are no free slots right now: I can put you on the waiting list.",
+        "waiting_p": "For priority P the booking goes through the waiting list: I am offering it to you here.",
+        "which": "Sorry, I cannot match this choice with the slots I sent you: which one do you choose?",
+        "consent": "Great. To complete the booking I need your agreement: could you give it?",
+        "no_consent": "I understand. Without your agreement I cannot complete this booking: if you change your mind, I am here.",
+        "down": (
+            "Sorry, the facility cannot be reached right now, so this slot is withdrawn: I am "
+            "looking for an alternative straight away."
+        ),
+        "cancelled": "I am sorry, the facility withdrew this slot: I am looking for an alternative for you.",
+        "expired": "I am sorry, the facility reports that the prescription has expired.",
+        "receipt": "Your booking is confirmed: please keep this receipt for check-in at the facility.",
+        "prefs": (
+            "To offer you the most convenient slots: do you prefer particular days (Monday-Friday) "
+            "or a female or male doctor? If you have no preference, just tell me and I will proceed."
+        ),
+        "hello": (
+            "Good morning, this is the booking centre: your GP forwarded me your prescription, so I "
+            "can look for a slot for you right away."
+        ),
+        "handoff": "Thank you, I am taking over the booking and contacting the patient right away.",
         "redirect": (
             "I cannot give you reliable information on this. You can ask: your GP (symptoms, "
             "prescriptions and renewals); the hospital (physiatry visits and check-in); the "
@@ -203,7 +242,13 @@ async def main(need: Need, city: City) -> None:
 
 
 def _phrase(chat: list[Message], key: str) -> str:
-    return _PHRASES.get(_lang(chat), _PHRASES["it"])[key]
+    phrases = _PHRASES.get(_lang(chat), _PHRASES["it"])
+    # A case the GP handed over: our first word to the citizen says who we are and why we write.
+    if key in {"handoff", "redirect"} or not any(_from_gp(row) for row in chat):
+        return phrases[key]
+    if any(row.recipient.startswith("citizen:") for row in chat):
+        return phrases[key]
+    return f"{phrases['hello']} {phrases[key]}"
 
 
 async def _tell(city: City, chat: list[Message], citizen: str, text: str, *, again: bool) -> None:
@@ -234,6 +279,9 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
         or _consent_offer(chat, city.agent_id, sender)
     ):
         await _on_confirm(city, message, chat)
+        return
+    if sender.startswith("agent:") and picked.get("handoff") == "gp":
+        await _accept_handoff(city, message, chat)
         return
     if "booking.receipt" in kind and sender.startswith("agent:"):
         await _forward_receipt(city, message, chat)
@@ -290,8 +338,14 @@ async def _advance(city: City, message: Message, chat: list[Message], *, replaci
     if gate is None:
         gate = _GATES[key] = _Gate()
     gate.turns += 1
+    waited = gate.lock.locked()
     try:
         async with gate.lock:
+            if waited:
+                # Another turn of this need (the GP's handoff, the citizen) just wrote: read again.
+                chat = await _until(city, message.need_id, chat, lambda rows: True)
+                if all(row.msg_id != message.msg_id for row in chat):
+                    chat = [*chat, message]
             await _advance_alone(city, message, chat, key, replacing=replacing)
     finally:
         gate.turns -= 1
@@ -307,7 +361,8 @@ async def _advance_alone(
     if citizen is None:
         return
     need_id = message.need_id
-    again = message.sender.startswith("citizen:")
+    # A citizen message we already answered (it crossed ours) is not the citizen asking again.
+    again = message.sender.startswith("citizen:") and not _answered(chat, agent, message)
     sent = _sent(key)
     number = _number(chat)
     if not number:
@@ -322,15 +377,27 @@ async def _advance_alone(
         trigger = fields_of(message.text).get("offer_id") or message.msg_id
         if sent.trigger != trigger:
             sent.trigger, sent.again, refresh = trigger, set(), True
-    asked = _we(chat, agent, f"prescription_number={number}", to=LEDGER, word="prescription")
-    if _prescription(chat, number) is None and not asked:
+    # Once the citizen names the number, only a Ledger answer after their message counts. The
+    # GP's handoff read it at issue, and a prescription can expire in between (P1).
+    since = next(
+        (
+            row.msg_id
+            for row in reversed(chat)
+            if row.sender.startswith("citizen:") and _fields(row).get("prescription_number") == number
+        ),
+        "",
+    )
+    asked = _we(_after(chat, since), agent, f"prescription_number={number}", to=LEDGER, word="prescription")
+    if _prescription(_after(chat, since), number) is None and not asked:
         if not await _say(city, LEDGER, f"prescription prescription_number={number}"):
             return
         # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
         refresh = refresh or bool(sent.mark) or _ledger(chat, "agenda") is not None
-    if _prescription(chat, number) is None:
-        chat = await _until(city, need_id, chat, lambda rows: _prescription(rows, number) is not None)
-    reply = _prescription(chat, number)
+    if _prescription(_after(chat, since), number) is None:
+        chat = await _until(
+            city, need_id, chat, lambda rows: _prescription(_after(rows, since), number) is not None
+        )
+    reply = _prescription(_after(chat, since), number)
     if reply is None:
         # The Ledger is slow: its answer opens a turn, or the citizen writes again. A citizen
         # writing again about a number the Ledger never confirmed hears that we cannot find it.
@@ -460,6 +527,20 @@ async def _advance_alone(
         return
     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true {_phrase(chat, 'waiting')}"):
         sent.offers.add(offer_id)
+
+
+async def _accept_handoff(city: City, message: Message, chat: list[Message]) -> None:
+    """The GP forwarded the prescription: answer the GP at once (before any Ledger wait), then
+    reach the citizen named in ``citizen=`` with the same flow as when they write to us."""
+
+    fields = _fields(message)
+    number = fields.get("prescription_number", "")
+    if not number or not fields.get("citizen", "").startswith("citizen:"):
+        return
+    if not _we(chat, city.agent_id, f"prescription_number={number}", to=message.sender, word="data.response"):
+        reply = f"data.response handoff=accepted prescription_number={number} {_phrase(chat, 'handoff')}"
+        await _say(city, message.sender, reply)
+    await _advance(city, message, chat, replacing=False)
 
 
 async def _offer(
@@ -721,10 +802,20 @@ def _when(value: str) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _from_gp(row: Message) -> bool:
+    """The GP's handoff: ``need.request handoff=gp citizen=... prescription_number=...``."""
+
+    return row.sender.startswith("agent:") and _fields(row).get("handoff") == "gp"
+
+
 def _citizen(chat: list[Message]) -> str | None:
     for row in chat:
         if row.sender.startswith("citizen:"):
             return row.sender
+    for row in chat:
+        party = _fields(row).get("citizen", "") if _from_gp(row) else ""
+        if party.startswith("citizen:"):
+            return party
     for row in chat:
         fields = fields_of(row.text)
         for key in ("patient", "citizen"):
@@ -876,6 +967,16 @@ def _offered(chat: list[Message], agent: str) -> set[str]:
     return found
 
 
+def _answered(chat: list[Message], agent: str, message: Message) -> bool:
+    """True when we already wrote to the sender of ``message`` after it in the case."""
+
+    ids = [row.msg_id for row in chat]
+    if message.msg_id not in ids:
+        return False
+    later = chat[ids.index(message.msg_id) + 1 :]
+    return any(row.sender == agent and row.recipient == message.sender for row in later)
+
+
 def _withdrawn(chat: list[Message], agent: str) -> set[str]:
     """Slots we cancelled. The citizen drops the rest, so those are offered again."""
 
@@ -947,12 +1048,14 @@ def _number(chat: list[Message]) -> str | None:
                 return f"prescription_number-{next(iter(mentions))}"
             if mentions:
                 return None
+        elif _from_gp(row) and _fields(row).get("prescription_number"):
+            return _fields(row)["prescription_number"]
     return None
 
 
 def _lang(chat: list[Message]) -> str:
     for row in chat:
-        if row.sender.startswith("citizen:"):
+        if row.sender.startswith("citizen:") or _from_gp(row):
             lang = _fields(row).get("lang", "")
             if lang:
                 return lang
@@ -970,7 +1073,7 @@ async def _preferences_ready(city: City, chat: list[Message], citizen: str, miss
         if fields.get("purpose") == "booking" and fields.get("fields") in {"days", "gender"}:
             # A plain-language refusal also ends the preference request.
             return any(reply.sender == citizen for reply in chat[index + 1:])
-    text = f"data.request purpose=booking fields={','.join(missing)}"
+    text = f"data.request purpose=booking fields={','.join(missing)} {_phrase(chat, 'prefs')}"
     await _say(city, citizen, text)
     return False
 

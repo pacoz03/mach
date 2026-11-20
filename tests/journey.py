@@ -336,6 +336,8 @@ class Citizen:
             if self.sc.get("wait_days") and not self.waited:  # P1: chiama il centro giorni dopo
                 self.waited = True
                 b.ledger.advance(self.sc["wait_days"])
+            if self.sc.get("handoff"):  # il gp inoltra la ricetta: il cittadino aspetta il centro
+                return
             self.say(b.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={self.rx} lang=it")
         elif kind == "offer" and self.chosen is None:  # sceglie dal PRIMO messaggio di offerte (R:95)
             offers = parse_offers(m.text)
@@ -513,6 +515,23 @@ def refused_silently(folder: str):
     return check
 
 
+def handed_over(b: Bus) -> str | None:
+    """Il gp inoltra la ricetta: il centro risponde al gp e scrive per primo al cittadino."""
+    bc, gp = b.ids["booking_centre"], b.ids["gp"]
+    if not any(m.sender == gp and m.recipient == bc and "handoff=gp" in m.text.split() for m in b.log):
+        return "il gp non ha mandato need.request handoff=gp al centro prenotazioni"
+    if not any(m.sender == bc and m.recipient == gp
+               and has(m.text, ("data.response", "handoff=accepted", "prescription_number=")) for m in b.log):
+        return "booking_centre non ha risposto al gp con data.response handoff=accepted"
+    first = next((i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == CIT), None)
+    asked = next((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == bc), None)
+    if first is None or (asked is not None and asked < first):
+        return "booking_centre non ha scritto per primo al cittadino"
+    offers = [m for m in b.log if m.sender == bc and m.recipient == CIT and act(m) == "offer"]
+    if len(offers) != 1:
+        return f"offerte al cittadino in {len(offers)} messaggi invece di uno (R:95)"
+
+
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
 SCENARIOS: dict[str, dict] = {
     "felice_fisiatria": dict(start=BACK, expect=[
@@ -536,6 +555,8 @@ SCENARIOS: dict[str, dict] = {
     "ospedale_giu": dict(start=BACK, down={"hospital"}, expect=[
         told("booking_centre", "cancel", "reason=", cite="R:701")]),
     "injection_slot": dict(start=BACK, inject=True, expect=[wrote("commit", "R:243")]),
+    "gp_handoff": dict(start=BACK, handoff=True, expect=[
+        handed_over, wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
 }
 
 

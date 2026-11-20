@@ -64,7 +64,10 @@ _NEGATED = re.compile(
     r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
     r"\s+(?:\w+\s+)?$"
 )
-ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
+ESCALATION = (
+    "escalate.emergency reason=red_flag Capisco la sua preoccupazione: è importante agire subito. "
+    "Contatti subito il 112."
+)
 LEDGER_REFUSAL = "Non sono riuscito a registrare la ricetta. Può riprovare con una nuova richiesta."
 RENEWAL_UNKNOWN = (
     "Non riesco a verificare questa ricetta sul Ledger. Può indicarmi il motivo della richiesta "
@@ -73,6 +76,26 @@ RENEWAL_UNKNOWN = (
 LEDGER_WAIT_ATTEMPTS = 24
 LEDGER_WAIT_SECONDS = 0.25
 CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+# Our ASST's booking centre (booking_centre/card.yaml). The Index Peer carries neither team nor
+# district, and find() leaves this agent out: the id is the only way to pick ours. We still write
+# to it only when the Index returns it.
+BOOKING_CENTRE = "agent:sbdpbpqz5sxe"
+HANDOFF = "need.request handoff=gp"
+# Priority deadlines (e19-rules.md R:91).
+TIMING = {
+    "it": {
+        "U": "la visita va fatta in giornata",
+        "B": "la visita va fatta entro 2 giorni",
+        "D": "la visita va fatta entro 5 giorni",
+        "P": "è una visita programmabile, per cui il centro prenotazioni può proporle la lista d'attesa",
+    },
+    "en": {
+        "U": "the visit is due today",
+        "B": "the visit is due within 2 days",
+        "D": "the visit is due within 5 days",
+        "P": "it is a scheduled visit, so the booking centre can offer you the waiting list",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -83,12 +106,45 @@ class Prescription:
     priority: str
 
     @property
-    def reply(self) -> str:
+    def head(self) -> str:
         return (
             f"prescription prescription_number={self.number} procedure={self.procedure} "
-            f"priority={self.priority} La ricetta è registrata. "
-            "Può usare il numero al centro prenotazioni."
+            f"priority={self.priority}"
         )
+
+    def reply(self, lang: str, handed: bool) -> str:
+        timing = TIMING[lang].get(self.priority)
+        if lang == "en":
+            text = (
+                "I understand your concern and I have taken care of it right away. "
+                f"Your prescription is registered with priority {self.priority}"
+                + (f": {timing}. " if timing else ". ")
+            )
+            text += (
+                "I have already passed it to our booking centre. If you have preferred days or a "
+                "preference for the doctor's gender or language, tell the booking centre: it will "
+                "find the slot that suits you best."
+                if handed
+                else "To book, write to your ASST's booking centre with the prescription number. If "
+                "you have preferred days or a preference for the doctor's gender or language, tell "
+                "them: they will find the slot that suits you best."
+            )
+        else:
+            text = (
+                "Capisco la sua preoccupazione e me ne sono occupato subito. "
+                f"La ricetta è registrata con priorità {self.priority}"
+                + (f": {timing}. " if timing else ". ")
+            )
+            text += (
+                "Ho già passato la ricetta al nostro centro prenotazioni. Se ha giorni preferiti o "
+                "preferenze sul genere o sulla lingua del medico, le indichi al centro prenotazioni: "
+                "così troverà lo slot più adatto a lei."
+                if handed
+                else "Per prenotare scriva al centro prenotazioni della sua ASST con il numero della "
+                "ricetta. Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
+                "le indichi: così troverà lo slot più adatto a lei."
+            )
+        return f"{self.head} {text}"
 
 
 async def main(need: Need, city: City) -> None:
@@ -281,15 +337,57 @@ async def _notify(city: City, history: list[Message], request: Prescription) -> 
             fields.get("procedure", request.procedure) == request.procedure
             and fields.get("priority", request.priority) == request.priority
         ):
-            answer = request.reply
+            answer = request.head
             break
         if words[:1] == ["refused"] and "prescribe" in words and "DUPLICATE" not in row.text:
             answer = LEDGER_REFUSAL
     if answer is None:
         return False
-    if not _sent(history, city.agent_id, request.patient, answer):
-        await city.say(request.patient, answer)
+    if answer == LEDGER_REFUSAL:
+        if not _sent(history, city.agent_id, request.patient, answer):
+            await city.say(request.patient, answer)
+        return True
+    if not any(
+        row.sender == city.agent_id and row.recipient == request.patient and row.text.startswith(answer + " ")
+        for row in history
+    ):
+        lang = _lang(history)
+        # Before the citizen's message, so that "already passed on" is true when we say it.
+        handed = await _handoff(city, history, request, lang)
+        await city.say(request.patient, request.reply(lang, handed))
     return True
+
+
+def _lang(history: list[Message]) -> str:
+    """The citizen's ``lang=``, as the booking centre reads it; Italian otherwise."""
+
+    for row in history:
+        if row.sender.startswith("citizen:"):
+            lang = understood(row).body.get("lang")
+            if lang in TIMING:
+                return lang
+    return "it"
+
+
+async def _handoff(city: City, history: list[Message], request: Prescription, lang: str) -> bool:
+    """Best effort, once per need: the prescription to our booking centre. Never raises."""
+
+    done = [row.text for row in history if row.sender == city.agent_id and row.text.startswith(HANDOFF + " ")]
+    if done:  # once per need; a renewal's new number was not passed on, so we do not claim it
+        return any(f" prescription_number={request.number} " in text for text in done)
+    try:
+        peers = [peer for peer in await city.find("booking_centre") if peer.agent_id == BOOKING_CENTRE]
+        if len(peers) != 1:
+            return False
+        await city.say(
+            peers[0],
+            f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
+            f"procedure={request.procedure} priority={request.priority} lang={lang} "
+            "Buongiorno, vi passo la ricetta appena registrata sul Ledger per la prenotazione. Grazie!",
+        )
+        return True
+    except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us
+        return False
 
 
 def _sent(history: list[Message], agent_id: str, recipient: str, text: str) -> bool:
