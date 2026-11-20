@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 import unicodedata
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
@@ -31,16 +32,18 @@ _MAX_PAGE = 8
 # Four agenda hours is about half a minute of real time at 480x, so a slot is still
 # ahead when the citizen decides. One hour was already past by then.
 _LEAD = timedelta(hours=4)
-# Doctor key (the last segment of doctor_id) -> languages, gender, days. ``*`` is the ASST's
-# rare language. The Ledger's slot line names the doctor; it does not repeat this table.
+# Doctor key (the last segment of doctor_id) -> languages, gender, days, from the registry
+# (console team/world). The Ledger's slot line names the doctor; it does not repeat this table.
 _DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
     "h1": (frozenset({"it", "en"}), "f", frozenset({"mon", "tue", "wed"})),
     "h2": (frozenset({"it"}), "m", frozenset({"wed", "thu", "fri"})),
-    "h3": (frozenset({"it", "*"}), "m", frozenset({"tue", "thu"})),
+    "h3": (frozenset({"it", "sq"}), "m", frozenset({"tue", "thu"})),
     "s1": (frozenset({"it", "en"}), "m", frozenset({"mon", "wed", "fri"})),
     "s2": (frozenset({"it"}), "f", frozenset({"tue", "thu"})),
     "c1": (frozenset({"it", "en"}), "f", frozenset({"mon", "tue", "wed", "thu", "fri"})),
 }
+# Our ASST's rare language: only h3 speaks it, and partners ask us for it (registry).
+_RARE = "sq"
 _DEADLINE_DAYS = {"B": 2, "D": 5}
 _LOG = logging.getLogger("care")
 # The Relay accepts a ledger reply and then the agent rejects the push, so the reply sits in
@@ -49,6 +52,9 @@ _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
 # About 3 s: the visit's time and the city's clock are a courtesy, never worth a long wait.
 _SHORT_TRIES = 12
+# A cross-ASST answer goes out by this many seconds from the turn's start: the fast reply (+1,
+# R:246) needs < 10 s, and the real Ledger's agenda reply alone takes 3-5 s.
+_CROSS_WAIT = 5.5
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 # The kit names no outcome_code values: VISIT is the only one it writes (examples/agent.py).
@@ -353,20 +359,22 @@ async def _until(
     chat: list[Message],
     ready: Callable[[list[Message]], bool],
     tries: int = _PULL_TRIES,
+    deadline: float | None = None,
 ) -> list[Message]:
-    """Re-read the case until ``ready`` or the short wait ends. The push may never arrive."""
+    """Re-read the case until ``ready`` or the short wait ends: ``tries`` reads, or until
+    ``deadline`` (time.monotonic()) when given. The push may never arrive."""
 
     fresh = chat
-    for attempt in range(tries):
+    attempt = 0
+    while True:
         try:
             fresh = await city.history(need_id=need_id)
         except CapError:
             fresh = chat
-        if ready(fresh):
+        attempt += 1
+        if ready(fresh) or (attempt >= tries if deadline is None else time.monotonic() >= deadline):
             return fresh
-        if attempt + 1 < tries:
-            await asyncio.sleep(_PULL_PAUSE)
-    return fresh
+        await asyncio.sleep(_PULL_PAUSE)
 
 
 async def _await_line(
@@ -414,12 +422,7 @@ def _has_procedure(chat: list[Message]) -> bool:
 
 def _speaks(doctor_id: str, lang: str) -> bool:
     spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
-    if spec is None:
-        return False
-    langs = spec[0]
-    if lang in langs:
-        return True
-    return "*" in langs and lang not in {"it", "en"}
+    return spec is not None and lang in spec[0]
 
 
 def fitting(
@@ -484,9 +487,45 @@ def _ledger(chat: list[Message], head: str) -> dict[str, str] | None:
     for row in chat:
         if row.sender == LEDGER and first_word(row.text) == head:
             found = fields_of(row.text)
-    if found is not None and head == "agenda" and "agenda_now" not in found:
-        found["agenda_now"] = found.get("agenda_date", "")
+    if found is not None and head == "agenda":
+        found.setdefault("agenda_now", found.get("agenda_date", ""))
+        new, old = _when(found["agenda_now"]), _when(_CLOCK.get("agenda_now", ""))
+        if new is not None and (old is None or new >= old):
+            _CLOCK.clear()
+            _CLOCK.update(found)
     return found
+
+
+# The agenda reply with the latest agenda_now this process read (_ledger keeps it).
+_CLOCK: dict[str, str] = {}
+
+
+def _city_now() -> datetime | None:
+    """Agenda now from _CLOCK, without asking: ``epoch_agenda`` + (real now - ``epoch_real``) x
+    ``rate``, on weekdays only (no agenda weekends, R:85). None if paused or a field is missing."""
+
+    real, base = _when(_CLOCK.get("epoch_real", "")), _when(_CLOCK.get("epoch_agenda", ""))
+    try:
+        rate = float(_CLOCK.get("rate", ""))
+    except ValueError:
+        return None
+    if real is None or base is None or _CLOCK.get("paused") == "true":
+        return None
+    monday = (base - timedelta(days=base.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week = timedelta(days=5)
+    weeks, rest = divmod(min(base - monday, week) + (datetime.now(base.tzinfo) - real) * rate, week)
+    return monday + weeks * timedelta(days=7) + rest
+
+
+def _day_after(world: str) -> datetime | None:
+    """No clock: the end of world's first day (``from=``, today's agenda date; else its earliest
+    slot). It bounds now from above, so every slot fitting() keeps from it is surely ahead."""
+
+    day = fields_of(world).get("from") or min(
+        (_slot(line).get("at", "") for line in world.splitlines() if "slot_id=" in line), default=""
+    )
+    start = _when(f"{day[:10]}T00:00:00+00:00")
+    return None if start is None else start + timedelta(days=1)
 
 
 def _latest_slots(chat: list[Message]) -> str | None:
@@ -988,7 +1027,8 @@ async def _confirm_alone(
                 parts.append(f"citizen={citizen}")
             if number:
                 parts.append(f"prescription_number={number}")
-            parts.append(f"consent_ref={consent}")
+            # P2: the hold carries the cross-ASST consent; the commit keeps the booking one.
+            parts.append(f"consent_ref={fields.get('cross_asst_consent_ref') or consent}")
             if not await _say(city, LEDGER, " ".join(parts)):
                 return
             sent.holds.add(slot)
@@ -1580,8 +1620,14 @@ async def _cross_asst(
     """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
     per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
     ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
-    attribute the Ledger did not write. The confirm that follows takes _on_confirm."""
+    attribute the Ledger did not write. The confirm that follows takes _on_confirm.
 
+    Hospital only: the answer goes out by _CROSS_WAIT. The clock is _city_now (agenda is asked
+    to refresh it, waited for only without it), else world's first day (_day_after). A partner
+    asks because its own set is empty: with nothing in the priority window we offer the first
+    free slots after it (relaxed alternative, R:232), page 2 too, and always one h3 slot."""
+
+    deadline = time.monotonic() + _CROSS_WAIT
     fields = _fields(message)
     rid = fields.get("request_id", "")
     tag = f"request_id={rid}" if rid else ""
@@ -1603,39 +1649,77 @@ async def _cross_asst(
         priority = fields.get("priority", "").upper()
         priority = priority if priority in {"U", "B", "D", "P"} else None
         chosen: list[dict[str, str]] = []
+        relaxed = False
         # Only our own service: world lists every slot of the ASST, other facilities' too.
         if procedure in procedures:
+            hospital = procedures == (_PROCEDURE,)  # the specialist's answer stays as it was
             known = {row.msg_id for row in chat}
 
             def fresh(rows: list[Message]) -> list[Message]:
                 return [row for row in rows if row.msg_id not in known]
 
+            def clock(rows: list[Message]) -> datetime | None:
+                agenda = _ledger(fresh(rows), "agenda")  # a fresh reply also refreshes _CLOCK
+                cached = _city_now() if hospital else None
+                return cached or _when("" if agenda is None else agenda.get("agenda_now", ""))
+
+            def page_of(rows: list[Message], page: int) -> str | None:
+                world = _latest_slots(fresh(rows))
+                return world if world is not None and _page(world)[0] >= page else None
+
             await _say(city, LEDGER, "agenda")
-            await _say(city, LEDGER, f"world procedure={procedure} page=1")
-            rows = fresh(await _until(
-                city,
-                message.need_id,
-                chat,
-                lambda rows: _has_agenda(fresh(rows)) and _latest_slots(fresh(rows)) is not None,
-                tries=_SHORT_TRIES,
-            ))
-            agenda = _ledger(rows, "agenda")
-            now = _when("" if agenda is None else agenda.get("agenda_now", ""))
-            world = _latest_slots(rows)
-            if now is not None and world is not None:
-                chosen = fitting(
-                    [line for line in world.splitlines() if "slot_id=" in line],
-                    now=now,
-                    priority=priority,
-                    lang="it",
-                    procedure=procedure,
-                )[:3]
+            page = 1
+            found: list[dict[str, str]] = []
+            every: list[dict[str, str]] = []
+            while True:
+                await _say(city, LEDGER, f"world procedure={procedure} page={page}")
+                rows = await _until(
+                    city,
+                    message.need_id,
+                    chat,
+                    lambda rows, page=page: page_of(rows, page) is not None
+                    and clock(rows) is not None,
+                    tries=_SHORT_TRIES,
+                    deadline=deadline if hospital else None,
+                )
+                world = page_of(rows, page)
+                now = clock(rows) or (_day_after(world) if hospital and world else None)
+                if world is None or now is None:
+                    break
+                lines = [line for line in world.splitlines() if "slot_id=" in line]
+                found = fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
+                if not hospital:
+                    break
+                # ponytail: read as priority P, so a U request's relaxed slots skip the U reserve.
+                every = fitting(lines, now=now, priority="P", lang="it", procedure=procedure)
+                if every or page >= min(_page(world)[1], 2) or time.monotonic() >= deadline:
+                    break
+                page += 1
+            relaxed = hospital and not found and bool(every)
+            pool = found or every
+            chosen = pool[:3]
+            if hospital:
+                # Partners mostly want h3, our only sq speaker: no lang= reads as sq. The
+                # earliest slot in the asked language first, then by time, and always one h3.
+                lang = (fields.get("lang") or _RARE).lower()
+                first = next((slot for slot in pool if _speaks(slot["doctor_id"], lang)), None)
+                pool = ([first] if first else []) + [slot for slot in pool if slot is not first]
+                rare = next((s for s in (*pool, *every) if _speaks(s["doctor_id"], _RARE)), None)
+                chosen = pool[:3]
+                if rare is not None and rare not in chosen:
+                    chosen = [*chosen[:2], rare]
         if chosen:
             lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
+            beyond = (
+                f"Entro i tempi della priorità {priority or 'richiesta'} non abbiamo posti liberi: "
+                "queste sono le prime date libere subito dopo. "
+                if relaxed
+                else ""
+            )
             text = "\n".join([
                 *lines,
-                f"Buongiorno, ecco le prime disponibilità {ours} per la vostra "
-                "richiesta. Per prenotarne una inviateci la scelta con il riferimento del consenso "
+                f"Buongiorno, ecco le prime disponibilità {ours} per la vostra richiesta. "
+                f"{beyond}Per prenotarne una inviateci la scelta con il riferimento del consenso "
                 "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta.",
             ])
         else:
@@ -2207,7 +2291,7 @@ def _booking_of(chat: list[Message], agent: str, slot_id: str) -> tuple[str, str
             consent = fields.get("consent_ref", consent)
             number = fields.get("prescription_number") or number
         if row.sender == agent and "hold" in words(row.text):
-            consent = fields.get("consent_ref", consent)
+            consent = consent or fields.get("consent_ref", "")
             number = fields.get("prescription_number") or number
             sender = sender or fields.get("citizen", "")
     return sender, consent, number
