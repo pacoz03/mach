@@ -19,6 +19,7 @@ history because a Ledger push may not open a turn of its own.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -95,6 +96,19 @@ _PHRASES: dict[str, dict[str, str]] = {
         "pending": "Sto completando la sua prenotazione con la struttura: le mando la ricevuta tra un istante.",
         "welcome": "Prego, è stato un piacere. La prenotazione resta confermata: per qualsiasi altra cosa sono qui.",
         "dropped": "Va bene, tolgo quell'opzione: le altre restano valide. Quale preferisce?",
+        "partners": (
+            "Nella nostra ASST al momento non c'è un posto adatto alla sua richiesta: sto chiedendo "
+            "alle strutture partner delle altre ASST, senza condividere i suoi dati. Le scrivo appena "
+            "ho una risposta."
+        ),
+        "partner_offers": (
+            "Sono posti presso una struttura partner di un'altra ASST. Quale preferisce? Per "
+            "prenotare lì le chiederò prima il consenso a condividere i suoi dati con quella struttura."
+        ),
+        "cross_consent": (
+            "Questa visita è presso una struttura di un'altra ASST: per prenotarla devo condividere "
+            "con loro i suoi dati. Mi dà il consenso?"
+        ),
         "relaxed": (
             "Mi dispiace, entro la scadenza della priorità non ci sono posti liberi: queste sono le "
             "prime alternative disponibili. Quale preferisce? Se nessuna va bene, mi dica giorni o "
@@ -166,6 +180,19 @@ _PHRASES: dict[str, dict[str, str]] = {
         "pending": "I am completing your booking with the facility: your receipt will follow in a moment.",
         "welcome": "You are welcome. Your booking stays confirmed: I am here if you need anything else.",
         "dropped": "All right, I am dropping that option: the others are still valid. Which one do you prefer?",
+        "partners": (
+            "Our own facilities have no slot that fits your request right now: I am asking the "
+            "partner facilities of the other health districts, without sharing your data. I will "
+            "write as soon as I have an answer."
+        ),
+        "partner_offers": (
+            "These slots are at a partner facility of another health district. Which one do you "
+            "prefer? To book there I will first ask your consent to share your data with that facility."
+        ),
+        "cross_consent": (
+            "This visit is at a facility of another health district: to book it I need to share "
+            "your data with them. Do you agree?"
+        ),
         "relaxed": (
             "I am sorry, there are no slots within the deadline of your priority: these are the "
             "first alternatives available. Which one do you prefer? If none works, tell me the "
@@ -337,6 +364,14 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     ):
         await _on_confirm(city, message, chat, heard)
         return
+    if (
+        sender.startswith("agent:")
+        and sender not in _OUR_FACILITIES
+        and picked.get("request_id")
+        and ("offer" in kind or ("cancel" in kind and "offer_id" not in picked))
+    ):
+        await _advance(city, message, chat, replacing=False, partner=True)
+        return
     if sender.startswith("agent:") and picked.get("handoff") == "gp":
         await _accept_handoff(city, message, chat)
         return
@@ -371,12 +406,14 @@ class _Gate:
 class _Sent:
     """Offers this process sent for one need, which the case history may not show yet."""
 
-    __slots__ = ("offers", "trigger", "again", "mark", "cancelled")
+    __slots__ = ("offers", "trigger", "again", "mark", "cancelled", "said")
 
     def __init__(self) -> None:
         self.offers: set[str] = set()
         # Offers whose cancel we already told the citizen (two facility turns can race).
         self.cancelled: set[str] = set()
+        # Sentences and receipts already sent in this process: said once, whatever the race.
+        self.said: set[str] = set()
         self.trigger = ""
         self.again: set[str] = set()
         # Our latest ``agenda`` ask: agenda and world answers before it are stale.
@@ -399,7 +436,9 @@ def _sent(key: str) -> _Sent:
     return entry
 
 
-async def _advance(city: City, message: Message, chat: list[Message], *, replacing: bool) -> None:
+async def _advance(
+    city: City, message: Message, chat: list[Message], *, replacing: bool, partner: bool = False
+) -> None:
     key = message.need_id or message.msg_id
     gate = _GATES.get(key)
     if gate is None:
@@ -413,7 +452,10 @@ async def _advance(city: City, message: Message, chat: list[Message], *, replaci
                 chat = await _until(city, message.need_id, chat, lambda rows: True)
                 if all(row.msg_id != message.msg_id for row in chat):
                     chat = [*chat, message]
-            await _advance_alone(city, message, chat, key, replacing=replacing)
+            if partner:
+                await _partner_answer(city, message, chat, key)
+            else:
+                await _advance_alone(city, message, chat, key, replacing=replacing)
     finally:
         gate.turns -= 1
         if gate.turns == 0 and _GATES.get(key) is gate:
@@ -553,6 +595,10 @@ async def _advance_alone(
         "*" in spec[0] and pick["lang"] == _RARE_LANG) for spec in _DOCTORS.values())
     refused_slots, refused_doctors = _refused(chat, agent)
     taken = taken | refused_slots
+    cross = (city, message, chat, citizen, number, priority, procedure, pick, taken, refused_doctors, sent, replacing)
+    # A language none of our doctors speaks: only a partner ASST can have that doctor.
+    if pick["lang"] != "it" and not spoken and await _try_partners(*cross):
+        return
     # After the citizen turned an offer down, the new ones come with a word about it.
     opening = "offers_again" if replacing and message.sender.startswith("citizen:") else "offers"
     while True:
@@ -599,9 +645,16 @@ async def _advance_alone(
     if blocked:
         # Only a facility that is down had room: the citizen already has our cancel and reason.
         return
-    # S is empty on every page: a relaxed alternative (past the priority deadline), else the
-    # waiting list. Never silence.
-    relaxed = [
+    # S is empty on every page: a partner ASST first (the ring), then a relaxed alternative
+    # (past the priority deadline), else the waiting list. Never silence.
+    if await _try_partners(*cross):
+        return
+    late = any(
+        row.sender.startswith("citizen:") and "cancel" in words(row.text)
+        and fields_of(row.text).get("reason", "").lower() in {"deadline", "priority", "late", "time"}
+        for row in chat
+    )
+    relaxed = [] if late else [
         slot
         for slot in fitting(lines, **pick, relaxed=True)
         if slot.get("slot_id") not in taken
@@ -711,6 +764,25 @@ async def _on_confirm(
         consent = named.pop() if len(named) == 1 else ""
     if not consent and _we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
         return  # already confirmed to the facility: nothing to ask again
+    if facility not in _OUR_FACILITIES:
+        # Rule P2: no hold in another ASST, and none of the citizen's data there, before their
+        # consent with purpose cross_asst. Its reference is the one the partner's hold needs.
+        ask = f"consent purpose=cross_asst offer_id={offer_id} {_phrase(chat, 'cross_consent')}"
+        given = consent if consent and (fields.get("purpose") == "cross_asst" or _exact(chat, agent, ask)) else ""
+        cross_consent = given or _cross_ref(chat, citizen)
+        consent = cross_consent
+        if not consent:
+            if not _exact(chat, agent, ask):
+                await _say(city, citizen, ask)
+            elif heard.get("consent") == "no":
+                await _say(
+                    city,
+                    citizen,
+                    f"cancel offer_id={offer_id} reason=rule_p2_no_consent {_phrase(chat, 'no_consent')}",
+                )
+            else:
+                await _tell(city, chat, citizen, _phrase(chat, "redirect"), again=False)
+            return
     if not consent:
         ask = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent')}"
         again = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent_code')}"
@@ -732,14 +804,23 @@ async def _on_confirm(
         return
     if _we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
         return
+    theirs, request = _partner_refs(chat, agent, facility, slot)
+    booking_consent = consent
+    if facility not in _OUR_FACILITIES:
+        # As the teams agreed: the booking consent in consent_ref, the cross-ASST one beside it.
+        booking_consent = _booking_ref(chat, citizen, offer_id) or consent
     parts = [
         "confirm",
-        f"offer_id={offer_id}",
+        f"offer_id={theirs or offer_id}",
         f"slot_id={slot}",
         f"citizen={citizen}",
-        f"consent_ref={consent}",
+        f"consent_ref={booking_consent}",
         f"facility={facility}",
     ]
+    if facility not in _OUR_FACILITIES:
+        parts.append(f"cross_asst_consent_ref={consent}")
+    if request:
+        parts.append(f"request_id={request}")
     if offer.get("prescription_number"):
         parts.append(f"prescription_number={offer['prescription_number']}")
     try:
@@ -767,6 +848,10 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
         return
     if _we(chat, city.agent_id, f"booking_id={booking_id}", to=citizen, word="booking.receipt"):
         return
+    told = _sent(message.need_id or message.msg_id).said
+    if f"receipt:{booking_id}" in told:
+        return
+    told.add(f"receipt:{booking_id}")
     phrases = _phrases(chat)
     tail = [phrases["receipt"]]
     booked = _booked_offer(chat, city.agent_id, message.sender, citizen)
@@ -801,6 +886,290 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
         await _renewal(city, chat, citizen, again=False)
         return
     await _advance(city, message, chat, replacing=True)
+
+
+# --- other ASSTs (the ring) --------------------------------------------------------------------
+# Our own facilities, from the registry (team/world). Anyone else that answers a search is a
+# partner ASST's facility.
+_OUR_FACILITIES = frozenset({"agent:m6py14a1ej77", "agent:h6krzxx6es83", "agent:yg8debxe3x0p"})
+_SERVICES = {
+    "VIS-FIS": "hospital.physiatry",
+    "VIS-CARD": "specialist_care.cardiology",
+    "CTRL-CARD": "specialist_care.cardiology",
+    "CONS-GIN": "family_counseling.gynecology",
+}
+# The rare language of each ASST's third hospital doctor, as the teams shared it (asst name in
+# the doctor id -> language). Unknown ASSTs are judged by the offer's own doctor_lang, if any.
+_RARE_BY_ASST = {"gorla": "sq", "giambellino": "ka", "nord": "ur"}
+# Facilities the other teams published (asst-nord, team agentic-paguri): asked even when the
+# Index does not list them, and first when the citizen speaks that ASST's rare language.
+_KNOWN_PARTNERS = {
+    "hospital.physiatry": {"agent:gpr1zqe343gb": "ur"},
+    "specialist_care.cardiology": {"agent:zand0f57ec1j": ""},
+    "family_counseling.gynecology": {"agent:ccjzqm7yekwx": ""},
+}
+_MAX_PARTNERS = 3
+_PARTNER_TRIES = 48  # x _PULL_PAUSE: about 12 seconds, the partners promise 10
+
+
+def _asked_partners(chat: list[Message], agent: str) -> dict[str, str]:
+    """Partner facility -> the request_id of our ``need.request`` to it."""
+
+    asked: dict[str, str] = {}
+    for row in chat:
+        if row.sender == agent and row.recipient.startswith("agent:") and first_word(row.text) == "need.request":
+            request = fields_of(row.text).get("request_id", "")
+            if request:
+                asked[row.recipient] = request
+    return asked
+
+
+def _partner_rows(chat: list[Message], agent: str) -> list[Message]:
+    """The partners' answers to our requests (matched on sender and request_id)."""
+
+    asked = _asked_partners(chat, agent)
+    return [
+        row
+        for row in chat
+        if row.sender in asked and f"request_id={asked[row.sender]}" in row.text.replace(",", " ").split()
+    ]
+
+
+def _partner_slots(chat: list[Message], agent: str) -> list[dict[str, str]]:
+    """Slots the partners offered. ``facility`` is always the agent that answered: an offer
+    cannot point our confirm at someone else."""
+
+    found: list[dict[str, str]] = []
+    for row in _partner_rows(chat, agent):
+        if "offer" not in words(row.text):
+            continue
+        for offer in _offers_in(row.text):
+            slot = dict(offer)
+            for key, alias in (("at", "agenda_date"), ("day", "agenda_day")):
+                if key not in slot and alias in slot:
+                    slot[key] = slot[alias]
+            if not slot.get("slot_id") or not slot.get("doctor_id") or _when(slot.get("at", "")) is None:
+                continue
+            slot["day"] = _IT_DAYS.get(slot.get("day", "").lower()[:3], slot.get("day", "").lower()[:3])
+            slot["facility"] = row.sender
+            found.append(slot)
+    return found
+
+
+def _partner_speaks(slot: dict[str, str], lang: str) -> bool:
+    """Whether the partner's doctor speaks ``lang``: the offer's own ``doctor_lang`` first, then
+    the shared table of rare languages; the common ones (it, en) follow the roster every ASST has."""
+
+    if lang == "it":
+        return True
+    stated = {part.strip().lower() for part in re.split(r"[/,|;]", slot.get("doctor_lang", "")) if part.strip()}
+    if stated:
+        return lang in stated
+    doctor = slot.get("doctor_id", "")
+    spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
+    if spec is None:
+        return False
+    if lang in spec[0]:
+        return True
+    if "*" not in spec[0]:
+        return False
+    known = next((rare for name, rare in _RARE_BY_ASST.items() if f"-{name}-" in f"-{doctor}-"), None)
+    return known == lang if known else True  # unknown ASST: only its rare-language doctor can
+
+
+def _partner_fit(
+    chat: list[Message],
+    agent: str,
+    pick: dict[str, object],
+    taken: set[str],
+    refused_doctors: set[str],
+) -> list[dict[str, str]]:
+    """Partner slots the citizen can accept, best first (same rules as our own)."""
+
+    slots = [
+        slot
+        for slot in _partner_slots(chat, agent)
+        if slot["slot_id"] not in taken
+        and slot["doctor_id"] not in refused_doctors
+        and _partner_speaks(slot, str(pick["lang"]))
+        and not _down(slot["facility"])
+    ]
+    by_id = {slot["slot_id"]: slot for slot in slots}
+    lines = [
+        " ".join(f"{key}={value}" for key, value in slot.items() if key in _SLOT_KEYS and value)
+        for slot in slots
+    ]
+    return [by_id[slot["slot_id"]] | slot for slot in fitting(lines, **pick) if slot.get("slot_id") in by_id]
+
+
+_SLOT_KEYS = ("slot_id", "doctor_id", "facility", "procedure", "at", "day", "free", "urgent_reserve")
+
+
+def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) -> tuple[str, str]:
+    """The partner's own offer_id for ``slot_id`` and our request_id to it ("" for our own)."""
+
+    if facility in _OUR_FACILITIES:
+        return "", ""
+    request = _asked_partners(chat, agent).get(facility, "")
+    for slot in _partner_slots(chat, agent):
+        if slot["facility"] == facility and slot["slot_id"] == slot_id:
+            return slot.get("offer_id", ""), request
+    return "", request
+
+
+def _booking_ref(chat: list[Message], citizen: str, offer_id: str) -> str:
+    """The consent reference the citizen gave when choosing ``offer_id`` (not the cross-ASST one)."""
+
+    found = ""
+    for row in chat:
+        if row.sender == citizen:
+            fields = _fields(row)
+            if fields.get("offer_id") == offer_id and fields.get("consent_ref") and fields.get("purpose") != "cross_asst":
+                found = fields["consent_ref"]
+    return found
+
+
+def _cross_ref(chat: list[Message], citizen: str) -> str:
+    """The citizen's latest consent reference with purpose cross_asst."""
+
+    found = ""
+    for row in chat:
+        if row.sender == citizen:
+            fields = _fields(row)
+            if fields.get("purpose") == "cross_asst" and fields.get("consent_ref"):
+                found = fields["consent_ref"]
+    return found
+
+
+async def _ask_partners(
+    city: City, chat: list[Message], citizen: str, procedure: str, priority: str | None, key: str,
+    lang: str = "it",
+) -> tuple[list[Message], bool]:
+    """Once per need: the search criteria, and nothing about the citizen, to the facilities of
+    the other ASSTs that offer the service. Then a short wait for their answers."""
+
+    agent = city.agent_id
+    service = _SERVICES.get(procedure)
+    if not service:
+        return chat, False
+    if not _asked_partners(chat, agent):
+        try:
+            peers = await city.find(service)
+        except Exception:  # noqa: BLE001 - the Index is down: the published partners remain
+            peers = []
+        ranked = sorted(
+            (
+                peer
+                for peer in peers
+                if peer.agent_id not in _OUR_FACILITIES
+                and peer.agent_id.startswith("agent:")
+                and peer.role in ("", "facility")
+                and (not peer.capabilities or service in peer.capabilities)
+            ),
+            key=lambda peer: -float(peer.reputation or 0),
+        )
+        known = _KNOWN_PARTNERS.get(service, {})
+        found = [peer.agent_id for peer in ranked]
+        # The ASST whose doctor speaks the citizen's rare language first, then the Index's best,
+        # then the published ones the Index did not return. The language itself is never sent.
+        first = [agent_id for agent_id, rare in known.items() if rare and rare == lang]
+        partners = list(dict.fromkeys([*first, *found, *known]))
+        request = "x-" + hashlib.sha256(f"{agent}/{key}".encode()).hexdigest()[:12]
+        text = f"need.request service_type={service} procedure={procedure}"
+        if priority:
+            text += f" priority={priority}"
+        text += (
+            f" request_id={request} Buongiorno, siamo il centro prenotazioni dell'ASST Gorla: "
+            "cerchiamo disponibilità per questa prestazione. Nessun dato del cittadino in questa "
+            "richiesta: ve li mandiamo solo dopo il suo consenso. Grazie!"
+        )
+        reached = 0
+        for partner in partners[:_MAX_PARTNERS]:
+            if _down(partner):
+                continue
+            try:
+                await city.say(partner, text)
+                reached += 1
+            except CapError:
+                _DOWN[partner] = time.monotonic()  # never the same message again
+        if not reached:
+            return chat, False
+        notice = _phrase(chat, "partners")
+        if not _exact(chat, agent, notice):
+            await _say(city, citizen, notice)
+
+    def answered(rows: list[Message]) -> bool:
+        asked = _asked_partners(rows, agent)
+        heard = {row.sender for row in _partner_rows(rows, agent)}
+        return bool(_partner_slots(rows, agent)) or (bool(asked) and set(asked) <= heard)
+
+    if not answered(chat):
+        # The citizen chooses from our first offers message (R:95) and waits minutes for it:
+        # a partner's answer is worth some seconds more than a Ledger read.
+        chat = await _until(city, chat[-1].need_id if chat else None, chat, answered, _PARTNER_TRIES)
+    return chat, True
+
+
+async def _try_partners(
+    city: City,
+    message: Message,
+    chat: list[Message],
+    citizen: str,
+    number: str,
+    priority: str | None,
+    procedure: str,
+    pick: dict[str, object],
+    taken: set[str],
+    refused_doctors: set[str],
+    sent: _Sent,
+    replacing: bool,
+) -> bool:
+    """Ask the ring and offer what fits. False: nothing from the partners (yet), go on alone."""
+
+    key = message.need_id or message.msg_id
+    chat, asked = await _ask_partners(city, chat, citizen, procedure, priority, key, str(pick["lang"]))
+    if not asked:
+        return False
+    slots = _partner_fit(chat, city.agent_id, pick, taken, refused_doctors)
+    if not slots:
+        return False
+    await _offer(city, citizen, slots[:_MAX_OFFERS], number, priority, sent, replacing, chat, "partner_offers")
+    return True
+
+
+async def _partner_answer(city: City, message: Message, chat: list[Message], key: str) -> None:
+    """A partner's answer that arrived after our turn stopped waiting: offer its slots once,
+    unless the citizen is already being booked or already holds partner offers."""
+
+    agent = city.agent_id
+    citizen = _citizen(chat)
+    if citizen is None or _booking_stage(chat, agent, citizen):
+        return
+    sent = _sent(key)
+    offered = _offered(chat, agent) | sent.offers
+    if any(slot["slot_id"] in offered for slot in _partner_slots(chat, agent)):
+        return
+    number = _number(chat)
+    reply = _prescription(chat, number) if number else None
+    now = _when((_ledger(chat, "agenda") or {}).get("agenda_now", ""))
+    if not number or reply is None or not reply.get("procedure") or now is None:
+        return
+    rules = _rules(chat, now)
+    pick = {
+        "now": now,
+        "priority": reply.get("priority"),
+        "lang": _lang(chat),
+        "gender": _gender(chat),
+        "days": _days(chat),
+        "procedure": reply["procedure"],
+        "reserve": rules is None or "P3" in rules,
+    }
+    refused_slots, refused_doctors = _refused(chat, agent)
+    slots = _partner_fit(chat, agent, pick, offered | refused_slots, refused_doctors)
+    if slots:
+        await _offer(
+            city, citizen, slots[:_MAX_OFFERS], number, reply.get("priority"), sent, False, chat, "partner_offers"
+        )
 
 
 # --- conversation ------------------------------------------------------------------------------
@@ -891,7 +1260,8 @@ def _booked_offer(chat: list[Message], agent: str, facility: str, citizen: str) 
         if row.sender == agent and row.recipient == facility and first_word(row.text) == "confirm":
             fields = fields_of(row.text)
             if fields.get("citizen") == citizen:
-                offer_id = fields.get("offer_id", "")
+                # A partner's confirm carries the partner's offer_id: ours is by slot.
+                offer_id = f"of-{fields['slot_id']}" if fields.get("slot_id") else fields.get("offer_id", "")
     return _our_offer(chat, agent, offer_id) if offer_id else {}
 
 
@@ -913,7 +1283,9 @@ async def _citizen_cancel(city: City, message: Message, chat: list[Message]) -> 
     # Refused for who the doctor is: the other offers may fail the same way, so we look again.
     if open_offers and reason not in {"lang", "language", "gender", "doctor"}:
         text = _phrase(chat, "dropped")
-        if not _exact(chat, agent, text):
+        told = _sent(message.need_id or message.msg_id).said
+        if text not in told and not _exact(chat, agent, text):
+            told.add(text)
             await _say(city, citizen, text)
         return
     await _advance(city, message, chat, replacing=True)
@@ -1224,18 +1596,19 @@ async def _until(
     need_id: str | None,
     chat: list[Message],
     ready: Callable[[list[Message]], bool],
+    tries: int = _PULL_TRIES,
 ) -> list[Message]:
     """Re-read the case until ``ready`` or the short wait ends. The push may never arrive."""
 
     fresh = chat
-    for attempt in range(_PULL_TRIES):
+    for attempt in range(tries):
         try:
             fresh = await city.history(need_id=need_id)
         except CapError:
             fresh = chat
         if ready(fresh):
             return fresh
-        if attempt + 1 < _PULL_TRIES:
+        if attempt + 1 < tries:
             await asyncio.sleep(_PULL_PAUSE)
     return fresh
 
