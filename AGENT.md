@@ -50,6 +50,7 @@ Ogni agente vede ciò che sanno gli altri: cosa è successo in un caso, cosa è 
 | `shared/schema.sql` | Data model (Supabase). Idempotente: si rilancia nel SQL Editor. |
 | `shared/tools.py` | **Fonte unica** dei tool. Solo stdlib: il Dockerfile non installa pacchetti. |
 | `shared/sync.sh` | Copia `tools.py` in ogni `<agente>/agent/` e genera `<agente>/agent/_secrets.py` da `.env`. |
+| `shared/sentiment.sql` | Tabella `sentiments` (una riga per episodio: score −1..1, label, emotion, basis `text`/`act`, mai il testo) e viste `sentiment_pending`, `sentiment_by_agent`. Idempotente. La scrive solo `tools/sentiment.py` dal laptop (secret key), dal job pianificato `sentiment-agenti` ogni 5 minuti (skill in `.claude/skills/sentiment-agenti/`). |
 | `.env` (root, gitignored) | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `EXA_API_KEY`. Nel pod vanno solo publishable key ed Exa. |
 
 Perché le copie: `city deploy` impacchetta solo `<agente>/agent/`, salta symlink e file `.env`, e nel pod non arrivano variabili d'ambiente nostre (`city secrets set` le salva ma non le monta). Ogni agente ha quindi il suo `tools.py` (committato) e il suo `_secrets.py` (gitignored). **Non modificare le copie**: modifica `shared/tools.py` e rilancia `shared/sync.sh`.

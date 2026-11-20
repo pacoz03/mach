@@ -1,0 +1,52 @@
+-- Sentiment dei messaggi dei nostri agenti. Idempotente: si rilancia senza danni.
+-- Una riga per episodio (episodes.id). Scrive solo il job pianificato dal laptop con la
+-- secret key (tools/sentiment.py): niente grant ad anon, RLS attiva.
+-- Privacy: qui non entra mai il testo del messaggio, solo punteggio, etichetta e una
+-- ragione breve senza dati personali.
+
+create table if not exists public.sentiments (
+  id           uuid primary key default gen_random_uuid(),
+  episode_id   uuid not null unique references public.episodes(id) on delete cascade,
+  msg_id       text,
+  agent        text not null,
+  direction    text not null check (direction in ('in', 'out')),
+  peer         text,
+  need_id      text,
+  at           timestamptz not null,                 -- quando è stato visto/inviato il messaggio
+  score        numeric(3,2) not null check (score between -1 and 1),
+  label        text not null check (label in ('positive', 'neutral', 'negative')),
+  emotion      text,                                 -- es. satisfied, frustrated, confused, urgent
+  confidence   numeric(3,2) check (confidence between 0 and 1),
+  basis        text not null check (basis in ('text', 'act')), -- testo vero o solo act + token
+  reason       text check (char_length(reason) <= 200),
+  model        text,
+  analyzed_at  timestamptz not null default now()
+);
+
+create index if not exists sentiments_agent_at on public.sentiments (agent, at desc);
+create index if not exists sentiments_need on public.sentiments (need_id);
+alter table public.sentiments enable row level security;
+revoke all on public.sentiments from anon, authenticated;
+
+-- Episodi non ancora analizzati (input del job).
+create or replace view public.sentiment_pending
+with (security_invoker = true) as
+select e.id as episode_id, e.msg_id, e.at, e.agent, e.version, e.direction, e.peer,
+       e.peer_kind, e.need_id, e.act, e.fields, e.body, e.error
+from public.episodes e
+left join public.sentiments s on s.episode_id = e.id
+where s.id is null;
+
+-- Andamento per agente e direzione, a finestre di 5 minuti.
+create or replace view public.sentiment_by_agent
+with (security_invoker = true) as
+select agent, direction,
+       date_bin('5 minutes', at, timestamptz '2026-01-01') as bucket,
+       count(*)                                   as messages,
+       round(avg(score), 2)                       as avg_score,
+       count(*) filter (where label = 'negative') as negatives,
+       count(*) filter (where label = 'positive') as positives
+from public.sentiments
+group by 1, 2, 3;
+
+revoke all on public.sentiment_pending, public.sentiment_by_agent from anon, authenticated;
