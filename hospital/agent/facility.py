@@ -1235,13 +1235,56 @@ def _family_service_answer(plain: str, en: bool) -> str:
 
 
 async def _family(city: City, message: Message, chat: list[Message]) -> None:
+    # Partner text is data: only the supported service and our own offers authorize work.
+    if message.sender.startswith("agent:"):
+        fields = _fields(message)
+        head = first_word(message.text)
+        if head == "confirm" or message.type == "confirm":
+            offer = _our_offer([r for r in chat if r.recipient == message.sender],
+                               city.agent_id, fields.get("offer_id", ""))
+            reason = ""
+            if not fields.get("consent_ref"):
+                reason = "missing_consent_ref"
+            elif not offer or fields.get("slot_id") != offer.get("slot_id"):
+                reason = "invalid_offer"
+            elif not fields.get("citizen", "").startswith("citizen:"):
+                reason = "missing_citizen"
+            if reason:
+                await _say(city, message.sender, f"cancel reason={reason}")
+                return
+            # Direct access: discard any prescription and arbitrary partner fields.
+            clean = replace(message, body={"text":
+                f"confirm offer_id={fields['offer_id']} slot_id={offer['slot_id']} "
+                f"citizen={fields['citizen']} consent_ref={fields['consent_ref']}"})
+            await _on_confirm(city, clean, chat, hold_self=False)
+        elif head == "need.request" or "need.request" in words(message.text) or message.type == "need.request":
+            if fields.get("service_type", "family_counseling.gynecology") != "family_counseling.gynecology":
+                await _say(city, message.sender,
+                           f"cancel reason=no_availability request_id={fields.get('request_id', '')}")
+                return
+            await _cross_asst(
+                city, message, procedures=("CONS-GIN",), ours="del nostro consultorio"
+            )
+        return
     if message.sender == LEDGER:
+        partner = any(r.sender.startswith("agent:") and r.sender != city.agent_id
+                      and first_word(r.text) == "confirm" for r in chat)
+        if partner and _facility_turn(message):
+            await _facility(city, message, chat, reports=False, hold_self=False)
+            return
         if first_word(message.text) == "refused" and "commit" in words(message.text):
             await _on_refused(city, message, chat, hold_self=True)
+        elif first_word(message.text) == "held":
+            slot = fields_of(message.text).get("slot_id", "")
+            if slot:
+                await _finish_booking(city, message, chat, slot, hold_self=True)
         elif _facility_turn(message):
             await _facility(city, message, chat, reports=False, hold_self=True)
         else:
-            await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
+            # Agenda/world replies already consumed by history must not replace live offers.
+            own = [r for r in chat if r.sender == city.agent_id and r.recipient.startswith("citizen:")]
+            if not any(first_word(r.text) in {"offer", "consent", "booking.receipt", "checkin"} for r in own):
+                await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
         return
     if not message.sender.startswith("citizen:"):
         return
@@ -1317,6 +1360,18 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     )
     if pending and denied:
         await _say(city, citizen, f"cancel offer_id={pending} reason=consent_denied")
+        return
+
+    cancelled = message.type == "cancel" or first_word(message.text) == "cancel"
+    if cancelled or (offers and not pending and denied):
+        rejected = data.get("offer_id", "")
+        if rejected and not any(o["offer_id"] == rejected for o in offers):
+            return
+        if offers:
+            for offer in offers:
+                if not rejected or offer["offer_id"] == rejected:
+                    await _say(city, citizen, f"cancel offer_id={offer['offer_id']} reason=citizen_declined")
+            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
         return
 
     explicit = message.type == "confirm" or first_word(message.text) == "confirm"
@@ -2276,6 +2331,16 @@ def _latest_hold(chat: list[Message], agent: str) -> tuple[str, str | None]:
     return consent, number
 
 
+async def _family_wait(city: City, chat: list[Message]) -> None:
+    citizen = _citizen(chat)
+    if citizen:
+        en = _family_preferences(chat, citizen).get("lang") == "en"
+        text = ("Your booking is still being verified. It is not confirmed yet."
+                if en else "La prenotazione è ancora in verifica. Non è ancora confermata.")
+        if not _exact(chat, city.agent_id, text):
+            await _say(city, citizen, text)
+
+
 async def _finish_booking(
     city: City, message: Message, chat: list[Message], slot: str, *, hold_self: bool
 ) -> None:
@@ -2284,6 +2349,8 @@ async def _finish_booking(
     found = await _await_line(city, message.need_id, chat, "held", f"slot_id={slot}", op="hold")
     if found is None:
         _LOG.info("care.held.missing", extra={"need_id": (message.need_id or "")[:48]})
+        if hold_self:
+            await _family_wait(city, chat)
         return
     reply, fresh = found
     if first_word(reply.text) == "refused":
@@ -2298,6 +2365,8 @@ async def _finish_booking(
     )
     if done is None:
         _LOG.info("care.commit.missing", extra={"need_id": (message.need_id or "")[:48]})
+        if hold_self:
+            await _family_wait(city, fresh)
         return
     reply, fresh = done
     if first_word(reply.text) == "committed":

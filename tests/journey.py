@@ -903,8 +903,10 @@ SCENARIOS: dict[str, dict] = {
     "gp_testo_libero_en": dict(start=("gp", KNEE_EN), llm={KNEE_EN: '<think>knee</think> {"code":"SYM-KNEE","red_flag":false,"lang":"en"}'},
                                expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
                                        told_text("gp", "I understand your concern", cite="lang en")]),
+    # Le regole decidono il protocollo (VIS-FIS/B anche se il modello direbbe SYM-KNEE); il modello
+    # viene chiamato una volta sola, per la lingua del cittadino (tools.language).
     "gp_regole_prima": dict(start=BACK, llm={BACK[1]: '{"code": "SYM-KNEE"}'}, expect=[
-        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 0)]),
+        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 1)]),
     "gp_red_flag_modello": dict(start=("gp", PECHO), llm={PECHO: '{"code": "NONE", "red_flag": true, "lang": "es"}'},
                                 expect=[told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442")]),
     # Codice inventato dal modello o Gateway giù: nessuna ricetta, il gp chiede il motivo (mai muto).

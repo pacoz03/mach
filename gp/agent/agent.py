@@ -21,6 +21,8 @@ import tools  # noqa: E402
 
 # What the citizen wrote in this turn: our reply goes out in that language (tools.localize).
 _HEARD: ContextVar[str] = ContextVar("heard", default="")
+# The language the model named for those words in this turn, so localize does not ask again.
+_LANG: ContextVar[str | None] = ContextVar("lang", default=None)
 
 
 PROTOCOL = {
@@ -205,7 +207,8 @@ async def main(need: Need, city: City) -> None:
     if inbound is None:
         return
     message = understood(inbound)
-    _HEARD.set("")  # never the words of a previous turn
+    _HEARD.set("")  # never the words or language of a previous turn
+    _LANG.set(None)
     if message.sender == LEDGER:
         if message.need_id and message.text.split()[:1] in (["prescribed"], ["refused"]):
             async with _case_lock(message.need_id):
@@ -237,18 +240,23 @@ async def main(need: Need, city: City) -> None:
         return
 
     code = _symptom_code(message, text)
-    # The model names the citizen's language (any language); our word list only if it cannot.
+    # The model names the citizen's language (any language), once per turn: the level-3 reading
+    # brings it, otherwise one short call. Our word list only if the model cannot.
     # The handoff's lang= stays it/en (_reply_lang): the booking centre filters doctors on it.
-    lang = await tools.language(city, said) or _guess_lang(text)
     if code is None:
         # Level 3: the citizen's own words, in any language. The rules found nothing, so the model
         # reads them once; only a protocol code, a yes/no red flag and a language come back.
         read = await _read_with_model(city, said)
+        heard = read.get("lang")
+        lang = heard if isinstance(heard, str) else _guess_lang(text)
         if read.get("red_flag") is True:
-            await _escalate(city, message, str(read.get("lang", lang)))
+            await _escalate(city, message, lang)
             return
         code = read.get("code")
-        lang = str(read.get("lang", lang))
+    else:
+        heard = await tools.language(city, said)
+        lang = heard or _guess_lang(text)
+    _LANG.set(heard if isinstance(heard, str) else "")  # "": asked, no answer, not again
     if message.need_id:
         async with _case_lock(message.need_id):
             history = await city.history(need_id=message.need_id)
@@ -770,7 +778,7 @@ async def _tell(city: City, patient: str, text: str, history: list[Message] | No
         # Their own words, not a bare "data.response purpose=booking": tokens say no language.
         words = (re.sub(r"\S+=\S+", "", row.text or "") for row in reversed(history) if row.sender == patient)
         heard = next((said for said in words if len(re.findall(r"[^\W\d_]{2,}", said)) >= 3), "")
-    await city.say(patient, await tools.localize(city, text, heard))
+    await city.say(patient, await tools.localize(city, text, heard, _LANG.get()))
 
 
 def _lang(history: list[Message]) -> str:

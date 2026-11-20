@@ -389,13 +389,18 @@ async def language(city: Any, citizen_text: str | None) -> str | None:
     return code if re.fullmatch(r"[a-z]{2}", code) else None
 
 
-async def localize(city: Any, text: str, citizen_text: str | None) -> str:
-    """``text`` con la frase nella lingua di ``citizen_text``. Non solleva mai."""
+async def localize(city: Any, text: str, citizen_text: str | None, lang: str | None = None) -> str:
+    """``text`` con la frase nella lingua di ``citizen_text``. ``lang``: la lingua che il turno
+    ha già chiesto al modello (una chiamata in meno); ``""`` = chiesta senza risposta, non si
+    richiede. Non solleva mai."""
 
     head, prose = _split(text)
     if not prose:
         return text
-    lang = await language(city, citizen_text)
+    if lang is None:
+        lang = await language(city, citizen_text)
+    if lang is not None and not re.fullmatch(r"[a-z]{2}", lang):
+        lang = None
     if lang is None or lang == "it":
         return text
     try:
