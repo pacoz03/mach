@@ -133,38 +133,60 @@ class Prescription:
             f"priority={self.priority}"
         )
 
-    def reply(self, lang: str, handed: bool) -> str:
+    def reply(self, lang: str, handed: bool, prefs: dict[str, object] | None = None) -> str:
         timing = TIMING[lang].get(self.priority)
+        noted = _describe(prefs or {}, lang)
         if lang == "en":
             text = (
                 "I understand your concern and I have taken care of it right away. "
                 f"Your prescription is registered with priority {self.priority}"
                 + (f": {timing}. " if timing else ". ")
             )
-            text += (
-                "I have already passed it to our booking centre. If you have preferred days or a "
-                "preference for the doctor's gender or language, tell the booking centre: it will "
-                "find the slot that suits you best."
-                if handed
-                else "To book, write to your ASST's booking centre with the prescription number. If "
-                "you have preferred days or a preference for the doctor's gender or language, tell "
-                "them: they will find the slot that suits you best."
-            )
+            if handed:
+                text += "I have already passed it to our booking centre. "
+                text += (
+                    f"I have noted your preferences ({noted}) and passed them on too, so they can "
+                    "look for a slot that matches them."
+                    if noted
+                    else "If you have preferred days or a preference for the doctor's gender or "
+                    "language, tell the booking centre: it will find the slot that suits you best."
+                )
+            else:
+                text += "To book, write to your ASST's booking centre with the prescription number. "
+                text += (
+                    f"Remember to tell them your preferences ({noted}): they will look for a slot "
+                    "that matches them."
+                    if noted
+                    else "If you have preferred days or a preference for the doctor's gender or "
+                    "language, tell them: they will find the slot that suits you best."
+                )
         else:
             text = (
                 "Capisco la sua preoccupazione e me ne sono occupato subito. "
                 f"La ricetta è registrata con priorità {self.priority}"
                 + (f": {timing}. " if timing else ". ")
             )
-            text += (
-                "Ho già passato la ricetta al nostro centro prenotazioni. Se ha giorni preferiti o "
-                "preferenze sul genere o sulla lingua del medico, le indichi al centro prenotazioni: "
-                "così troverà lo slot più adatto a lei."
-                if handed
-                else "Per prenotare scriva al centro prenotazioni della sua ASST con il numero della "
-                "ricetta. Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
-                "le indichi: così troverà lo slot più adatto a lei."
-            )
+            if handed:
+                text += "Ho già passato la ricetta al nostro centro prenotazioni. "
+                text += (
+                    f"Ho preso nota delle sue preferenze ({noted}) e le ho passate anche quelle, "
+                    "così cercherà uno slot che le rispetti."
+                    if noted
+                    else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
+                    "le indichi al centro prenotazioni: così troverà lo slot più adatto a lei."
+                )
+            else:
+                text += (
+                    "Per prenotare scriva al centro prenotazioni della sua ASST con il numero "
+                    "della ricetta. "
+                )
+                text += (
+                    f"Ricordi di indicare le sue preferenze ({noted}): cercheranno uno slot che le "
+                    "rispetti."
+                    if noted
+                    else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
+                    "le indichi: così troverà lo slot più adatto a lei."
+                )
         return f"{self.head} {text}"
 
 
@@ -226,7 +248,8 @@ async def main(need: Need, city: City) -> None:
                     await _renew(city, message.sender, message.need_id, issued.number, lang)
                     return
                 if code is None or PROTOCOL[code] == (issued.procedure, issued.priority):
-                    await city.say(message.sender, _reminder(history, city.agent_id, issued, lang))
+                    prefs = {**_case_preferences(history, message.sender), **_preferences(said)}
+                    await city.say(message.sender, _reminder(history, city.agent_id, issued, lang, prefs))
                     return
                 await _prescribe(city, message, message.need_id, code, lang, again=True)
                 return
@@ -343,6 +366,142 @@ def _symptom_code(message: Message, text: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+# --- the citizen's preferences (level 3) -------------------------------------------------------
+# What the citizen tells the gp about the visit they want: the doctor's language and gender, the
+# days they can come. We confirm them and pass them to the booking centre with the prescription,
+# with the tokens it reads from a citizen (lang/doctor_lang, gender_preference, days). Rules only,
+# never guesses: a preference we are not sure of is left to the booking centre to ask.
+_LANG_NAMES = {
+    "en": r"ingles\w*|english|anglofon\w*",
+    "sq": r"albanes\w*|albanian",
+    "es": r"spagnol\w*|spanish|espa[nñ]ol",
+    "fr": r"frances\w*|french|fran[cç]ais",
+    "de": r"tedesc\w*|german|deutsch",
+    "ar": r"arab\w*",
+    "ro": r"romen\w*|rumen\w*|romanian",
+    "zh": r"cines\w*|chinese",
+    "ru": r"russ[oia]\b|russian",
+    "uk": r"ucrain\w*|ukrainian",
+    "pt": r"portoghes\w*|portuguese",
+}
+# A language is a preference for the doctor only next to a word about speaking it.
+_SPEAK = r"(?:speak\w*|speaker|parl\w*|lingua|language|madrelingua|-speaking)"
+_DOCTOR_LANG = {
+    code: re.compile(rf"{_SPEAK}\W+(?:\w+\W+){{0,3}}?(?:{names})|(?:{names})(?:\W+\w+){{0,2}}?\W*{_SPEAK}")
+    for code, names in _LANG_NAMES.items()
+}
+_FEMALE = re.compile(
+    r"\b(?:una|la|da una|con una) dottoressa\b|\bmedic[oa] donna\b|\bdottor\w* donna\b|\buna donna\b"
+    r"|\b(?:female|woman|lady) (?:doctor|physician|physio\w*)\b|\ba woman\b"
+)
+_MALE = re.compile(
+    r"\bmedico uomo\b|\bdottor\w* uomo\b|\bun uomo\b|\b(?:male|man) (?:doctor|physician|physio\w*)\b"
+    r"|\ba man\b"
+)
+_DAY_NAMES = {
+    "mon": r"luned[iì]|monday", "tue": r"marted[iì]|tuesday", "wed": r"mercoled[iì]|wednesday",
+    "thu": r"gioved[iì]|thursday", "fri": r"venerd[iì]|friday",
+}
+_DAY = re.compile("|".join(rf"(?P<{day}>\b(?:{names})s?\b)" for day, names in _DAY_NAMES.items()))
+# A weekday is a wish only in a sentence that says so ("preferisco il lunedì", "I can only do
+# Fridays"), never "da lunedì ho mal di schiena" / "since Monday".
+_WISH = re.compile(
+    r"prefer\w*|meglio|possibilmente|disponibil\w*|liber[oa]\b|posso|potrei|riesco|va bene|vanno bene"
+    r"|ideally|available|free\b|\bcan\b|could|works?\b|suits?\b|better|only\b|solo\b|soltanto"
+)
+_PAST = re.compile(r"\b(?:da|dal|dalla|dallo|scorso|scorsa|since|last|ago|fa)\s+(?:\w+\s+)?$")
+_NOT_DAY = re.compile(
+    r"\b(?:non|no|not|never|tranne|eccetto|except|but not|n't)\b\W+(?:\w+\W+){0,3}?$|n't\s+(?:\w+\s+){0,3}$"
+)
+_WEEK = ("mon", "tue", "wed", "thu", "fri")
+
+
+def _preferences(text: str) -> dict[str, object]:
+    """``doctor_lang`` (ISO code), ``gender`` (f/m), ``days`` (sorted tuple of mon..fri)."""
+
+    plain = unicodedata.normalize("NFKC", text.replace("’", "'")).casefold()
+    prefs: dict[str, object] = {}
+    langs = [code for code, pattern in _DOCTOR_LANG.items() if pattern.search(plain)]
+    if len(langs) == 1:
+        prefs["doctor_lang"] = langs[0]
+    female, male = bool(_FEMALE.search(plain)), bool(_MALE.search(plain))
+    if female != male:
+        prefs["gender"] = "f" if female else "m"
+    wanted: set[str] = set()
+    excluded: set[str] = set()
+    for sentence in re.split(r"[.!?;\n]+", plain):
+        if not _WISH.search(sentence):
+            continue
+        for match in _DAY.finditer(sentence):
+            before = sentence[max(0, match.start() - 40) : match.start()]
+            if _PAST.search(before):
+                continue
+            (excluded if _NOT_DAY.search(before) else wanted).add(match.lastgroup)
+    days = (wanted or (set(_WEEK) if excluded else set())) - excluded
+    if days and len(days) < len(_WEEK):
+        prefs["days"] = tuple(day for day in _WEEK if day in days)
+    return prefs
+
+
+def _case_preferences(history: list[Message], patient: str) -> dict[str, object]:
+    """The preferences the citizen gave the gp in this case; a later message wins per field."""
+
+    prefs: dict[str, object] = {}
+    for row in history:
+        if row.sender == patient and row.recipient != LEDGER:
+            prefs.update(_preferences(row.text or ""))
+    return prefs
+
+
+_LANG_LABEL = {
+    "it": {"en": "inglese", "sq": "albanese", "es": "spagnolo", "fr": "francese", "de": "tedesco",
+           "ar": "arabo", "ro": "rumeno", "zh": "cinese", "ru": "russo", "uk": "ucraino",
+           "pt": "portoghese"},
+    "en": {"en": "English", "sq": "Albanian", "es": "Spanish", "fr": "French", "de": "German",
+           "ar": "Arabic", "ro": "Romanian", "zh": "Chinese", "ru": "Russian", "uk": "Ukrainian",
+           "pt": "Portuguese"},
+}
+_DAY_LABEL = {
+    "it": {"mon": "lunedì", "tue": "martedì", "wed": "mercoledì", "thu": "giovedì", "fri": "venerdì"},
+    "en": {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday", "fri": "Friday"},
+}
+
+
+def _describe(prefs: dict[str, object], lang: str) -> str:
+    """The preferences in the citizen's words, for our reply; '' when there are none."""
+
+    parts = []
+    doctor_lang = prefs.get("doctor_lang")
+    speaks = _LANG_LABEL[lang].get(doctor_lang) if isinstance(doctor_lang, str) else None
+    gender = prefs.get("gender")
+    if speaks or gender in ("f", "m"):
+        if lang == "en":
+            who = {"f": "a female doctor", "m": "a male doctor"}.get(str(gender), "a doctor")
+            parts.append(who + (f" who speaks {speaks}" if speaks else ""))
+        else:
+            who = {"f": "una dottoressa", "m": "un medico uomo"}.get(str(gender), "un medico")
+            parts.append(who + (f" che parli {speaks}" if speaks else ""))
+    days = prefs.get("days")
+    if isinstance(days, tuple) and days:
+        names = [_DAY_LABEL[lang][day] for day in days]
+        joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + (" or " if lang == "en" else " o ") + names[-1]
+        parts.append(joined)
+    return "; ".join(parts)
+
+
+def _preference_tokens(prefs: dict[str, object]) -> str:
+    """The tokens the booking centre reads from a citizen, for our handoff."""
+
+    tokens = []
+    if isinstance(prefs.get("doctor_lang"), str):
+        tokens.append(f"doctor_lang={prefs['doctor_lang']}")
+    if prefs.get("gender") in ("f", "m"):
+        tokens.append(f"gender_preference={prefs['gender']}")
+    if isinstance(prefs.get("days"), tuple) and prefs["days"]:
+        tokens.append("days=" + ",".join(prefs["days"]))  # type: ignore[arg-type]
+    return " ".join(tokens)
+
+
 async def _prescribe(
     city: City, message: Message, need_id: str, code: str, lang: str, *, again: bool = False
 ) -> None:
@@ -352,7 +511,7 @@ async def _prescribe(
     digest = sha256(key.encode()).hexdigest()[:24].upper()
     procedure, priority = PROTOCOL[code]
     request = Prescription(message.sender, f"prescription_number-{digest}", procedure, priority)
-    await _issue(city, need_id, request, f"symptom_code={code} ", lang)
+    await _issue(city, need_id, request, f"symptom_code={code} ", lang, _preferences(message.text or ""))
 
 
 # "the prescription expired, I need a new one" in words, without the prescription_number token.
@@ -387,10 +546,13 @@ def _issued(history: list[Message], agent_id: str, patient: str) -> Prescription
     return None
 
 
-def _reminder(history: list[Message], agent_id: str, issued: Prescription, lang: str) -> str:
+def _reminder(
+    history: list[Message], agent_id: str, issued: Prescription, lang: str, prefs: dict[str, object]
+) -> str:
     """What is ready and what happens next, for a citizen who writes again after the prescription."""
 
     lang = _reply_lang(lang)
+    noted = _describe(prefs, lang)
     handed = any(
         row.sender == agent_id
         and row.text.startswith(HANDOFF + " ")
@@ -409,9 +571,13 @@ def _reminder(history: list[Message], agent_id: str, issued: Prescription, lang:
             else "To book, write to your ASST's booking centre with the prescription number. "
         )
         text += (
-            "If you have preferred days or a preference for the doctor's gender or language, tell "
-            "the booking centre. If you feel worse or something new comes up, write to me."
+            f"I have noted your preferences ({noted}): confirm them to the booking centre when it "
+            "contacts you, so it can look for a slot that matches them. "
+            if noted
+            else "If you have preferred days or a preference for the doctor's gender or language, "
+            "tell the booking centre. "
         )
+        text += "If you feel worse or something new comes up, write to me."
     else:
         text = (
             "Grazie per avermi scritto. La sua ricetta è già pronta, con priorità "
@@ -425,9 +591,13 @@ def _reminder(history: list[Message], agent_id: str, issued: Prescription, lang:
             "della ricetta. "
         )
         text += (
-            "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, le indichi "
-            "al centro prenotazioni. Se si sente peggio o compare un disturbo nuovo, mi scriva."
+            f"Ho preso nota delle sue preferenze ({noted}): le confermi al centro prenotazioni "
+            "quando la contatta, così cercherà uno slot che le rispetti. "
+            if noted
+            else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, le "
+            "indichi al centro prenotazioni. "
         )
+        text += "Se si sente peggio o compare un disturbo nuovo, mi scriva."
     return f"{issued.head} {text}"
 
 
@@ -478,7 +648,10 @@ def _ledger_rx(history: list[Message], number: str) -> dict | None:
     return found
 
 
-async def _issue(city: City, need_id: str, request: Prescription, extra: str, lang: str) -> None:
+async def _issue(
+    city: City, need_id: str, request: Prescription, extra: str, lang: str,
+    prefs: dict[str, object] | None = None,
+) -> None:
     """Ledger first: ``prescribe``, then the prescription to the citizen once it is written."""
 
     history = await city.history(need_id=need_id)
@@ -495,11 +668,11 @@ async def _issue(city: City, need_id: str, request: Prescription, extra: str, la
 
     # In some runs a Ledger reply is visible in history before it opens an agent turn.
     for _ in range(LEDGER_WAIT_ATTEMPTS):
-        if await _notify(city, history, request, lang):
+        if await _notify(city, history, request, lang, prefs):
             return
         await asyncio.sleep(LEDGER_WAIT_SECONDS)
         history = await city.history(need_id=need_id)
-    await _notify(city, history, request, lang)
+    await _notify(city, history, request, lang, prefs)
 
 
 def _previous_prescription(
@@ -524,9 +697,13 @@ def _previous_prescription(
 
 
 async def _notify(
-    city: City, history: list[Message], request: Prescription, lang: str | None = None
+    city: City,
+    history: list[Message],
+    request: Prescription,
+    lang: str | None = None,
+    prefs: dict[str, object] | None = None,
 ) -> bool:
-    """``lang``: the language read in this turn; a Ledger turn has none and reads the case's."""
+    """``lang``/``prefs``: what this turn read; a Ledger turn has none and reads the case's."""
 
     answer = None
     matching_request = False
@@ -563,8 +740,10 @@ async def _notify(
     ):
         lang = _lang(history) if lang is None else _reply_lang(lang)
         # Before the citizen's message, so that "already passed on" is true when we say it.
-        handed = await _handoff(city, history, request, lang)
-        await city.say(request.patient, request.reply(lang, handed))
+        # This turn's words may not be in history yet: they win over the case's earlier ones.
+        prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
+        handed = await _handoff(city, history, request, lang, prefs)
+        await city.say(request.patient, request.reply(lang, handed, prefs))
     return True
 
 
@@ -579,7 +758,9 @@ def _lang(history: list[Message]) -> str:
     return "en" if said and _guess_lang(said[0].text.casefold()) == "en" else "it"
 
 
-async def _handoff(city: City, history: list[Message], request: Prescription, lang: str) -> bool:
+async def _handoff(
+    city: City, history: list[Message], request: Prescription, lang: str, prefs: dict[str, object]
+) -> bool:
     """Best effort, once per need: the prescription to our booking centre. Never raises."""
 
     done = [row.text for row in history if row.sender == city.agent_id and row.text.startswith(HANDOFF + " ")]
@@ -593,7 +774,10 @@ async def _handoff(city: City, history: list[Message], request: Prescription, la
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
             f"procedure={request.procedure} priority={request.priority} lang={lang} "
-            "Buongiorno, vi passo la ricetta appena registrata sul Ledger per la prenotazione. Grazie!",
+            + (f"{tokens} " if (tokens := _preference_tokens(prefs)) else "")
+            + "Buongiorno, vi passo la ricetta appena registrata sul Ledger per la prenotazione"
+            + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
+            + "Grazie!",
         )
         return True
     except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us

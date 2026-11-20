@@ -10,5 +10,7 @@ role: gp
 capabilities:
   - gp
 no_clinical_advice: true
+data_processing:
+  - purpose: care-coordination
 endpoints:
   mailbox: agent:ck9w60ejwnvw
