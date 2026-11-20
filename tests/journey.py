@@ -466,7 +466,7 @@ class Bus:
         lang = self.citizen.sc.get("confirm_lang")  # il centro manda lang= nel confirm all'ospedale
         if (lang and sender == self.ids["booking_centre"] and to == self.ids["hospital"]
                 and str(body.get("text", "")).startswith("confirm")):
-            body = {**body, "text": f"{body['text']} lang={lang}"}
+            body = {**body, "text": f"{re.sub(r' ?lang=\S+', '', body['text'])} lang={lang}"}
         m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
                     need_id=need, conversation_id=conv, body=body)
         self.log.append(m)
