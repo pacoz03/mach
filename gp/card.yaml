@@ -1,7 +1,7 @@
 agent_id: agent:ck9w60ejwnvw
 team: team:the-promptfather-s
 name: gp
-version: 1.0.4
+version: 1.0.5
 cap_versions:
   - "1.0"
 profiles:
@@ -10,5 +10,7 @@ role: gp
 capabilities:
   - gp
 no_clinical_advice: true
+data_processing:
+  - purpose: care-coordination
 endpoints:
   mailbox: agent:ck9w60ejwnvw
