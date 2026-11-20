@@ -442,8 +442,13 @@ async def _advance_alone(
     refresh = False
     if replacing:
         trigger = fields_of(message.text).get("offer_id") or message.msg_id
+        if message.sender.startswith("citizen:"):
+            # A citizen refusing several offers of one message is one refusal: one new search.
+            trigger = "citizen:" + (_offer_source(chat, agent, trigger) or trigger)
         if sent.trigger != trigger:
             sent.trigger, sent.again, refresh = trigger, set(), True
+        elif message.sender.startswith("citizen:"):
+            return
     # Once the citizen names the number, only a Ledger answer after their message counts. The
     # GP's handoff read it at issue, and a prescription can expire in between (P1).
     since = next(
@@ -541,6 +546,11 @@ async def _advance_alone(
     }
     blocked = False
     fallback: list[dict[str, str]] = []
+    # A language one of our doctors speaks is a hard need (the citizen refuses anyone else,
+    # journey 0071): only those doctors, on every page, then past the deadline. A language none
+    # of ours speaks cannot be met here, so it does not filter.
+    spoken = pick["lang"] != "it" and any(pick["lang"] in spec[0] or (
+        "*" in spec[0] and pick["lang"] == _RARE_LANG) for spec in _DOCTORS.values())
     refused_slots, refused_doctors = _refused(chat, agent)
     taken = taken | refused_slots
     # After the citizen turned an offer down, the new ones come with a word about it.
@@ -550,7 +560,9 @@ async def _advance_alone(
         fit = [
             slot
             for slot in fitting(lines, **pick)
-            if slot.get("slot_id") not in taken and slot.get("doctor_id") not in refused_doctors
+            if slot.get("slot_id") not in taken
+            and slot.get("doctor_id") not in refused_doctors
+            and (not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
         ]
         chosen = [slot for slot in fit if not _down(slot.get("facility", ""))]
         blocked = blocked or len(chosen) < len(fit)
@@ -594,6 +606,7 @@ async def _advance_alone(
         for slot in fitting(lines, **pick, relaxed=True)
         if slot.get("slot_id") not in taken
         and slot.get("doctor_id") not in refused_doctors
+        and (not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
         and not _down(slot.get("facility", ""))
     ]
     if relaxed:
@@ -858,6 +871,16 @@ def _refused(chat: list[Message], agent: str) -> tuple[set[str], set[str]]:
         if fields.get("reason", "").lower() in {"lang", "language", "gender", "doctor"} and offer.get("doctor_id"):
             doctors.add(offer["doctor_id"])
     return slots, doctors
+
+
+def _offer_source(chat: list[Message], agent: str, offer_id: str) -> str:
+    """The msg_id of our message that carried ``offer_id``."""
+
+    for row in chat:
+        if row.sender == agent and "offer" in words(row.text):
+            if any(offer.get("offer_id") == offer_id for offer in _offers_in(row.text)):
+                return row.msg_id
+    return ""
 
 
 def _booked_offer(chat: list[Message], agent: str, facility: str, citizen: str) -> dict[str, str]:
