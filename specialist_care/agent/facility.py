@@ -46,6 +46,8 @@ _LOG = logging.getLogger("care")
 # the case history and never opens a turn. Wait briefly and read it back from history.
 _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
+# About 3 s: the visit's time and the city's clock are a courtesy, never worth a long wait.
+_SHORT_TRIES = 12
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 # The kit names no outcome_code values: VISIT is the only one it writes (examples/agent.py).
@@ -338,18 +340,19 @@ async def _until(
     need_id: str | None,
     chat: list[Message],
     ready: Callable[[list[Message]], bool],
+    tries: int = _PULL_TRIES,
 ) -> list[Message]:
     """Re-read the case until ``ready`` or the short wait ends. The push may never arrive."""
 
     fresh = chat
-    for attempt in range(_PULL_TRIES):
+    for attempt in range(tries):
         try:
             fresh = await city.history(need_id=need_id)
         except CapError:
             fresh = chat
         if ready(fresh):
             return fresh
-        if attempt + 1 < _PULL_TRIES:
+        if attempt + 1 < tries:
             await asyncio.sleep(_PULL_PAUSE)
     return fresh
 
@@ -1126,9 +1129,92 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         # A refusal that came after the arrival turn stopped waiting for it.
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
     else:
-        await _facility(city, message, chat, reports=False, hold_self=False)
+        booking = _facility(city, message, chat, reports=False, hold_self=False)
+        if confirm and message.sender != LEDGER:
+            # The visit's time, read alongside the hold: world goes out first, so it still
+            # lists the slot, and the hold, commit and receipt do not wait for it.
+            await asyncio.gather(_ask_slots(city, message, chat), booking)
+        else:
+            await booking
         if confirm or (message.sender == LEDGER and head in {"held", "committed"}):
             await _welcome(city, message)
+
+
+async def _ask_slots(city: City, message: Message, chat: list[Message]) -> None:
+    """One ``world`` page for the visit's time: neither the confirm nor held/committed carry
+    it. Page 1 only: a slot not on it stays unknown, never guessed. Its reply is read from
+    history (_welcome, _answer); as a turn of its own it does nothing."""
+
+    fields = _fields(message)
+    slot = fields.get("slot_id", "")
+    facts = _slot_facts(chat, city.agent_id, slot)
+    if not slot or facts.get("at"):
+        return
+    procedure = fields.get("procedure") or facts.get("procedure")
+    await _say(city, LEDGER, f"world procedure={procedure} page=1" if procedure else "world page=1")
+
+
+async def _agenda_now(
+    city: City, message: Message, chat: list[Message]
+) -> tuple[datetime | None, list[Message]]:
+    """The city's clock (agenda time, 60x real time, never the pc's): a fresh ``agenda``
+    reply within ~3 s, else None and we go on without it. Also the re-read case."""
+
+    known = {row.msg_id for row in chat}
+
+    def fresh(rows: list[Message]) -> dict[str, str] | None:
+        return _ledger([row for row in rows if row.msg_id not in known], "agenda")
+
+    if not await _say(city, LEDGER, "agenda"):
+        return None, chat
+    rows = await _until(
+        city, message.need_id, chat, lambda rows: fresh(rows) is not None, tries=_SHORT_TRIES
+    )
+    reply = fresh(rows)
+    return (None if reply is None else _when(reply["agenda_now"])), rows
+
+
+def _timing(at: datetime, now: datetime | None, en: bool, *, inside: bool = True) -> str:
+    """One sentence on when to come, by the city's clock, or "" without it. ``inside``:
+    say so when the arrival window is open now."""
+
+    if now is None:
+        return ""
+    now = now.astimezone(at.tzinfo)
+    start = at.replace(hour=8 if at.hour < 13 else 13, minute=0, second=0, microsecond=0)
+    end = start + timedelta(hours=5)
+    if now >= end:
+        return (
+            " The time of this visit has already passed: the booking centre can find you a new "
+            "date."
+            if en
+            else " L'orario di questa visita risulta già passato: il centro prenotazioni può "
+            "trovarle una nuova data."
+        )
+    if now.date() != at.date():
+        today = f"{_DAY_NAMES['en' if en else 'it'][now.weekday()]} {now:%d/%m}"
+        return (
+            f" Today is {today}: your visit is on another day, we expect you on "
+            f"{_in_words(at, True)}."
+            if en
+            else f" Oggi è {today}: la visita è un altro giorno, la aspettiamo "
+            f"{_in_words(at, False)}."
+        )
+    if now < start:
+        return (
+            f" Your visit is today: arrivals open at {start:%H:%M}, please come from then."
+            if en
+            else f" La visita è oggi: la fascia per l'arrivo apre alle {start:%H:%M}, si "
+            "presenti da quell'ora."
+        )
+    if not inside:
+        return ""
+    return (
+        " Your visit is today and the arrival window is already open: you can come right away."
+        if en
+        else " La visita è oggi e la fascia per l'arrivo è già aperta: può presentarsi anche "
+        "subito."
+    )
 
 
 def _arrival(message: Message) -> bool:
@@ -1327,6 +1413,14 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
 async def _checkin_refused(
     city: City, message: Message, chat: list[Message], *, booking_id: str, en: bool
 ) -> None:
+    # The arrival turn and the refusal's own turn may both get here: one answer only.
+    async with _gated(f"refused:{message.need_id or message.msg_id}"):
+        await _refused_alone(city, message, chat, booking_id=booking_id, en=en)
+
+
+async def _refused_alone(
+    city: City, message: Message, chat: list[Message], *, booking_id: str, en: bool
+) -> None:
     """The Ledger refused the arrival: the reason in plain words and what to do next. No act
     word for the arrival in the prose: it was not honoured."""
 
@@ -1346,6 +1440,13 @@ async def _checkin_refused(
     )
     at = _when(_slot_facts(chat, agent, slot).get("at", ""))
     if _WINDOW_CODE.search(code):
+        timing = ""
+        if at:
+            # The city's clock says whether it is another day or just early (never the pc's).
+            now, chat = await _agenda_now(city, message, chat)
+            if _answered(chat, agent, message.msg_id, citizen):
+                return
+            timing = _timing(at, now, en, inside=False)
         if en:
             when = (
                 f", that is {_in_words(at, True)}, between {_half_day(at)}"
@@ -1354,8 +1455,8 @@ async def _checkin_refused(
             )
             note = (
                 f"I'm sorry, I cannot register your arrival for booking {booking_id} right "
-                f"now: arrivals are registered only in the half day of the visit{when}. Write "
-                "to me again when you are within that time and I will register it at once, I "
+                f"now: arrivals are registered only in the half day of the visit{when}.{timing} "
+                "Write to me again when you are within that time and I will register it at once, I "
                 "already have your code. If you cannot come, the booking centre can move the "
                 "visit."
             )
@@ -1368,7 +1469,7 @@ async def _checkin_refused(
             note = (
                 f"Mi dispiace, in questo momento non riesco a registrare il suo arrivo per la "
                 f"prenotazione {booking_id}: l'arrivo si registra solo nella mezza giornata "
-                f"della visita{when}. Mi riscriva quando è in quella fascia e lo registro "
+                f"della visita{when}.{timing} Mi riscriva quando è in quella fascia e lo registro "
                 "subito, il codice ce l'ho già. Se non riesce a venire, il centro prenotazioni "
                 "può spostare la visita."
             )
@@ -1415,6 +1516,12 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
     (booking_id, entry), = ours.items()
     en = _english(chat, message.text)
     at = _when(_slot_facts(chat, agent, entry["slot"]).get("at", ""))
+    timing = ""
+    if at:
+        now, chat = await _agenda_now(city, message, chat)
+        if _answered(chat, agent, message.msg_id, citizen):
+            return
+        timing = _timing(at, now, en)
     if en:
         head = (
             f"your visit with us is on {_in_words(at, True)} (booking code {booking_id}). "
@@ -1426,7 +1533,7 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
             "day of the visit (08:00-13:00 or 13:00-18:00)"
         )
         text = (
-            f"booking_id={booking_id} Thank you for your message: {head}. When you are here, "
+            f"booking_id={booking_id} Thank you for your message: {head}.{timing} When you are here, "
             "just write to me that you have arrived, I already have your code. For symptoms, "
             "or to move or call off the visit, your GP and the booking centre can help."
         )
@@ -1441,7 +1548,7 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
             "visita (08:00-13:00 o 13:00-18:00)"
         )
         text = (
-            f"booking_id={booking_id} Grazie del messaggio: {head}. Quando è qui mi scriva "
+            f"booking_id={booking_id} Grazie del messaggio: {head}.{timing} Quando è qui mi scriva "
             "semplicemente che è arrivato/a, il codice ce l'ho già. Per sintomi, o per spostare "
             "o annullare la visita, può rivolgersi al suo medico di base o al centro prenotazioni."
         )
@@ -1475,6 +1582,18 @@ async def _welcome(city: City, message: Message) -> None:
                 or _we(chat, agent, token, to=citizen, word="booking.receipt")
             ):
                 continue
+            if _latest_slots(chat) is None and any(
+                row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "world"
+                for row in chat
+            ):
+                # Our world read may still be on its way: a short wait, then go on without it.
+                chat = await _until(
+                    city,
+                    message.need_id,
+                    chat,
+                    lambda rows: _latest_slots(rows) is not None,
+                    tries=_SHORT_TRIES,
+                )
             facts = _slot_facts(chat, agent, entry["slot"])
             at = _when(facts.get("at", ""))
             en = _english(chat)

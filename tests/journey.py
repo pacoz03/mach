@@ -577,8 +577,9 @@ def handed_over(b: Bus) -> str | None:
 def answered_time(b: Bus) -> str | None:
     """Alla domanda d'orario l'ospedale risponde con la sua prenotazione, non un rinvio generico.
 
-    L'ora dello slot non arriva all'ospedale (né confirm né held/committed la portano): se la dice
-    deve essere quella vera, altrimenti basta il codice di prenotazione (regola 9, mai inventare)."""
+    Né confirm né held/committed portano l'ora: l'ospedale la legge da `world`. Se il Ledger gli ha
+    risposto con lo slot (il caso normale) deve dire l'ora vera; altrimenti basta il codice di
+    prenotazione (regola 9, mai inventare)."""
     hosp = b.ids["hospital"]
     q = next((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == hosp and m.text == ORARIO), None)
     booked = [h for h in b.ledger.holds.values() if h["state"] == "committed"]
@@ -587,10 +588,14 @@ def answered_time(b: Bus) -> str | None:
     reply = next((m for m in b.log[q + 1:] if m.sender == hosp and m.recipient == CIT), None)
     if reply is None:
         return "hospital muto alla domanda d'orario (R:248)"
-    at = b.ledger.slots[booked[0]["slot_id"]]["at"][11:16]
+    slot = booked[0]["slot_id"]
+    at = b.ledger.slots[slot]["at"][11:16]
     hours = re.findall(r"\b\d{1,2}:\d{2}\b", reply.text)
     if any(h.zfill(5) == at for h in hours):
         return None
+    if any(m.sender == LEDGER and m.recipient == hosp and m.text.split()[0] in ("slots", "world")
+           and f"slot_id={slot}" in m.text.split() for m in b.log[:q]):
+        return f"hospital aveva lo slot {slot} da world ma non ha detto l'ora {at}: «{reply.text[:80]}»"
     if booked[0].get("booking_id", booked[0].get("hold_id", "")) not in reply.text:
         return f"hospital non ha dato né l'orario {at} né il codice di prenotazione: «{reply.text[:80]}»"
 
