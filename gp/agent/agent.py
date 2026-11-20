@@ -5,12 +5,22 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 import unicodedata
+from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from weakref import WeakValueDictionary
 
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, clinical, understood
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tools  # noqa: E402
+
+# What the citizen wrote in this turn: our reply goes out in that language (tools.localize).
+_HEARD: ContextVar[str] = ContextVar("heard", default="")
 
 
 PROTOCOL = {
@@ -195,6 +205,7 @@ async def main(need: Need, city: City) -> None:
     if inbound is None:
         return
     message = understood(inbound)
+    _HEARD.set("")  # never the words of a previous turn
     if message.sender == LEDGER:
         if message.need_id and message.text.split()[:1] in (["prescribed"], ["refused"]):
             async with _case_lock(message.need_id):
@@ -209,6 +220,7 @@ async def main(need: Need, city: City) -> None:
         return
 
     said = message.text or need.summary
+    _HEARD.set(said or "")
     text = said.casefold()
     if need.is_emergency or message.body.get("is_emergency") is True or red_flag(text):
         await _escalate(city, message, _guess_lang(text))
@@ -225,7 +237,9 @@ async def main(need: Need, city: City) -> None:
         return
 
     code = _symptom_code(message, text)
-    lang = _guess_lang(text)
+    # The model names the citizen's language (any language); our word list only if it cannot.
+    # The handoff's lang= stays it/en (_reply_lang): the booking centre filters doctors on it.
+    lang = await tools.language(city, said) or _guess_lang(text)
     if code is None:
         # Level 3: the citizen's own words, in any language. The rules found nothing, so the model
         # reads them once; only a protocol code, a yes/no red flag and a language come back.
@@ -249,12 +263,12 @@ async def main(need: Need, city: City) -> None:
                     return
                 if code is None or PROTOCOL[code] == (issued.procedure, issued.priority):
                     prefs = {**_case_preferences(history, message.sender), **_preferences(said)}
-                    await city.say(message.sender, _reminder(history, city.agent_id, issued, lang, prefs))
+                    await _tell(city, message.sender, _reminder(history, city.agent_id, issued, lang, prefs))
                     return
                 await _prescribe(city, message, message.need_id, code, lang, again=True)
                 return
     if code is None:
-        await city.say(message.sender, ASK_REASON[_reply_lang(lang)])
+        await _tell(city, message.sender, ASK_REASON[_reply_lang(lang)])
         return
     if not message.need_id:
         await city.say(message.sender, "Non riesco ad associare la richiesta a un percorso.")
@@ -743,8 +757,20 @@ async def _notify(
         # This turn's words may not be in history yet: they win over the case's earlier ones.
         prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
         handed = await _handoff(city, history, request, lang, prefs)
-        await city.say(request.patient, request.reply(lang, handed, prefs))
+        await _tell(city, request.patient, request.reply(lang, handed, prefs), history)
     return True
+
+
+async def _tell(city: City, patient: str, text: str, history: list[Message] | None = None) -> None:
+    """A message to the citizen, in the language they write in. A Ledger turn has no words of
+    the citizen: the last thing they wrote in the case stands in."""
+
+    heard = _HEARD.get()
+    if not heard and history:
+        # Their own words, not a bare "data.response purpose=booking": tokens say no language.
+        words = (re.sub(r"\S+=\S+", "", row.text or "") for row in reversed(history) if row.sender == patient)
+        heard = next((said for said in words if len(re.findall(r"[^\W\d_]{2,}", said)) >= 3), "")
+    await city.say(patient, await tools.localize(city, text, heard))
 
 
 def _lang(history: list[Message]) -> str:
