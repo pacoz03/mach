@@ -228,7 +228,18 @@ async def handle(role: str, need: Need, city: City) -> None:
     if role == "hospital":
         await _hospital(city, message, chat)
     elif role == "specialist_care":
-        await _facility(city, message, chat, reports=True, hold_self=False)
+        kind = words(message.text)
+        if (
+            message.sender.startswith("agent:")
+            and not ("confirm" in kind or message.type == "confirm")
+            and ("need.request" in kind or message.type == "need.request")
+        ):
+            # Level 4: another ASST's booking centre asks for our cardiology slots (R:191).
+            await _cross_asst(
+                city, message, procedures=_CARDIOLOGY, ours="del nostro ambulatorio di cardiologia"
+            )
+        else:
+            await _facility(city, message, chat, reports=True, hold_self=False)
     elif role == "family_counseling":
         await _family(city, message, chat)
 
@@ -1443,6 +1454,8 @@ _OUR_BOOKING = "agent:sbdpbpqz5sxe"
 # The hospital's catalogue code (gp PROTOCOL; kit city_deploy/local.py maps hospital.* to it).
 # A cross-ASST request names it, or names nothing and means it.
 _PROCEDURE = "VIS-FIS"
+# The specialist's catalogue codes: the cardiology visit and its control visit (_CONTROL).
+_CARDIOLOGY = ("VIS-CARD", _CONTROL)
 
 
 async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
@@ -1490,7 +1503,13 @@ async def _ask_slots(city: City, message: Message, chat: list[Message]) -> None:
     await _say(city, LEDGER, f"world procedure={procedure} page=1" if procedure else "world page=1")
 
 
-async def _cross_asst(city: City, message: Message) -> None:
+async def _cross_asst(
+    city: City,
+    message: Message,
+    *,
+    procedures: tuple[str, ...] = (_PROCEDURE,),
+    ours: str = "del nostro ospedale",
+) -> None:
     """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
     per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
     ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
@@ -1513,12 +1532,12 @@ async def _cross_asst(city: City, message: Message) -> None:
             for row in chat
         ):
             return
-        procedure = fields.get("procedure") or _PROCEDURE
+        procedure = fields.get("procedure") or procedures[0]
         priority = fields.get("priority", "").upper()
         priority = priority if priority in {"U", "B", "D", "P"} else None
         chosen: list[dict[str, str]] = []
         # Only our own service: world lists every slot of the ASST, other facilities' too.
-        if procedure == _PROCEDURE:
+        if procedure in procedures:
             known = {row.msg_id for row in chat}
 
             def fresh(rows: list[Message]) -> list[Message]:
@@ -1548,7 +1567,7 @@ async def _cross_asst(city: City, message: Message) -> None:
             lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
             text = "\n".join([
                 *lines,
-                "Buongiorno, ecco le prime disponibilità del nostro ospedale per la vostra "
+                f"Buongiorno, ecco le prime disponibilità {ours} per la vostra "
                 "richiesta. Per prenotarne una inviateci la scelta con il riferimento del consenso "
                 "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta.",
             ])
