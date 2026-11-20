@@ -1459,11 +1459,13 @@ async def _facility_dispatch(
         await _redirect(city, message, chat)
 
 
-async def _redirect(city: City, message: Message, chat: list[Message]) -> None:
+async def _redirect(
+    city: City, message: Message, chat: list[Message], en: bool | None = None
+) -> None:
     """Un messaggio del cittadino che non sappiamo gestire: rinvio al ruolo giusto, mai una
-    risposta inventata, e una volta sola per caso."""
+    risposta inventata, e una volta sola per caso. ``en``: la lingua già scelta dal chiamante."""
 
-    if _en(chat):
+    if _en(chat) if en is None else en:
         text = (
             "Thank you for your message. I can't give you reliable information on this: your GP "
             "can help with symptoms and referrals, the booking centre with booking, moving or "
@@ -1486,7 +1488,10 @@ _ARRIVED = re.compile(
     r"\bcheck[\s-]?in\b|\bsono\s+(?:arrivat[oaie]|giunt[oaie]|qui|qua|in\s+(?:sala|accettazione"
     r"|struttura|reception|ospedale))\b|\bsiamo\s+(?:arrivat[ie]|qui|qua)\b|\beccomi\b"
     r"|\bi\s*['’]?\s*m\s+here\b|\b(?:i\s+am|we\s+are|we\s*['’]\s*re)\s+here\b"
-    r"|\b(?:i|we)\s*(?:['’]\s*ve|\s+have)\s+(?:just\s+)?arrived\b|\bjust\s+arrived\b",
+    r"|\b(?:i|we)\s*(?:['’]\s*ve|\s+have)\s+(?:just\s+)?arrived\b|\bjust\s+arrived\b"
+    r"|\bio\s+arrivat[oaie]\b|\bsono\s+all\s*['’]\s*(?:ospedale|accettazione)\b"
+    r"|\b(?:i\s*['’]?\s*m|i\s+am|we\s*['’]\s*re|we\s+are)\s+(?:at|in)\s+(?:the\s+)?"
+    r"(?:hospital|reception|front\s+desk)\b",
     re.IGNORECASE,
 )
 _APPOINTMENT = re.compile(
@@ -1518,9 +1523,14 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
     kind = words(message.text)
     confirm = "confirm" in kind or message.type == "confirm"
     from_citizen = message.sender.startswith("citizen:")
+    if from_citizen and not {"offer_id", "slot_id"} & _fields(message).keys():
+        confirm = False  # "I'm here to confirm my appointment" is prose, not a booking confirm
     if from_citizen and not confirm and (
         _arrival(message)
-        or ("booking_id" in _fields(message) and _asked_booking(chat, city.agent_id))
+        or (
+            ("booking_id" in _fields(message) or _prose_code(message.text, chat, city.agent_id))
+            and _asked_booking(chat, city.agent_id)
+        )
     ):
         await _arrive(city, message)
     elif from_citizen and not confirm:
@@ -1528,6 +1538,8 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
     elif message.sender == LEDGER and head == "refused" and "checkin" in kind:
         # A refusal that came after the arrival turn stopped waiting for it.
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
+    elif message.sender == LEDGER and head == "checked_in":
+        await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
     elif message.sender.startswith("agent:") and not confirm and (
         "need.request" in kind or message.type == "need.request"
     ):
@@ -1708,8 +1720,15 @@ def _arrival(message: Message) -> bool:
 
 
 def _english(chat: list[Message], text: str = "") -> bool:
+    """The citizen's lang=, else the lang= of our booking centre's confirm, else their words."""
+
     rows = [row for row in chat if row.sender.startswith("citizen:")]
-    for row in rows:
+    confirms = [
+        row
+        for row in chat
+        if row.sender == _OUR_BOOKING and ("confirm" in words(row.text) or row.type == "confirm")
+    ]
+    for row in rows + confirms:
         lang = _fields(row).get("lang", "")
         if lang:
             return lang == "en"
@@ -1732,6 +1751,21 @@ def _asked_booking(chat: list[Message], agent: str) -> bool:
         and "fields=booking_id" in row.text.split()
         for row in chat
     )
+
+
+def _prose_code(text: str, chat: list[Message], agent: str) -> str:
+    """A booking code written in prose, as _family reads it: one of our bookings named in the
+    text, else "codice/code (è/is) X". The Ledger still checks it on checkin."""
+
+    for booking in _bookings(chat, agent):
+        if re.search(rf"(?<![\w-]){re.escape(booking)}(?![\w-])", text, re.I):
+            return booking
+    code = re.search(
+        rf"\b(?:codice|code)(?: di prenotazione)?\s+(?:[èe]\s+|is\s+)?({_ID})", text, re.I
+    )
+    # ponytail: a code has a digit, so "my code is lost" is not a code.
+    value = code[1].rstrip(".") if code else ""
+    return value if any(c.isdigit() for c in value) else ""
 
 
 def _holder(chat: list[Message], agent: str, slot: str) -> str:
@@ -1822,7 +1856,7 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
     agent = city.agent_id
     citizen = message.sender
     en = _english(chat, message.text)
-    booking_id = _fields(message).get("booking_id", "")
+    booking_id = _fields(message).get("booking_id", "") or _prose_code(message.text, chat, agent)
     if not booking_id:
         ours = [
             booking
@@ -1992,7 +2026,7 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
         if _holder(chat, agent, entry["slot"]) in ("", citizen)
     }
     if len(ours) != 1:
-        await _redirect(city, message, chat)
+        await _redirect(city, message, chat, en=_english(chat, message.text))
         return
     if _answered(chat, agent, message.msg_id, citizen):
         return
