@@ -51,7 +51,7 @@ Ogni agente vede ciò che sanno gli altri: cosa è successo in un caso, cosa è 
 | `shared/tools.py` | **Fonte unica** dei tool. Solo stdlib: il Dockerfile non installa pacchetti. |
 | `shared/facility.py` | **Fonte unica** del brain delle tre strutture: `handle(role, need, city)` con `role` = `hospital`, `specialist_care` o `family_counseling`. Ogni `agent.py` fa il controllo clinico e `start_turn`, poi lo chiama con il suo ruolo. |
 | `shared/sync.sh` | Copia `tools.py` in ogni `<agente>/agent/`, `facility.py` solo nelle tre strutture, e genera `<agente>/agent/_secrets.py` da `.env`. Fallisce se una copia diverge dalla fonte (`cmp`). |
-| `shared/sentiment.sql` | Tabella `sentiments` (una riga per messaggio, fonti `episode`, `comment` e `journey`: score −1..1, label, emotion, voto del cittadino, mai il testo), tabella `citizen_comments` (commenti pubblici dei nostri cittadini, ASST Gorla `-890924`) e viste `sentiment_pending`, `comment_pending`, `sentiment_by_agent`. Idempotente. Scrive solo `tools/sentiment.py` dal laptop (secret key): `collect` ogni 30 s via launchd (`ai.mach.sentiment-collect`), perché la scoreboard tiene solo gli ultimi 40 commenti della città; l'analisi la fa il job pianificato `sentiment-agenti` ogni 10 minuti (skill in `.claude/skills/sentiment-agenti/`). |
+| `shared/sentiment.sql` | Tabella `sentiments` (una riga per messaggio, fonti `episode`, `comment` e `journey` (messaggi delle journey chiuse, letti con `tools/nanda_console.py`): score −1..1, label, emotion, voto del cittadino, mai il testo), tabella `citizen_comments` (commenti pubblici dei nostri cittadini, ASST Gorla `-890924`) e viste `sentiment_pending`, `comment_pending`, `sentiment_by_agent`. Idempotente. Scrive solo `tools/sentiment.py` dal laptop (secret key): `collect` ogni 30 s via launchd (`ai.mach.sentiment-collect`), perché la scoreboard tiene solo gli ultimi 40 commenti della città; l'analisi la fa il job pianificato unico `mach-sorveglianza` (ogni 5 minuti Token della Sera, al massimo ogni 10 il sentiment; skill in `.claude/skills/sentiment-agenti/` e `.claude/skills/token-della-sera/`). |
 | `.env` (root, gitignored) | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `EXA_API_KEY`. Nel pod vanno solo publishable key ed Exa. |
 
 Perché le copie: `city deploy` impacchetta solo `<agente>/agent/`, salta symlink e file `.env`, e nel pod non arrivano variabili d'ambiente nostre (`city secrets set` le salva ma non le monta). Ogni agente ha quindi il suo `tools.py` (committato) e il suo `_secrets.py` (gitignored); le strutture anche il loro `facility.py` (committato). **Non modificare le copie**: modifica `shared/tools.py` o `shared/facility.py` e rilancia `shared/sync.sh`.
@@ -127,9 +127,10 @@ async def main(need, city):
 
 ### Migliorare con gli eval
 
-1. Le righe di rubrica della console (Journeys) vanno in `outcomes` (secret key, dal laptop).
-2. `eval_rows` le unisce alla versione del brain; `episodes` dà la traccia completa del caso, di tutti gli agenti.
-3. Da un errore ricorrente scriviamo una `lesson` (`status = 'proposed'`, con `evidence`), la rivediamo e la attiviamo: da quel momento ogni agente di quel ruolo la riceve in `context()`. Se la correzione è di codice, cambiamo il brain e confrontiamo le versioni in `eval_rows`.
+1. `python3 tools/journeys_sync.py` (dal laptop: cookie della console e secret key) copia i percorsi della console (Journeys) in `journeys` e le righe di rubrica e i voti della review (`review.collaboration`, `review.proactivity`, `review.domain`) in `outcomes`. Idempotente: legge solo i percorsi nuovi o cambiati; `--all` li rilegge tutti, `--schema` applica `shared/evals.sql`. La trascrizione salvata ha il testo solo dei nostri agenti, mai quello del cittadino.
+2. Le viste `missed_points` (ogni punto o bonus perso, per percorso e ruolo) e `eval_summary` (per livello, ruolo e riga) dicono dove perdiamo punti; `eval_rows` unisce le righe alla versione del brain; `episodes` dà la traccia completa del caso, di tutti gli agenti.
+3. La diagnosi di un percorso va in `journey_analyses` (`role`, `category`, `missed`, `diagnosis`, `fix`, `status` open/fixed/wontfix, `lesson_id`): prima di analizzare di nuovo, leggi quelle già scritte.
+4. Da un errore ricorrente scriviamo una `lesson` (`status = 'proposed'`, con `evidence`), la rivediamo e la attiviamo: da quel momento ogni agente di quel ruolo la riceve in `context()`. Se la correzione è di codice, cambiamo il brain e confrontiamo le versioni in `eval_rows`.
 
 ### Aggiungere un tool
 

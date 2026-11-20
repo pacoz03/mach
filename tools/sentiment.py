@@ -4,13 +4,14 @@ Tre fonti, una tabella (`sentiments`, schema in shared/sentiment.sql):
 - `episode`: righe di `episodes` scritte dagli agenti con shared/tools.py;
 - `comment`: commenti pubblici della scoreboard (`/v1/scoreboard` → `comments`) dei nostri
   cittadini, salvati in `citizen_comments` dal collector;
-- `journey`: messaggi delle journey della console (backfill, letti dal browser loggato).
+- `journey`: messaggi delle journey della console, letti con tools/nanda_console.py (cookie nel
+  Portachiavi, servizio `nanda-console`). Solo journey chiuse (done/escalated/failed).
 
 La classificazione la fa Claude (skill `sentiment-agenti`); questo script fa solo I/O verso
 Supabase con la secret key di .env (mai nei pod). Solo stdlib.
 
     python3 tools/sentiment.py collect                # ogni 30 s (launchd): salva i commenti nuovi
-    python3 tools/sentiment.py pending [--limit 60]   # JSON: episodi e commenti da analizzare
+    python3 tools/sentiment.py pending [--limit 60]   # JSON: episodi, commenti e journey da analizzare
     python3 tools/sentiment.py save < scores.json     # JSON: [{source, ref, score, label, ...}]
     python3 tools/sentiment.py summary [--minutes 60] # media per agente e direzione
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import ssl
 import sys
 import urllib.error
@@ -30,11 +32,24 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+import nanda_console  # noqa: E402  (stesso cartella, solo stdlib)
+
 SCOREBOARD = "https://projectnandaitaly.ai/v1/scoreboard"
 ASST_CODE = "-890924"  # ASST Gorla: il codice nei nostri need_id
 LABELS = {"positive", "neutral", "negative"}
 SOURCES = {"episode", "comment", "journey"}
 JOURNEY_FIELDS = ("msg_id", "agent", "direction", "peer", "need_id", "at")
+FINAL_STATES = {"done", "escalated", "failed"}
+AGENTS = {  # agent_id della città → ruolo (cartella) nostro
+    "agent:sbdpbpqz5sxe": "booking_centre",
+    "agent:ck9w60ejwnvw": "gp",
+    "agent:m6py14a1ej77": "hospital",
+    "agent:dmkjw2atrh77": "specialist_care",
+    "agent:h6krzxx6es83": "specialist_care",
+    "agent:yg8debxe3x0p": "family_counseling",
+    "agent:vm8zdp5v4q2j": "family_counseling",
+}
 
 
 def _env() -> dict[str, str]:
@@ -55,6 +70,7 @@ KEY = ENV.get("SUPABASE_SECRET_KEY", "")
 _CTX = ssl.create_default_context()
 if not _CTX.get_ca_certs() and Path("/etc/ssl/cert.pem").is_file():
     _CTX = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/cert.pem")  # per nanda_console
 
 
 def _open(request: urllib.request.Request):
@@ -96,6 +112,59 @@ def collect() -> dict:
 # --- analisi -----------------------------------------------------------------------------------
 
 
+def _text(body) -> str:
+    if isinstance(body, dict):
+        return str(body.get("text") or json.dumps(body, ensure_ascii=False))
+    return "" if body is None else str(body)
+
+
+def console_pending(limit: int) -> dict:
+    """Messaggi delle journey chiuse della console non ancora analizzati (source=journey)."""
+    cookie = nanda_console.session()
+    if not cookie:
+        return {"status": "no_cookie", "messages": []}
+    for _ in range(3):  # la console a volte non risponde: riprova prima di arrendersi
+        status, board = nanda_console.get("team/journeys", cookie)
+        if status != 0:
+            break
+    if status != 200:
+        return {"status": status, "error": None if status else str(board)[:200], "messages": []}
+    done = {r["need_id"] for r in _get("sentiments", select="need_id", source="eq.journey")}
+    todo = [j for j in (board or {}).get("journeys") or []
+            if j.get("state") in FINAL_STATES and j.get("need_id") not in done]
+    todo.sort(key=lambda j: j.get("updated_at") or "")
+    messages, open_left = [], 0
+    for j in todo:
+        if len(messages) >= limit:
+            open_left += 1
+            continue
+        for _ in range(2):
+            status, detail = nanda_console.get(f"team/journeys/{j['need_id']}", cookie)
+            if status != 0:
+                break
+        if status != 200:
+            continue
+        ratings = [r.get("score") for r in detail.get("ratings") or [] if not r.get("cancelled")]
+        rating = ratings[-1] if ratings else None
+        for m in detail.get("messages") or []:
+            sender, recipient = m.get("from") or "", m.get("to") or ""
+            if sender in AGENTS:
+                agent, direction, peer = AGENTS[sender], "out", recipient
+            elif recipient in AGENTS:
+                agent, direction, peer = AGENTS[recipient], "in", sender
+            else:
+                continue
+            messages.append({"source": "journey", "ref": m["msg_id"], "msg_id": m["msg_id"],
+                             "agent": agent, "direction": direction, "peer": peer,
+                             "need_id": j["need_id"], "at": m.get("sent_at"), "state": j.get("state"),
+                             "type": m.get("type"), "citizen_score": rating, "text": _text(m.get("body"))})
+    # Lo stesso messaggio può già essere in episodes (scritto dal pod): non contarlo due volte.
+    ids = [m["msg_id"] for m in messages]
+    seen = {r["msg_id"] for r in _get("episodes", select="msg_id", msg_id=f"in.({','.join(ids)})")} if ids else set()
+    messages = [m for m in messages if m["msg_id"] not in seen]
+    return {"status": 200, "journeys_left": open_left, "messages": messages}
+
+
 def pending(limit: int) -> dict:
     episodes = _get("sentiment_pending", order="at.asc", limit=str(limit),
                     select="episode_id,msg_id,at,agent,direction,peer,peer_kind,need_id,act,fields,body,error")
@@ -104,7 +173,9 @@ def pending(limit: int) -> dict:
     grouped: dict[str, list] = {}
     for row in episodes:
         grouped.setdefault(row["agent"], []).append(row)
-    return {"total": len(episodes) + len(comments), "episodes": grouped, "comments": comments}
+    console = console_pending(limit)
+    return {"total": len(episodes) + len(comments) + len(console["messages"]),
+            "episodes": grouped, "comments": comments, "console": console}
 
 
 def _scored(score: dict) -> dict:
@@ -171,6 +242,8 @@ def save(scores: list[dict]) -> dict:
                      "citizen_score": score.get("citizen_score"), "basis": "text", **_scored(score)})
 
     saved = []
+    keys = sorted({k for r in rows for k in r})  # PostgREST vuole le stesse chiavi in ogni riga
+    rows = [{k: r.get(k) for k in keys} for r in rows]
     if rows:
         saved = _call("POST", "sentiments?on_conflict=source,source_ref", rows,
                       prefer="resolution=ignore-duplicates,return=representation") or []
