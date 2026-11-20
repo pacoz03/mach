@@ -1081,6 +1081,13 @@ async def _facility_dispatch(
     elif (
         reports
         and message.sender.startswith("citizen:")
+        and (booked := _prose_checkin(message, chat))
+    ):
+        # Level 3: "sono arrivata", or our booking code in prose, with no ``checkin`` token.
+        await _on_checkin(city, _as_checkin(message, booked), chat, reports=reports)
+    elif (
+        reports
+        and message.sender.startswith("citizen:")
         and (asked := _consent_asked(chat, city.agent_id))
     ):
         if _reported(chat, city.agent_id, asked):
@@ -1435,7 +1442,104 @@ async def _on_consent(city: City, message: Message, chat: list[Message], booking
     consent = ""
     if fields.get("purpose", "report_sharing") == "report_sharing":
         consent = fields.get("consent_ref", "")
+    if not consent and (code := _CONSENT_CODE.search(message.text)):
+        # Level 3: the code in prose, "il codice del consenso è cons-...".
+        consent = code.group(0).rstrip(".,;:!?)")
+    if (
+        not consent
+        and _YES_PROSE.search(message.text)
+        and not _NO_PROSE.search(message.text)
+        and _consent_asks(chat, city.agent_id, booking_id) < 2
+    ):
+        # "Sì" without the code: we never invent a consent_ref (sharing without consent is
+        # over-disclosure, R:244). Ask for the code once; a second answer without it is a no.
+        await _say(
+            city,
+            message.sender,
+            f"consent purpose=report_sharing booking_id={booking_id} "
+            + (
+                "Thank you! To share it I need the code of your consent (consent_ref): could "
+                "you send it to me? Without it we file the summary without sharing it."
+                if _en(chat)
+                else "Grazie! Per condividerlo mi serve il codice del suo consenso (consent_ref): "
+                "me lo può inviare? Senza il codice lo archiviamo senza condividerlo."
+            ),
+        )
+        return
     await _file_report(city, message, chat, booking_id, message.sender, consent)
+
+
+# Level 3 ("Bisogni in linguaggio naturale"): citizens write prose, no key=value tokens.
+_ARRIVED = re.compile(
+    r"\b(?:sono\s+arrivat[oa]|siamo\s+arrivati|sono\s+qui|siamo\s+qui|allo\s+sportello|"
+    r"in\s+accettazione|check[\s-]?in|i'?m\s+here|i\s+am\s+here|i\s+have\s+arrived|i\s+arrived|"
+    r"at\s+the\s+desk)\b",
+    re.IGNORECASE,
+)
+_CONSENT_CODE = re.compile(r"\bcons-[A-Za-z0-9_.-]+")
+_YES_PROSE = re.compile(
+    r"\b(?:s[iì]|ok|okay|va\s+bene|certo|acconsento|d'accordo|autorizzo|confermo|"
+    r"yes|sure|i\s+agree|i\s+consent)\b",
+    re.IGNORECASE,
+)
+_NO_PROSE = re.compile(
+    r"\b(?:no|non\s+acconsento|preferisco\s+di\s+no|non\s+voglio|rifiuto|nope|"
+    r"i\s+do\s+not|i\s+don'?t)\b",
+    re.IGNORECASE,
+)
+
+
+def _our_booking(chat: list[Message]) -> str:
+    """The booking the Ledger committed for us in this case, or ``""``."""
+
+    found = ""
+    for row in chat:
+        if row.sender == LEDGER and first_word(row.text) == "committed":
+            found = fields_of(row.text).get("booking_id", found)
+    return found
+
+
+def _prose_checkin(message: Message, chat: list[Message]) -> str:
+    """Our booking when a citizen says in prose that they arrived (or names its code), else
+    ``""``. Only before the check-in: a later line is a consent answer or small talk."""
+
+    if "checkin" in words(message.text):
+        return ""
+    booking = _our_booking(chat)
+    if not booking or _latest(chat, "checked_in", f"booking_id={booking}") is not None:
+        return ""
+    named = booking in {token.strip(".,;:!?()\"'") for token in message.text.split()}
+    return booking if named or _ARRIVED.search(message.text) else ""
+
+
+def _as_checkin(message: Message, booking_id: str) -> Message:
+    """The citizen's prose turn as the ``checkin`` the Ledger path reads."""
+
+    return Message(
+        type=message.type,
+        sender=message.sender,
+        msg_id=message.msg_id,
+        need_id=message.need_id,
+        conversation_id=message.conversation_id,
+        body={"text": f"checkin booking_id={booking_id}"},
+        recipient=message.recipient,
+        sent_at=message.sent_at,
+    )
+
+
+def _consent_asks(chat: list[Message], agent: str, booking_id: str) -> int:
+    """How many report_sharing requests we sent the citizen for ``booking_id``."""
+
+    token = f"booking_id={booking_id}"
+    return sum(
+        1
+        for row in chat
+        if row.sender == agent
+        and row.recipient.startswith("citizen:")
+        and first_word(row.text) == "consent"
+        and "purpose=report_sharing" in row.text.split()
+        and token in row.text.split()
+    )
 
 
 def _follow_up(chat: list[Message]) -> str | None:
