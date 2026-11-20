@@ -239,6 +239,9 @@ async def handle(role: str, need: Need, city: City) -> None:
             message.sender.startswith("agent:")
             and not ("confirm" in kind or message.type == "confirm")
             and ("need.request" in kind or message.type == "need.request")
+            # As the hospital (0e2d784): a partner's search names request_id, procedure or
+            # service_type; the conformance probe names none and must not be answered.
+            and {"request_id", "procedure", "service_type"} & _fields(message).keys()
         ):
             # Level 4: another ASST's booking centre asks for our cardiology slots (R:191).
             await _cross_asst(

@@ -102,3 +102,15 @@ def test_partner_confirm_without_consent_is_cancelled_never_held(brain):
     run(brain, fake, msg(PARTNER, "confirm offer_id=of-S-c1 slot_id=S-c1 citizen=citizen:T9", need_id="N-X"))
     assert not any(to == LEDGER and t.startswith("hold") for to, t in fake.sent)
     assert _to_partner(fake) and _to_partner(fake)[0].startswith("cancel offer_id=of-S-c1 reason=missing_consent_ref")
+
+
+def test_conformance_probe_without_criteria_is_ignored(brain):
+    # The deploy's conformance suite sends {"service": "lab"} as a need.request from an agent.
+    # Answering it with late world reads and a cancel failed the hospital's deploys (0e2d784).
+    from city_sdk.city import Message
+
+    probe = Message(type="need.request", sender=PARTNER, msg_id="probe-1", need_id="N-P",
+                    body={"service": "lab", "text": "need lab"})
+    fake = FakeCity([], on_post=_ledger(WORLD))
+    run(brain, fake, probe)
+    assert fake.sent == []
