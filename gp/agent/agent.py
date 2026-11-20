@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from dataclasses import dataclass
 from hashlib import sha256
 from weakref import WeakValueDictionary
@@ -22,14 +24,52 @@ SYMPTOM_PHRASES = {
     "SYM-PALPITATIONS": ("palpitazioni", "palpitations", "cuore che batte", "heart racing"),
     "SYM-FOLLOWUP": ("controllo del cuore", "routine heart check"),
 }
-RED_FLAGS = (
-    "perdita di forza alle gambe",
-    "loss of strength in the legs",
-    "dolore al petto",
-    "chest pain",
+# Red flags in the citizen's own words (it/en, any tone), on text without accents. The city's
+# protocol lists red flags as codes (RF-...), which a citizen does not write: words it is.
+_PAIN = r"(?:dolor\w*|mal(?:e|issimo)?\b|fitt\w*|strett\w*|oppress\w*|bruci\w*|pain\w*|hurt\w*|ach\w*|tight\w*|pressure|squeez\w*)"
+_CHEST = r"(?:petto|torace|chest)"
+_NEAR = r"\W+(?:\w+\W+){0,4}?"
+_RED_FLAG = re.compile(
+    "|".join(
+        (
+            _PAIN + _NEAR + _CHEST,
+            _CHEST + _NEAR + _PAIN,
+            r"peso (?:sul|al) petto|dolor\w* toracic\w*",
+            r"(?:dolor\w*|male|pain\w*|hurt\w*)" + _NEAR + r"(?:braccio sinistro|left arm)",
+            r"fiato corto|cort\w* di fiato|senza fiato|affann\w*|dispne\w*",
+            r"manc\w*\W+(?:\w+\W+){0,2}?(?:fiato|respiro|aria)\b",
+            r"(?:non riesco|fatic\w*|difficolt\w*)\W+(?:\w+\W+){0,2}?respir\w*",
+            r"short(?:ness)? of breath|out of breath|breathless\w*",
+            r"(?:can'?t|cannot|hard to|trouble|difficult\w*|struggl\w*)\W+(?:\w+\W+){0,2}?breath\w*",
+            r"svenu\w*|svenim\w*|sven(?:go|gono|ire)\b|(?:pers\w*|perdo)\W+(?:i sensi|conoscenza|coscienza)",
+            r"faint(?:ed|ing)\b|(?:feel\w*|felt) faint|pass(?:ed|ing)? out|lost consciousness|black(?:ed)? out",
+            r"(?:perdita di forza|perdo (?:la )?forza|debolezza|non sento)\W+(?:\w+\W+){0,3}?gamb\w*",
+            r"gamb\w*\W+(?:\w+\W+){0,2}?(?:cedono|non (?:mi )?(?:reggono|rispondono)|paralizzat\w*)",
+            r"(?:loss of strength|losing strength|weakness|can'?t feel)\W+(?:\w+\W+){0,3}?legs?\b",
+            r"legs?\W+(?:\w+\W+){0,2}?(?:giving (?:out|way)|gave (?:out|way)|won'?t hold)",
+            r"incontinen\w*|(?:controll\w*|controllo)\W+(?:\w+\W+){0,2}?(?:vescica|intestino|sfinter\w*)",
+            r"(?:loss of|lost|can'?t control)\W+(?:\w+\W+){0,2}?(?:bladder|bowel)",
+            r"(?:sput\w*|tossisc\w*|tosse con|vomit\w*|perd\w*)\W+(?:\w+\W+){0,2}?sangue",
+            r"sangue\W+(?:\w+\W+)?(?:nelle urine|nelle feci|nel vomito|dalla bocca)",
+            r"sanguin\w*\W+(?:\w+\W+)?(?:molto|tanto|abbondant\w*|non si ferma)|emorragi\w*",
+            r"(?:cough\w*|vomit\w*|spit\w*)\W+(?:\w+\W+)?blood|blood in (?:my |the )?(?:urine|stool|vomit)",
+            r"bleed\w*\W+(?:\w+\W+)?(?:heavily|a lot|won'?t stop)|heavy bleeding|h(?:a)?emorrhag\w*",
+            r"paralis\w*|paralizz\w*|paraly\w*|(?:faccia|bocca) storta|slurred speech|face droop\w*",
+            r"convulsion\w*|seizure\w*|crisi epilettic\w*",
+        )
+    )
+)
+# "non ho dolore al petto": a negation right before the words is not a red flag.
+_NEGATED = re.compile(
+    r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
+    r"\s+(?:\w+\s+)?$"
 )
 ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
 LEDGER_REFUSAL = "Non sono riuscito a registrare la ricetta. Può riprovare con una nuova richiesta."
+RENEWAL_UNKNOWN = (
+    "Non riesco a verificare questa ricetta sul Ledger. Può indicarmi il motivo della richiesta "
+    "in poche parole? Così applico il protocollo."
+)
 LEDGER_WAIT_ATTEMPTS = 24
 LEDGER_WAIT_SECONDS = 0.25
 CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
@@ -64,13 +104,13 @@ async def main(need: Need, city: City) -> None:
                 if request is not None:
                     await _notify(city, history, request)
         return
-    if not message.sender.startswith("citizen:") or message.type != "need.request":
+    # Every citizen message: a word like "prescription" in the text changes the act understood()
+    # reads, and a red flag must never be missed for that.
+    if not message.sender.startswith("citizen:"):
         return
 
     text = (message.text or need.summary).casefold()
-    if need.is_emergency or message.body.get("is_emergency") is True or any(
-        flag in text for flag in RED_FLAGS
-    ):
+    if need.is_emergency or message.body.get("is_emergency") is True or red_flag(text):
         async with _case_lock(message.need_id or message.msg_id):
             history = await city.history(need_id=message.need_id) if message.need_id else []
             if not _sent(history, city.agent_id, message.sender, ESCALATION):
@@ -78,8 +118,13 @@ async def main(need: Need, city: City) -> None:
         return
     if clinical(text):
         raise OutOfScope()
-    if message.body.get("prescription_number") and not message.body.get("symptom_code"):
-        await city.say(message.sender, "Al momento il rinnovo della ricetta non è disponibile.")
+    old = message.body.get("prescription_number")
+    if isinstance(old, str) and old and not message.body.get("symptom_code"):
+        if not message.need_id:
+            await city.say(message.sender, "Non riesco ad associare la richiesta a un percorso.")
+            return
+        async with _case_lock(message.need_id):
+            await _renew(city, message.sender, message.need_id, old)
         return
 
     code = _symptom_code(message, text)
@@ -97,6 +142,15 @@ def _case_lock(need_id: str) -> asyncio.Lock:
     return CASE_LOCKS.setdefault(need_id, asyncio.Lock())
 
 
+def red_flag(text: str) -> bool:
+    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
+    lowered = plain.decode().lower()
+    return any(
+        not _NEGATED.search(lowered[max(0, match.start() - 40) : match.start()])
+        for match in _RED_FLAG.finditer(lowered)
+    )
+
+
 def _symptom_code(message: Message, text: str) -> str | None:
     code = message.body.get("symptom_code")
     if code is not None:
@@ -109,18 +163,69 @@ def _symptom_code(message: Message, text: str) -> str | None:
 
 
 async def _prescribe(city: City, message: Message, need_id: str, code: str) -> None:
-    history = await city.history(need_id=need_id)
     digest = sha256(f"{need_id}/{message.sender}".encode()).hexdigest()[:24].upper()
-    number = f"prescription_number-{digest}"
-    request = _previous_prescription(history, city.agent_id, number=number)
-    if request is None:
-        procedure, priority = PROTOCOL[code]
-        request = Prescription(message.sender, number, procedure, priority)
+    procedure, priority = PROTOCOL[code]
+    request = Prescription(message.sender, f"prescription_number-{digest}", procedure, priority)
+    await _issue(city, need_id, request, f"symptom_code={code} ")
+
+
+async def _renew(city: City, patient: str, need_id: str, old: str) -> None:
+    """P1: a new prescription with the procedure and priority of ``old``, read from the Ledger."""
+
+    history = await city.history(need_id=need_id)
+    ask = f"prescription prescription_number={old}"
+    if not _sent(history, city.agent_id, LEDGER, ask):
+        try:
+            await city.say(LEDGER, ask)
+        except CapError:
+            await city.say(patient, LEDGER_REFUSAL)
+            return
+    found = _ledger_rx(history, old)
+    for _ in range(LEDGER_WAIT_ATTEMPTS):
+        if found is not None:
+            break
+        await asyncio.sleep(LEDGER_WAIT_SECONDS)
+        history = await city.history(need_id=need_id)
+        found = _ledger_rx(history, old)
+    procedure = None if found is None else found.get("procedure")
+    priority = None if found is None else found.get("priority")
+    # Someone else's prescription, or one the Ledger does not know: nothing is renewed.
+    if (
+        not isinstance(procedure, str)
+        or not isinstance(priority, str)
+        or found.get("patient", patient) != patient
+    ):
+        if not _sent(history, city.agent_id, patient, RENEWAL_UNKNOWN):
+            await city.say(patient, RENEWAL_UNKNOWN)
+        return
+    digest = sha256(f"{need_id}/{patient}/{old}".encode()).hexdigest()[:24].upper()
+    request = Prescription(patient, f"prescription_number-{digest}", procedure, priority)
+    code = found.get("symptom_code")
+    await _issue(city, need_id, request, f"symptom_code={code} " if isinstance(code, str) else "")
+
+
+def _ledger_rx(history: list[Message], number: str) -> dict | None:
+    """The Ledger's latest answer about prescription ``number``."""
+
+    found = None
+    for row in history:
+        if row.sender == LEDGER and row.text.split()[:1] == ["prescription"]:
+            fields = understood(row).body
+            if fields.get("prescription_number") == number:
+                found = dict(fields)
+    return found
+
+
+async def _issue(city: City, need_id: str, request: Prescription, extra: str) -> None:
+    """Ledger first: ``prescribe``, then the prescription to the citizen once it is written."""
+
+    history = await city.history(need_id=need_id)
+    if _previous_prescription(history, city.agent_id, number=request.number) is None:
         try:
             await city.say(
                 LEDGER,
                 f"prescribe patient={request.patient} procedure={request.procedure} "
-                f"priority={request.priority} symptom_code={code} prescription_number={request.number}",
+                f"priority={request.priority} {extra}prescription_number={request.number}",
             )
         except CapError:
             await city.say(request.patient, LEDGER_REFUSAL)
