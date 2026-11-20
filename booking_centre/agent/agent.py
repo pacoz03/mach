@@ -406,7 +406,7 @@ class _Gate:
 class _Sent:
     """Offers this process sent for one need, which the case history may not show yet."""
 
-    __slots__ = ("offers", "trigger", "again", "mark", "cancelled", "said")
+    __slots__ = ("offers", "trigger", "again", "mark", "before", "cancelled", "said")
 
     def __init__(self) -> None:
         self.offers: set[str] = set()
@@ -418,6 +418,9 @@ class _Sent:
         self.again: set[str] = set()
         # Our latest ``agenda`` ask: agenda and world answers before it are stale.
         self.mark = ""
+        # The rows the case had when we asked: until history shows the mark (or if the city gave
+        # the ask no id), only rows that are not among these are answers to it.
+        self.before: frozenset[str] = frozenset()
 
 
 # Turns of one need run at the same time; offers wait on this lock so they are not duplicated.
@@ -551,19 +554,19 @@ async def _advance_alone(
     ):
         mark = await _say(city, LEDGER, "agenda")
         if mark:
-            sent.mark = mark
+            sent.mark, sent.before = mark, frozenset(row.msg_id for row in chat)
         await _say(city, LEDGER, "rules")
-    recent = _after(chat, sent.mark)
+    recent = _recent(chat, sent)
     if _latest_slots(recent) is None and not _asked(recent, agent, procedure, 1):
         await _say(city, LEDGER, f"world procedure={procedure} page=1")
 
     def fresh(rows: list[Message]) -> bool:
-        rows = _after(rows, sent.mark)
+        rows = _recent(rows, sent)
         return _has_agenda(rows) and _latest_slots(rows) is not None
 
     if not fresh(chat):
         chat = await _until(city, need_id, chat, fresh)
-    recent = _after(chat, sent.mark)
+    recent = _recent(chat, sent)
     now = _when((_ledger(recent, "agenda") or {}).get("agenda_now", ""))
     world = _latest_slots(recent)
     if now is None or world is None:
@@ -632,12 +635,12 @@ async def _advance_alone(
                 return
 
         def turned(rows: list[Message], page: int = page) -> bool:
-            return _page(_latest_slots(_after(rows, sent.mark)) or "")[0] > page
+            return _page(_latest_slots(_recent(rows, sent)) or "")[0] > page
 
         chat = await _until(city, need_id, chat, turned)
         if not turned(chat):
             return  # The Ledger is slow: its answer opens a turn of its own.
-        recent = _after(chat, sent.mark)
+        recent = _recent(chat, sent)
         world = _latest_slots(recent) or ""
     if fallback:
         await _offer(city, citizen, fallback, number, priority, sent, replacing, chat, opening)
@@ -867,12 +870,45 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     )
 
 
+_RECEIPT_TRIES = 8  # two seconds
+_RECEIPT_RACE = 30.0  # seconds between a receipt and a cancel that are one event
+
+
+def _just_booked(chat: list[Message], cancel: Message) -> bool:
+    """The facility that sent ``cancel`` also sent a receipt for this case around the same time.
+    A cancel long after the receipt is a real one (the facility dropped a booked visit)."""
+
+    at = _stamp(cancel.sent_at)
+    for row in chat:
+        if row.sender == cancel.sender and first_word(row.text) == "booking.receipt":
+            then = _stamp(row.sent_at)
+            if at is None or then is None or (at - then).total_seconds() < _RECEIPT_RACE:
+                return True
+    return False
+
+
+def _stamp(text: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
 async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> None:
     offer_id = fields_of(message.text).get("offer_id", "")
     citizen = _citizen(chat)
     # P1: the Ledger refused the commit because the prescription expired. The GP renews it.
     expired = "PRESCRIPTION_EXPIRED" in message.text.upper()
     told = _sent(message.need_id or message.msg_id).cancelled
+    if not expired and citizen:
+        # A facility can refuse a second hold on the slot it is committing for this same citizen
+        # (journey 0112: its cancel and its receipt left in the same second, and we offered six
+        # more slots to someone already booked). Give the receipt a moment, then believe it.
+        booked = lambda rows: _just_booked(rows, message)  # noqa: E731
+        if not booked(chat):
+            chat = await _until(city, message.need_id, chat, booked, tries=_RECEIPT_TRIES)
+        if booked(chat):
+            return
     if (
         offer_id
         and citizen
@@ -1562,6 +1598,19 @@ def _after(chat: list[Message], mark: str) -> list[Message]:
         if mark and row.msg_id == mark:
             return chat[index + 1 :]
     return chat
+
+
+def _recent(chat: list[Message], sent: "_Sent") -> list[Message]:
+    """Rows that answer our latest ``agenda`` ask. A history read before the ask shows neither
+    the mark nor its answers: then nothing is recent, never the old agenda (journey 0099: slots
+    already past were offered from a clock sixteen agenda hours old)."""
+
+    if not sent.mark:
+        return chat
+    for index, row in enumerate(chat):
+        if row.msg_id == sent.mark:
+            return chat[index + 1 :]
+    return [row for row in chat if row.msg_id not in sent.before]
 
 
 def _rules(chat: list[Message], now: datetime) -> set[str] | None:
