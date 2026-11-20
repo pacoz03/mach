@@ -360,9 +360,9 @@ class Citizen:
         self.rx, self.chosen, self.receipts, self.waited = "", None, set(), False
         self.pending: tuple[str, str] | None = None  # check-in rimandato dopo la domanda d'orario
 
-    def say(self, to: str, text: str, kind: str = "chat", **body: str) -> None:
+    def say(self, to: str, text: str, kind: str = "chat", need: str = NEED, **body: str) -> None:
         if to not in self.bus.down:  # ponytail: il cittadino non riprova verso una struttura giù
-            self.bus.queue.append(self.bus.add(CIT, to, body or {"text": text}, kind=kind))
+            self.bus.queue.append(self.bus.add(CIT, to, body or {"text": text}, need=need, kind=kind))
 
     def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
         """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
@@ -375,6 +375,11 @@ class Citizen:
         elif mode == "orario":
             self.pending = (fac, text)
             self.say(fac, ORARIO)
+        elif mode == "conferma":  # "confirm" in prosa: arrivo, non un confirm di prenotazione
+            self.say(fac, CONFERMA_EN)
+        elif mode == "codice":  # arrivo in un caso nuovo: l'ospedale chiede il codice, lei lo scrive in prosa
+            self.code = booking_id
+            self.say(fac, "Buongiorno, sono arrivata.", need=WALKIN)
         else:
             self.say(fac, text)
 
@@ -409,7 +414,9 @@ class Citizen:
             self.chosen = None
         elif kind in ("data.request", "consent"):
             purpose = f.get("purpose", "")
-            if purpose in self.sc.get("refuse", ()):
+            if purpose == "booking" and getattr(self, "code", ""):
+                self.say(m.sender, f"Il mio codice è {self.code}.", need=m.need_id)
+            elif purpose in self.sc.get("refuse", ()):
                 self.say(m.sender, "Preferisco di no, grazie.")  # rifiuto in prosa (R:210)
             elif purpose == "prescription_renewal":
                 self.say(b.ids["gp"], f"Mi serve il rinnovo della ricetta. prescription_number={self.rx}")
@@ -448,6 +455,10 @@ class Bus:
         return self.agents[party].folder if party in self.agents else party
 
     def add(self, sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+        lang = self.citizen.sc.get("confirm_lang")  # il centro manda lang= nel confirm all'ospedale
+        if (lang and sender == self.ids["booking_centre"] and to == self.ids["hospital"]
+                and str(body.get("text", "")).startswith("confirm")):
+            body = {**body, "text": f"{body['text']} lang={lang}"}
         m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
                     need_id=need, conversation_id=conv, body=body)
         self.log.append(m)
@@ -754,6 +765,8 @@ XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
 ARRIVO = "Buongiorno, sono arrivata per la visita di fisiatria."
 ORARIO = "A che ora devo presentarmi?"
+CONFERMA_EN = "I'm here to confirm my appointment"
+WALKIN = "N-2026-11-23-0002"
 # Livello 3, check-in in ospedale (il testo `checkin booking_id=` è felice_fisiatria).
 CHECKED_IN = [wrote("checkin", "R:219/234", citizen=CIT), told("hospital", "checkin", "booking_id=", cite="R:234")]
 LOMBARE = "Mi fa malissimo la zona lombare quando mi alzo dal letto"
@@ -790,6 +803,11 @@ SCENARIOS: dict[str, dict] = {
     "checkin_body": dict(start=BACK, checkin="body", expect=[*CHECKED_IN, hospital_to_gp(True)]),
     "checkin_libero": dict(start=BACK, checkin="libero", expect=CHECKED_IN),
     "domanda_orario": dict(start=BACK, checkin="orario", expect=[answered_time, *CHECKED_IN]),
+    "checkin_conferma_prosa": dict(start=BACK, checkin="conferma", expect=[
+        *CHECKED_IN, never_told("hospital", "missing_slot_id", cite="confirm in prosa")]),
+    "checkin_codice_prosa": dict(start=BACK, checkin="codice", expect=CHECKED_IN),
+    "welcome_lang_en": dict(start=BACK, confirm_lang="en", expect=[
+        told_text("hospital", "Hello, this is the hospital", cite="lang=en dal centro"), *CHECKED_IN]),
     "checkin_rifiutato": dict(start=BACK, refuse_checkin=CHECKIN_REFUSED, expect=[
         wrote("commit", "R:241"), checkin_refused]),
     # Livello 3: il cittadino scrive con parole sue. Le regole non trovano il sintomo, il modello sì.
