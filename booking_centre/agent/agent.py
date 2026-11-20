@@ -874,44 +874,26 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     )
 
 
-_RECEIPT_TRIES = 8  # two seconds
-_RECEIPT_RACE = 30.0  # seconds between a receipt and a cancel that are one event
-
-
-def _just_booked(chat: list[Message], cancel: Message) -> bool:
-    """The facility that sent ``cancel`` also sent a receipt for this case around the same time.
-    A cancel long after the receipt is a real one (the facility dropped a booked visit)."""
-
-    at = _stamp(cancel.sent_at)
-    for row in chat:
-        if row.sender == cancel.sender and first_word(row.text) == "booking.receipt":
-            then = _stamp(row.sent_at)
-            if at is None or then is None or (at - then).total_seconds() < _RECEIPT_RACE:
-                return True
-    return False
-
-
-def _stamp(text: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
-
-
 async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> None:
     offer_id = fields_of(message.text).get("offer_id", "")
     citizen = _citizen(chat)
     # P1: the Ledger refused the commit because the prescription expired. The GP renews it.
     expired = "PRESCRIPTION_EXPIRED" in message.text.upper()
     told = _sent(message.need_id or message.msg_id).cancelled
-    if not expired and citizen:
-        # A facility can refuse a second hold on the slot it is committing for this same citizen
-        # (journey 0112: its cancel and its receipt left in the same second, and we offered six
-        # more slots to someone already booked). Give the receipt a moment, then believe it.
-        booked = lambda rows: _just_booked(rows, message)  # noqa: E731
-        if not booked(chat):
-            chat = await _until(city, message.need_id, chat, booked, tries=_RECEIPT_TRIES)
-        if booked(chat):
+    if fields_of(message.text).get("reason", "").upper() == "DUPLICATE":
+        # The Ledger refused a second commit on a prescription it has already booked (journey
+        # 0112: the facility sent this with its receipt, and we offered six more slots to a
+        # booked citizen). The visit stands: nothing to tell, nothing to offer. A cancel with
+        # any other reason is a real one (from level 6 the city cancels the first booking).
+        # With no receipt in the case after a short wait, the booking is not ours to trust:
+        # then this is handled as any other cancel.
+        def booked(rows: list[Message]) -> bool:
+            return any(
+                row.sender.startswith("agent:") and first_word(row.text) == "booking.receipt"
+                for row in rows
+            )
+
+        if booked(chat) or booked(await _until(city, message.need_id, chat, booked, tries=8)):
             return
     if (
         offer_id
