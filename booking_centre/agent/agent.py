@@ -32,6 +32,7 @@ from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, cli
 
 _MAX_PAGE = 8
 _MAX_OFFERS = 3
+_SAY_MAX = 1900
 # The agenda runs 60x: one agenda hour is a real minute, so a slot is still ahead when the
 # citizen decides (the citizen confirms within seconds of the offer).
 _LEAD = timedelta(hours=1)
@@ -91,6 +92,9 @@ _PHRASES: dict[str, dict[str, str]] = {
         "verified": "Ho verificato la sua ricetta: {what}.",
         "booked": "Riepilogo: {what}.",
         "more": "Posso aiutarla in altro?",
+        "pending": "Sto completando la sua prenotazione con la struttura: le mando la ricevuta tra un istante.",
+        "welcome": "Prego, è stato un piacere. La prenotazione resta confermata: per qualsiasi altra cosa sono qui.",
+        "dropped": "Va bene, tolgo quell'opzione: le altre restano valide. Quale preferisce?",
         "relaxed": (
             "Mi dispiace, entro la scadenza della priorità non ci sono posti liberi: queste sono le "
             "prime alternative disponibili. Quale preferisce? Se nessuna va bene, mi dica giorni o "
@@ -159,6 +163,9 @@ _PHRASES: dict[str, dict[str, str]] = {
         "verified": "I have checked your prescription: {what}.",
         "booked": "Summary: {what}.",
         "more": "Can I help you with anything else?",
+        "pending": "I am completing your booking with the facility: your receipt will follow in a moment.",
+        "welcome": "You are welcome. Your booking stays confirmed: I am here if you need anything else.",
+        "dropped": "All right, I am dropping that option: the others are still valid. Which one do you prefer?",
         "relaxed": (
             "I am sorry, there are no slots within the deadline of your priority: these are the "
             "first alternatives available. Which one do you prefer? If none works, tell me the "
@@ -339,6 +346,14 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     if "cancel" in kind and sender.startswith("agent:"):
         await _partner_cancel(city, message, chat)
         return
+    if sender.startswith("citizen:") and not picked.get("prescription_number"):
+        # Booking on its way to the facility, or already confirmed: no new offers on a "grazie".
+        stage = _booking_stage(chat, city.agent_id, sender)
+        if stage:
+            text = _phrase(chat, "pending" if stage == "flight" else "welcome")
+            if not _exact(chat, city.agent_id, text):
+                await _say(city, sender, text)
+            return
     if sender == LEDGER or sender.startswith("citizen:"):
         await _advance(city, message, chat, replacing=False)
 
@@ -629,6 +644,12 @@ async def _offer(
         text = "\n".join([*lines, _phrases(chat)["found"], *readable, closing])
     else:
         text = "\n".join([*lines, closing])
+    # city.say takes 2000 characters: the tokens matter most, then fewer offers.
+    while len(text) > _SAY_MAX and len(lines) > 1:
+        lines, slots = lines[:-1], slots[:-1]
+        text = "\n".join([*lines, closing])
+    if len(text) > _SAY_MAX:
+        text = lines[0][:_SAY_MAX]
     if await _say(city, citizen, text):
         for slot in slots:
             sent.offers.add(slot["slot_id"])
@@ -672,21 +693,29 @@ async def _on_confirm(
         return
     consent = fields.get("consent_ref", "")
     if not consent:
+        # Level 3: the code written in prose ("il mio consenso è cons-N-...-booking").
+        named = {match.rstrip(".,;:!?") for match in re.findall(r"\bcons-[\w-]+", message.text or "")}
+        consent = named.pop() if len(named) == 1 else ""
+    if not consent and _we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
+        return  # already confirmed to the facility: nothing to ask again
+    if not consent:
         ask = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent')}"
         again = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent_code')}"
         if not _exact(chat, agent, ask):
             await _say(city, citizen, ask)
-        elif heard.get("consent") == "yes" and not _exact(chat, agent, again):
-            # "Sì, acconsento" without the code: we cannot commit without consent_ref, so we
-            # ask for the code once, instead of reading the yes as a no.
-            await _say(city, citizen, again)
-        else:
-            # Asked once and the answer has no consent_ref: that is a no. Say so and move on.
+        elif heard.get("consent") == "no":
+            # An explicit no. Say so and move on.
             await _say(
                 city,
                 citizen,
                 f"cancel offer_id={offer_id} reason=consent_missing {_phrase(chat, 'no_consent')}",
             )
+        elif not _exact(chat, agent, again):
+            # A yes without the code, or a question: we cannot commit without consent_ref, so
+            # we ask for the code once. Never read it as a no.
+            await _say(city, citizen, again)
+        else:
+            await _tell(city, chat, citizen, _phrase(chat, "redirect"), again=False)
         return
     if _we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
         return
@@ -770,6 +799,8 @@ _WORRIED = re.compile(
 _PROCEDURES = {
     "VIS-FIS": {"it": "visita fisiatrica", "en": "physiatry visit"},
     "VIS-CARD": {"it": "visita cardiologica", "en": "cardiology visit"},
+    "CTRL-CARD": {"it": "controllo cardiologico", "en": "cardiology follow-up"},
+    "CONS-GIN": {"it": "consulenza ginecologica", "en": "gynaecology consultation"},
 }
 _DAY_WORDS = {
     "it": ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"),
@@ -847,19 +878,47 @@ async def _citizen_cancel(city: City, message: Message, chat: list[Message]) -> 
     what they refused."""
 
     agent, citizen = city.agent_id, message.sender
-    refused, _ = _refused(chat, agent)
-    if any(offer.get("slot_id") not in refused for offer in _live_offers(chat, agent, citizen)):
-        return
-    if any(
-        row.sender == agent and first_word(row.text) in ("confirm", "booking.receipt")
-        and f"citizen={citizen}" in row.text.split()
-        for row in chat
-    ):
+    if _booking_stage(chat, agent, citizen):
         return  # already booking another offer for them
+    refused, doctors = _refused(chat, agent)
+    reason = fields_of(message.text).get("reason", "").lower()
+    open_offers = [
+        offer
+        for offer in _live_offers(chat, agent, citizen)
+        if offer.get("slot_id") not in refused and offer.get("doctor_id") not in doctors
+    ]
+    # Refused for who the doctor is: the other offers may fail the same way, so we look again.
+    if open_offers and reason not in {"lang", "language", "gender", "doctor"}:
+        text = _phrase(chat, "dropped")
+        if not _exact(chat, agent, text):
+            await _say(city, citizen, text)
+        return
     await _advance(city, message, chat, replacing=True)
 
 
+def _booking_stage(chat: list[Message], agent: str, citizen: str) -> str:
+    """"flight" while our confirm is with the facility, "done" once the receipt reached the
+    citizen, "" otherwise (also after a cancel: then we are offering again)."""
+
+    stage = ""
+    for row in chat:
+        if row.sender != agent:
+            continue
+        head = first_word(row.text)
+        if head == "confirm" and f"citizen={citizen}" in row.text.split():
+            stage = "flight"
+        elif row.recipient == citizen and head == "booking.receipt":
+            stage = "done"
+        elif row.recipient == citizen and head in ("cancel", "offer"):
+            stage = ""
+    return stage
+
+
 # --- slot selection ----------------------------------------------------------------------------
+
+
+# The ASST's rare language, from the registry (team/world): asst-gorla-h3 speaks it and sq.
+_RARE_LANG = "sq"
 
 
 def _speaks(doctor_id: str, lang: str) -> bool:
@@ -868,7 +927,7 @@ def _speaks(doctor_id: str, lang: str) -> bool:
         return False
     if lang in spec[0]:
         return True
-    return "*" in spec[0] and lang not in {"it", "en"}
+    return "*" in spec[0] and lang == _RARE_LANG
 
 
 def _preferred(slot: dict[str, str], lang: str, gender: str | None, days: frozenset[str]) -> bool:
@@ -1247,6 +1306,12 @@ def _consent_offer(chat: list[Message], agent: str, citizen: str) -> str:
     for row in chat:
         if row.sender == agent and row.recipient == citizen:
             found = fields_of(row.text).get("offer_id", "") if first_word(row.text) == "consent" else ""
+    if found and any(
+        row.sender == agent and first_word(row.text) == "confirm"
+        and fields_of(row.text).get("offer_id") == found
+        for row in chat
+    ):
+        return ""  # the consent arrived: the booking is on its way to the facility
     return found
 
 
@@ -1362,6 +1427,7 @@ def _gender(chat: list[Message]) -> str | None:
 # lists and our own offers. It reads the citizen; it never writes a token or a fact.
 
 _LLM_TIMEOUT = 3.0
+_LANGS = frozenset("it en sq es fr de pt ro pl uk ru ar zh hi bn ur tr tl".split())
 _HEARD_MAX = 4096
 # msg_id -> what the model read in that citizen message (this process only; rules need no cache).
 _HEARD: OrderedDict[str, dict[str, object]] = OrderedDict()
@@ -1371,14 +1437,12 @@ _DAY_RX = {
     "thu": r"giovedi|thursdays?", "fri": r"venerdi|fridays?",
 }
 # Right before a day: "non il venerdì", "tranne giovedì", "not on Friday" (excluded) ...
-_DAY_NOT = re.compile(
-    r"(?:\bnon|\bno|\btranne|\beccetto|\bescluso|\bnot|\bexcept|\bbut not|\bapart from|\bcan'?t do)"
-    r"\W+(?:(?:il|lo|la|di|de|on|the|a|do|il giorno)\W+)?$"
+# A clause that rules its days out: "lunedì non posso", "Mondays I work", "except Friday".
+_CLAUSE_NOT = re.compile(
+    r"\b(?:non|no|not|never|mai|can'?t|cannot|couldn'?t|won'?t|don'?t|tranne|eccetto|escluso|esclus[oi]|"
+    r"except|apart from|lavoro|lavorando|work|working|impegnat\w*|occupat\w*|busy|impossibile|unavailable)\b"
 )
-# ... "da lunedì", "since Monday" (when it started, not a preference).
-_DAY_SINCE = re.compile(r"(?:\bda|\bdal|\bdi|\bsince|\blast|\bscorso|\bsorso)\W+$")
-_FEMALE = re.compile(r"\b(?:dottoressa|donna|femmina|female|woman|lady)\b")
-_MALE = re.compile(r"\b(?:uomo|maschio|male doctor|a male|male gp|a man|man doctor)\b")
+_CLAUSE_SPLIT = re.compile(r"[,.;:!?]+|\s+(?:ma|pero|invece|mentre|but|however|while|so)\s+")
 _IT_WORDS = frozenset(
     "vorrei buongiorno buonasera grazie prenotare prenotazione ricetta visita sono che non mi ho "
     "bene preferisco giorno dottoressa dottore medico posso ciao salve avete potete numero della "
@@ -1388,18 +1452,26 @@ _EN_WORDS = frozenset(
     "i i'd i'm my please would like book booking appointment thanks thank hello hi the is to "
     "for only prefer doctor need can yes with on any morning afternoon week work".split()
 )
+_SQ_WORDS = frozenset(
+    "pershendetje miredita faleminderit dua kam nje takim mjek mjeku vizite ju lutem flas shqip".split()
+)
+# A yes opens the message ("Sì, va bene"); "si" inside a sentence is the Italian reflexive.
 _YES = re.compile(
-    r"\b(?:si|ok|okay|va bene|perfetto|confermo|accetto|prenoto|d'accordo|certo|acconsento|"
-    r"yes|yep|sure|fine|book it|great|perfect|agree|i agree|deal)\b"
+    r"^\W*(?:si|ok|okay|va bene|perfetto|benissimo|confermo|accetto|prenoto|d'accordo|certo|"
+    r"acconsento|yes|yeah|yep|sure|fine|great|perfect|agreed|i agree|go ahead|deal)\b"
+    r"|\b(?:acconsento|do il (?:mio )?consenso|autorizzo|i agree|i consent|book it|lo prendo|la prendo)\b"
 )
 _NO = re.compile(
     r"\b(?:no|non|nessun\w*|rifiuto|preferisco di no|not|don'?t|do not|none|neither|refuse|"
     r"altr[oaie]|other|another|different|divers[oaie])\b"
 )
+# "ci penso", "let you know": not a choice yet.
+_LATER = re.compile(r"ci penso|faccio sapere|ci devo pensare|non so|forse|think about|let you know|not sure|maybe")
+_NAMES = r"(?:la|il|lo|l'|quell[ao]|opzione|option|numero|number|the|n\.?|#|prendo|scelgo|choose|take)"
 _ORDINALS = (
-    (1, r"prim[oa]|first|1st|1°|numero 1|n\.? ?1|#1|opzione 1|option 1"),
-    (2, r"second[oa]|second|2nd|2°|numero 2|n\.? ?2|#2|opzione 2|option 2"),
-    (3, r"terz[oa]|third|3rd|3°|numero 3|n\.? ?3|#3|opzione 3|option 3"),
+    (1, r"prim[oa](?!\s+(?:possibile|pomeriggio|mattin\w*|di tutto|cosa))|first(?!\s+of all)|1st|1"),
+    (2, r"second[oa](?!\s+me\b)|second|2nd|2"),
+    (3, r"terz[oa]|third|3rd|3"),
 )
 _HOUR = re.compile(
     r"\b(?:alle|delle|dalle|ore|le|at|h)\s*(\d{1,2})(?:[:.](\d{2}))?\b|\b(\d{1,2})[:.](\d{2})\b"
@@ -1424,28 +1496,64 @@ def _plain(text: str) -> str:
 
 
 def _said_days(plain: str) -> frozenset[str] | None:
-    """Weekdays wanted in free text: named days, minus the ones the citizen rules out."""
+    """Weekdays wanted in free text, clause by clause: named days, minus the ones a clause rules
+    out ("lunedì non posso", "except Friday"). "Da lunedì" alone is when it started."""
 
     wanted: set[str] = set()
     excluded: set[str] = set()
-    for day, pattern in _DAY_RX.items():
-        for match in re.finditer(rf"\b(?:{pattern})\b", plain):
-            before = plain[max(0, match.start() - 25) : match.start()]
-            if _DAY_NOT.search(before):
-                excluded.add(day)
-            elif not _DAY_SINCE.search(before):
-                wanted.add(day)
+    span = re.search(
+        rf"\b(?:da|dal|from)\s+({_ANY_DAY})\s+(?:a|al|to|until|fino a)\s+({_ANY_DAY})\b", plain
+    )
+    if span:
+        first, last = (_day_of(span.group(1)), _day_of(span.group(2)))
+        if first in _WEEK and last in _WEEK and _WEEK.index(first) <= _WEEK.index(last):
+            wanted |= set(_WEEK[_WEEK.index(first) : _WEEK.index(last) + 1])
+        plain = plain[: span.start()] + " " + plain[span.end() :]
+    for clause in _CLAUSE_SPLIT.split(plain):
+        clause = re.sub(rf"\b(?:da|dal|since)\s+(?:(?:il|lo|scorso|last)\s+)?(?:{_ANY_DAY})\b", " ", clause)
+        named = {day for day, pattern in _DAY_RX.items() if re.search(rf"\b(?:{pattern})\b", clause)}
+        if not named:
+            continue
+        if _CLAUSE_NOT.search(clause):
+            excluded |= named
+        else:
+            wanted |= named
     if not wanted and not excluded:
         return None
     days = (wanted or set(_WEEK)) - excluded
     return frozenset(days) if days and len(days) < len(_WEEK) else None
 
 
+def _day_of(word: str) -> str:
+    return next((day for day, pattern in _DAY_RX.items() if re.fullmatch(pattern, word)), "")
+
+
+# A doctor's gender asked for, not a word about the citizen ("sono una donna") or a greeting
+# ("buongiorno dottoressa").
+_FEMALE = re.compile(
+    r"\b(?:una dottoressa|medico donna|dottore donna|donna medico|specialista donna|"
+    r"(?:da|con) una donna|female (?:doctor|physician|gp|specialist)|(?:woman|lady) doctor|"
+    r"a female|(?:by|with) a woman)\b"
+)
+_MALE = re.compile(
+    r"\b(?:medico uomo|dottore uomo|uomo medico|specialista uomo|medico maschio|"
+    r"(?:da|con) un uomo|male (?:doctor|physician|gp|specialist)|man doctor|a male|"
+    r"(?:by|with) a man)\b"
+)
+_GENDER_NOT = re.compile(r"\b(?:non|no|not|don'?t|do not|never|mai|rather not|niente)\b")
+
+
 def _said_gender(plain: str) -> str | None:
-    female, male = bool(_FEMALE.search(plain)), bool(_MALE.search(plain))
-    if female == male:
-        return None
-    return "f" if female else "m"
+    found: set[str] = set()
+    for clause in _CLAUSE_SPLIT.split(plain):
+        female, male = bool(_FEMALE.search(clause)), bool(_MALE.search(clause))
+        if female == male:
+            continue
+        gender = "f" if female else "m"
+        if _GENDER_NOT.search(clause):  # "non voglio una dottoressa": the other one
+            gender = "m" if gender == "f" else "f"
+        found.add(gender)
+    return found.pop() if len(found) == 1 else None
 
 
 def _said_lang(text: str, plain: str) -> str | None:
@@ -1466,6 +1574,8 @@ def _said_lang(text: str, plain: str) -> str | None:
         return "en"
     if abs(it - en) >= 2:
         return "it" if it > en else "en"
+    if it == 0 and en == 0 and sum(token in _SQ_WORDS for token in tokens) >= 2:
+        return _RARE_LANG
     return None
 
 
@@ -1517,11 +1627,13 @@ def _pick_by_rules(plain: str, offers: list[dict[str, str]]) -> str | None:
     """The offer the citizen names by position, day or hour; None when unsure."""
 
     plain = _DAY_OUT.sub(" ", plain)
-    if not offers or _NO.search(plain):
-        return None  # "no", "un altro", "not that one": let the model read it
+    if not offers or "?" in plain or _NO.search(plain) or _LATER.search(plain):
+        return None  # a question, "no", "un altro", "ci penso": not a choice by rule
     sets: list[set[int]] = []
+    bare = re.fullmatch(r"\W*(?:opzione|option|numero|number|n\.?|#)?\s*([123])\W*", plain)
     for number, pattern in _ORDINALS:
-        if re.search(rf"(?:{pattern})(?!\w)", plain):
+        named = re.search(rf"\b{_NAMES}\s*(?:{pattern})\b", plain)
+        if named or (bare and int(bare.group(1)) == number):
             sets.append({number - 1} if number <= len(offers) else set())
     if re.search(r"\b(?:ultim[oa]|last)\b", plain):
         sets.append({len(offers) - 1})
@@ -1653,7 +1765,7 @@ async def _read_with_model(
         return {}
     read: dict[str, object] = {}
     choice = data.get("choice")
-    if offers and isinstance(choice, int) and 1 <= choice <= len(offers):
+    if offers and type(choice) is int and 1 <= choice <= len(offers):
         read["offer_id"] = offers[choice - 1]["offer_id"]
     if consent and data.get("consent") in ("yes", "no"):
         read["consent"] = data["consent"]
@@ -1669,7 +1781,7 @@ async def _read_with_model(
     if data.get("gender") in ("f", "m"):
         read["gender"] = data["gender"]
     lang = str(data.get("lang", "")).lower()
-    if re.fullmatch(r"[a-z]{2}", lang):
+    if lang in _LANGS:
         read["lang"] = lang
     return read
 
