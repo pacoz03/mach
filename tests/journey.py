@@ -64,6 +64,8 @@ STAFF = {
     "family_counseling": ("CONS-GIN", {"c1": "mon tue wed thu fri"}),
 }
 PAGE = 10
+# Codice ipotetico del rifiuto di checkin: la finestra è la mezza giornata dello slot (R:91).
+CHECKIN_REFUSED = "OUTSIDE_WINDOW"
 # ----------------------------------------------------------------------------------------------
 
 REPO = Path(__file__).resolve().parent.parent
@@ -141,6 +143,7 @@ class Ledger:
         self.consents: set[tuple[str, str]] = set()  # (purpose, consent_ref) dati dal cittadino
         self.writes: list[dict] = []
         self.refuse_holds = sc.get("refuse_holds", 0)
+        self.refuse_checkin = sc.get("refuse_checkin")
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -214,6 +217,8 @@ class Ledger:
             h["state"] = "cancelled"
             return None, REPLY["cancelled"].format(**h), False
         if op == "checkin":
+            if self.refuse_checkin:  # check-in fuori finestra iniettato dallo scenario
+                return self.refuse_checkin, "", True
             if h is None or h["state"] != "committed":
                 return "UNKNOWN_BOOKING", "", False
             self.checkins.add(h["hold_id"])
@@ -332,13 +337,32 @@ class Citizen:
     def __init__(self, bus: "Bus", sc: dict) -> None:
         self.bus, self.sc = bus, sc
         self.rx, self.chosen, self.receipts, self.waited = "", None, set(), False
+        self.pending: tuple[str, str] | None = None  # check-in rimandato dopo la domanda d'orario
 
-    def say(self, to: str, text: str) -> None:
+    def say(self, to: str, text: str, kind: str = "chat", **body: str) -> None:
         if to not in self.bus.down:  # ponytail: il cittadino non riprova verso una struttura giù
-            self.bus.queue.append(self.bus.add(CIT, to, {"text": text}))
+            self.bus.queue.append(self.bus.add(CIT, to, body or {"text": text}, kind=kind))
+
+    def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
+        """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
+        text = f"checkin booking_id={booking_id} ledger_ref={ledger_ref}"
+        mode = self.sc.get("checkin", "testo")
+        if mode == "body":  # /checkin di city run: messaggio tipato, testo vuoto (local.py:349-356)
+            self.say(fac, "", kind="checkin", booking_id=booking_id)
+        elif mode == "libero":
+            self.say(fac, ARRIVO)
+        elif mode == "orario":
+            self.pending = (fac, text)
+            self.say(fac, ORARIO)
+        else:
+            self.say(fac, text)
 
     def react(self, m: Message) -> None:
         b, kind, f = self.bus, act(m), fields(m.text)
+        if self.pending and m.sender == self.pending[0]:  # risposta all'orario: ora il check-in
+            fac, text = self.pending
+            self.pending = None
+            self.say(fac, text)
         if kind == "prescription" and f.get("prescription_number", self.rx) != self.rx:
             self.rx = f["prescription_number"]
             if self.sc.get("wait_days") and not self.waited:  # P1: chiama il centro giorni dopo
@@ -378,7 +402,7 @@ class Citizen:
             self.receipts.add(f["booking_id"])
             h = b.ledger.holds.get(f["booking_id"])
             fac = (self.chosen or {}).get("facility") or (h and b.ledger.slots[h["slot_id"]]["facility"]) or m.sender
-            self.say(fac, f"checkin booking_id={f['booking_id']} ledger_ref={f.get('ledger_ref', '')}")
+            self.checkin(fac, f["booking_id"], f.get("ledger_ref", ""))
 
 
 class Bus:
@@ -399,8 +423,8 @@ class Bus:
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
 
-    def add(self, sender, to, body, need=NEED, conv=None) -> Message:
-        m = Message(type="chat", sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
+    def add(self, sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+        m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
                     need_id=need, conversation_id=conv, body=body)
         self.log.append(m)
         self.turn_of[m.msg_id] = self.turn
@@ -457,6 +481,10 @@ def general(b: Bus) -> list[str]:
             errs.append(f"{b.name(m.sender)}: booking.receipt booking_id={f.get('booking_id')} senza commit prima (R:241)")
         if m.recipient != CIT:
             continue
+        if f.get("booking_id") and f["booking_id"] not in L.holds:
+            errs.append(f"{b.name(m.sender)}: booking_id={f['booking_id']} inventato al cittadino")
+        if kind == "checkin" and not before("checkin", "booking_id", f.get("booking_id"), i):
+            errs.append(f"{b.name(m.sender)}: checkin al cittadino prima del checkin sul Ledger (R:219)")
         if kind == "prescription" and "prescription_number" in f and not before("prescribe", "prescription_number", f["prescription_number"], i):
             errs.append(f"{b.name(m.sender)}: ricetta al cittadino prima del prescribe sul Ledger (R:219)")
         if kind == "offer":
@@ -473,6 +501,12 @@ def general(b: Bus) -> list[str]:
     for w in L.writes:
         if w["op"] == "hold" and w["f"].get("slot_id") not in offered:
             errs.append(f"{w['by']}: hold su {w['f'].get('slot_id')} mai offerto al cittadino (R:243 injection)")
+    committed = {h["hold_id"] for h in L.holds.values() if h["state"] == "committed"}
+    for (by, bid), n in Counter((w["by"], w["f"].get("booking_id")) for w in L.writes if w["op"] == "checkin").items():
+        if bid not in committed:
+            errs.append(f"{by}: checkin booking_id={bid} mai confermato sul Ledger (inventato)")
+        if n > 1:
+            errs.append(f"{by}: {n} checkin sul Ledger per booking_id={bid}, ne serve uno (retry)")
     for (s, t), n in Counter((s, t) for s, t, _ in b.bounced).items():
         if n > 1:
             errs.append(f"{b.name(s)} ha ritentato {n} volte verso {b.name(t)} dopo TARGET_NOT_VISIBLE (R:701)")
@@ -540,7 +574,44 @@ def handed_over(b: Bus) -> str | None:
         return f"offerte al cittadino in {len(offers)} messaggi invece di uno (R:95)"
 
 
+def answered_time(b: Bus) -> str | None:
+    """Alla domanda d'orario l'ospedale risponde con la sua prenotazione, non un rinvio generico.
+
+    L'ora dello slot non arriva all'ospedale (né confirm né held/committed la portano): se la dice
+    deve essere quella vera, altrimenti basta il codice di prenotazione (regola 9, mai inventare)."""
+    hosp = b.ids["hospital"]
+    q = next((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == hosp and m.text == ORARIO), None)
+    booked = [h for h in b.ledger.holds.values() if h["state"] == "committed"]
+    if q is None or not booked:
+        return "il cittadino non ha potuto chiedere l'orario: nessuna ricevuta"
+    reply = next((m for m in b.log[q + 1:] if m.sender == hosp and m.recipient == CIT), None)
+    if reply is None:
+        return "hospital muto alla domanda d'orario (R:248)"
+    at = b.ledger.slots[booked[0]["slot_id"]]["at"][11:16]
+    hours = re.findall(r"\b\d{1,2}:\d{2}\b", reply.text)
+    if any(h.zfill(5) == at for h in hours):
+        return None
+    if booked[0].get("booking_id", booked[0].get("hold_id", "")) not in reply.text:
+        return f"hospital non ha dato né l'orario {at} né il codice di prenotazione: «{reply.text[:80]}»"
+
+
+def checkin_refused(b: Bus) -> str | None:
+    """Ledger rifiuta il checkin: l'ospedale lo dice con un motivo, senza confermare né ritentare."""
+    tried = [w for w in b.ledger.writes if w["op"] == "checkin"]
+    if len(tried) != 1:
+        return f"{len(tried)} checkin sul Ledger invece di uno"
+    after = [m for m in b.log[tried[0]["i"]:] if m.sender == b.ids["hospital"] and m.recipient == CIT]
+    if any(act(m) == "checkin" for m in after):
+        return "hospital ha detto «checkin» al cittadino dopo il rifiuto del Ledger (R:219)"
+    if after and not any("reason=" in m.text or CHECKIN_REFUSED in m.text for m in after):
+        return f"hospital non ha dato il motivo del rifiuto: «{after[0].text[:80]}»"
+
+
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
+ARRIVO = "Buongiorno, sono arrivata per la visita di fisiatria."
+ORARIO = "A che ora devo presentarmi?"
+# Livello 3, check-in in ospedale (il testo `checkin booking_id=` è felice_fisiatria).
+CHECKED_IN = [wrote("checkin", "R:219/234", citizen=CIT), told("hospital", "checkin", "booking_id=", cite="R:234")]
 SCENARIOS: dict[str, dict] = {
     "felice_fisiatria": dict(start=BACK, expect=[
         wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), wrote("checkin", "R:234")]),
@@ -565,12 +636,18 @@ SCENARIOS: dict[str, dict] = {
     "injection_slot": dict(start=BACK, inject=True, expect=[wrote("commit", "R:243")]),
     "gp_handoff": dict(start=BACK, handoff=True, expect=[
         handed_over, wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
+    "checkin_body": dict(start=BACK, checkin="body", expect=CHECKED_IN),
+    "checkin_libero": dict(start=BACK, checkin="libero", expect=CHECKED_IN),
+    "domanda_orario": dict(start=BACK, checkin="orario", expect=[answered_time, *CHECKED_IN]),
+    "checkin_rifiutato": dict(start=BACK, refuse_checkin=CHECKIN_REFUSED, expect=[
+        wrote("commit", "R:241"), checkin_refused]),
 }
 
 
 def transcript(b: Bus) -> None:
     for m in b.log:
-        print(f"    {b.name(m.sender):>17} -> {b.name(m.recipient):<17} {m.text.replace(chr(10), ' | ')[:260]}")
+        text = m.text or f"<{m.type}> {dict(m.body)}"
+        print(f"    {b.name(m.sender):>17} -> {b.name(m.recipient):<17} {text.replace(chr(10), ' | ')[:260]}")
     for s, t, text in b.bounced:
         print(f"    {b.name(s):>17} -x {b.name(t):<17} TARGET_NOT_VISIBLE: {text[:200]}")
 
