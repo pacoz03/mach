@@ -1184,7 +1184,41 @@ def _family_service_answer(plain: str, en: bool) -> str:
 
 
 async def _family(city: City, message: Message, chat: list[Message]) -> None:
+    # Partner text is data: only the supported service and our own offers authorize work.
+    if message.sender.startswith("agent:"):
+        fields = _fields(message)
+        head = first_word(message.text)
+        if head == "confirm" or message.type == "confirm":
+            offer = _our_offer([r for r in chat if r.recipient == message.sender],
+                               city.agent_id, fields.get("offer_id", ""))
+            reason = ""
+            if not fields.get("consent_ref"):
+                reason = "missing_consent_ref"
+            elif not offer or fields.get("slot_id") != offer.get("slot_id"):
+                reason = "invalid_offer"
+            elif not fields.get("citizen", "").startswith("citizen:"):
+                reason = "missing_citizen"
+            if reason:
+                await _say(city, message.sender, f"cancel reason={reason}")
+                return
+            # Direct access: discard any prescription and arbitrary partner fields.
+            clean = replace(message, body={"text":
+                f"confirm offer_id={fields['offer_id']} slot_id={offer['slot_id']} "
+                f"citizen={fields['citizen']} consent_ref={fields['consent_ref']}"})
+            await _on_confirm(city, clean, chat, hold_self=False)
+        elif head == "need.request" or "need.request" in words(message.text) or message.type == "need.request":
+            if fields.get("service_type", "family_counseling.gynecology") != "family_counseling.gynecology":
+                await _say(city, message.sender,
+                           f"cancel reason=no_availability request_id={fields.get('request_id', '')}")
+                return
+            await _cross_asst(city, message, "CONS-GIN")
+        return
     if message.sender == LEDGER:
+        partner = any(r.sender.startswith("agent:") and r.sender != city.agent_id
+                      and first_word(r.text) == "confirm" for r in chat)
+        if partner and _facility_turn(message):
+            await _facility(city, message, chat, reports=False, hold_self=False)
+            return
         if first_word(message.text) == "refused" and "commit" in words(message.text):
             await _on_refused(city, message, chat, hold_self=True)
         elif first_word(message.text) == "held":
@@ -1468,7 +1502,7 @@ async def _ask_slots(city: City, message: Message, chat: list[Message]) -> None:
     await _say(city, LEDGER, f"world procedure={procedure} page=1" if procedure else "world page=1")
 
 
-async def _cross_asst(city: City, message: Message) -> None:
+async def _cross_asst(city: City, message: Message, procedure_code: str = _PROCEDURE) -> None:
     """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
     per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
     ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
@@ -1491,12 +1525,12 @@ async def _cross_asst(city: City, message: Message) -> None:
             for row in chat
         ):
             return
-        procedure = fields.get("procedure") or _PROCEDURE
+        procedure = fields.get("procedure") or procedure_code
         priority = fields.get("priority", "").upper()
         priority = priority if priority in {"U", "B", "D", "P"} else None
         chosen: list[dict[str, str]] = []
         # Only our own service: world lists every slot of the ASST, other facilities' too.
-        if procedure == _PROCEDURE:
+        if procedure == procedure_code:
             known = {row.msg_id for row in chat}
 
             def fresh(rows: list[Message]) -> list[Message]:
@@ -1526,7 +1560,7 @@ async def _cross_asst(city: City, message: Message) -> None:
             lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
             text = "\n".join([
                 *lines,
-                "Buongiorno, ecco le prime disponibilità del nostro ospedale per la vostra "
+                "Buongiorno, ecco le prime disponibilità della nostra struttura per la vostra "
                 "richiesta. Per prenotarne una inviateci la scelta con il riferimento del consenso "
                 "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta.",
             ])
