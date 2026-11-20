@@ -1026,7 +1026,37 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
 
 
+def _report_turn(message: Message) -> bool:
+    """A specialist turn that can touch the check-in note, the consent ask or the report."""
+
+    if message.sender == LEDGER:
+        return first_word(message.text) in {"checked_in", "reported"}
+    return message.sender.startswith("citizen:")
+
+
 async def _facility(
+    city: City,
+    message: Message,
+    chat: list[Message],
+    *,
+    reports: bool,
+    hold_self: bool,
+) -> None:
+    if reports and _report_turn(message):
+        # Specialist: the citizen's check-in turn and the Ledger's checked_in push run at the
+        # same time, and each would send the check-in note and the consent ask. One turn at a
+        # time per case, re-reading the case inside the lock, so each goes out once.
+        async with _gated(f"report:{message.need_id or message.msg_id}"):
+            try:
+                chat = await city.history(need_id=message.need_id)
+            except CapError:
+                pass
+            await _facility_dispatch(city, message, chat, reports=reports, hold_self=hold_self)
+        return
+    await _facility_dispatch(city, message, chat, reports=reports, hold_self=hold_self)
+
+
+async def _facility_dispatch(
     city: City,
     message: Message,
     chat: list[Message],
@@ -1053,8 +1083,12 @@ async def _facility(
         and message.sender.startswith("citizen:")
         and (asked := _consent_asked(chat, city.agent_id))
     ):
-        # The citizen's answer to our report_sharing request, a consent or a no in prose.
-        await _on_consent(city, message, chat, asked)
+        if _reported(chat, city.agent_id, asked):
+            # The report is already filed: answer, do not leave the message unanswered.
+            await _after_report(city, message, chat, asked)
+        else:
+            # The citizen's answer to our report_sharing request, a consent or a no in prose.
+            await _on_consent(city, message, chat, asked)
     elif "confirm" in kind or message.type == "confirm":
         await _on_confirm(city, message, chat, hold_self=hold_self)
     elif message.sender.startswith("citizen:"):
@@ -1332,10 +1366,11 @@ async def _on_checked_in(
         # Nobody to ask: file the report unshared (R:208).
         await _file_report(city, message, chat, booking_id, "", "")
         return
-    # R:208: after the check-in the specialist asks consent to share the report. The citizen's
-    # answer opens the next turn (_on_consent); the report is filed there.
+    if _reported(chat, city.agent_id, booking_id):
+        return
+    # R:208: after the check-in the specialist asks consent to share the report.
     if not _we(chat, city.agent_id, token, to=citizen, word="consent"):
-        await _say(
+        asked = await _say(
             city,
             citizen,
             f"consent purpose=report_sharing {token} "
@@ -1349,6 +1384,32 @@ async def _on_checked_in(
                 "archiviamo senza condividerlo e non deve fare altro."
             ),
         )
+        if not asked:
+            # The ask cannot reach the citizen: the report must not wait for an answer.
+            await _file_report(city, message, chat, booking_id, citizen, "")
+            return
+    # The citizen's answer opens the next turn (_on_consent); the report is filed there.
+
+
+def _reported(chat: list[Message], agent: str, booking_id: str) -> bool:
+    """We already wrote the report for ``booking_id`` to the Ledger."""
+
+    return _we(chat, agent, f"booking_id={booking_id}", to=LEDGER, word="report")
+
+
+async def _after_report(
+    city: City, message: Message, chat: list[Message], booking_id: str
+) -> None:
+    """A citizen line after the report is filed: a short, warm answer, nothing to redo."""
+
+    text = (
+        "You're welcome! Your visit summary is already filed: there is nothing else you "
+        "need to do. Take care."
+        if _en(chat)
+        else "Prego! Il referto della sua visita è già archiviato: non deve fare altro. "
+        "Buona giornata."
+    )
+    await _say(city, message.sender, f"booking_id={booking_id} {text}")
 
 
 def _consent_asked(chat: list[Message], agent: str) -> str:
