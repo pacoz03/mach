@@ -1111,6 +1111,11 @@ _WINDOW_CODE = re.compile(r"WINDOW|EARLY|LATE|TIME|CLOSED|HOUR|DAY", re.IGNORECA
 _UNKNOWN_CODE = re.compile(r"UNKNOWN|NOT_FOUND|INVALID|NO_BOOKING|CANCEL", re.IGNORECASE)
 # Our ASST's GP (gp/card.yaml): the hospital tells it the visit is booked, nobody else.
 _OUR_GP = "agent:ck9w60ejwnvw"
+# Our ASST's booking centre (booking_centre/card.yaml): only its bookings are our GP's patients.
+_OUR_BOOKING = "agent:sbdpbpqz5sxe"
+# The hospital's catalogue code (gp PROTOCOL; kit city_deploy/local.py maps hospital.* to it).
+# A cross-ASST request names it, or names nothing and means it.
+_PROCEDURE = "VIS-FIS"
 
 
 async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
@@ -1128,6 +1133,10 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
     elif message.sender == LEDGER and head == "refused" and "checkin" in kind:
         # A refusal that came after the arrival turn stopped waiting for it.
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
+    elif message.sender.startswith("agent:") and not confirm and (
+        "need.request" in kind or message.type == "need.request"
+    ):
+        await _cross_asst(city, message)
     else:
         booking = _facility(city, message, chat, reports=False, hold_self=False)
         if confirm and message.sender != LEDGER:
@@ -1152,6 +1161,79 @@ async def _ask_slots(city: City, message: Message, chat: list[Message]) -> None:
         return
     procedure = fields.get("procedure") or facts.get("procedure")
     await _say(city, LEDGER, f"world procedure={procedure} page=1" if procedure else "world page=1")
+
+
+async def _cross_asst(city: City, message: Message) -> None:
+    """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
+    per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
+    ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
+    attribute the Ledger did not write. The confirm that follows takes _on_confirm."""
+
+    fields = _fields(message)
+    rid = fields.get("request_id", "")
+    tag = f"request_id={rid}" if rid else ""
+    sender = message.sender
+    key = f"cross:{sender}:{rid or message.msg_id}"
+    async with _gated(key):
+        sent = _sent(key)
+        try:
+            chat = await city.history(need_id=message.need_id)
+        except CapError:
+            chat = []
+        agent = city.agent_id
+        if sent.offers or _answered(chat, agent, message.msg_id, sender) or tag and any(
+            row.sender == agent and row.recipient == sender and tag in row.text.split()
+            for row in chat
+        ):
+            return
+        procedure = fields.get("procedure") or _PROCEDURE
+        priority = fields.get("priority", "").upper()
+        priority = priority if priority in {"U", "B", "D", "P"} else None
+        chosen: list[dict[str, str]] = []
+        # Only our own service: world lists every slot of the ASST, other facilities' too.
+        if procedure == _PROCEDURE:
+            known = {row.msg_id for row in chat}
+
+            def fresh(rows: list[Message]) -> list[Message]:
+                return [row for row in rows if row.msg_id not in known]
+
+            await _say(city, LEDGER, "agenda")
+            await _say(city, LEDGER, f"world procedure={procedure} page=1")
+            rows = fresh(await _until(
+                city,
+                message.need_id,
+                chat,
+                lambda rows: _has_agenda(fresh(rows)) and _latest_slots(fresh(rows)) is not None,
+                tries=_SHORT_TRIES,
+            ))
+            agenda = _ledger(rows, "agenda")
+            now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+            world = _latest_slots(rows)
+            if now is not None and world is not None:
+                chosen = fitting(
+                    [line for line in world.splitlines() if "slot_id=" in line],
+                    now=now,
+                    priority=priority,
+                    lang="it",
+                    procedure=procedure,
+                )[:3]
+        if chosen:
+            lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
+            text = "\n".join([
+                *lines,
+                "Buongiorno, ecco le prime disponibilità del nostro ospedale per la vostra "
+                "richiesta. Per prenotarne una inviateci la scelta con il riferimento del consenso "
+                "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta.",
+            ])
+        else:
+            text = (
+                f"cancel reason=no_availability {tag}".rstrip()
+                + " Mi dispiace, al momento non abbiamo disponibilità adatte a questa richiesta. "
+                "Riscriveteci pure più avanti: ricontrolliamo subito l'agenda."
+            )
+        # Marked even if the say fails: a redelivery is not a retry after a 4xx.
+        sent.offers.add(key)
+        await _say(city, sender, text)
 
 
 async def _agenda_now(
@@ -1645,10 +1727,11 @@ async def _tell_gp(
     at: datetime | None,
 ) -> None:
     """Unrequested, once, right after the welcome: our own GP learns the visit is booked.
-    Best effort: only if the Index lists our GP, no retry, never raises."""
+    Only for our booking centre's bookings: another ASST's citizen is not our GP's patient
+    (over-disclosure, R:243). Best effort: only if the Index lists our GP, no retry, never raises."""
 
-    number = _booking_of(chat, city.agent_id, slot)[2] if slot else None
-    if not number or _we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
+    sender, _, number = _booking_of(chat, city.agent_id, slot) if slot else ("", "", None)
+    if sender != _OUR_BOOKING or not number or _we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
         return
     try:
         if not any(peer.agent_id == _OUR_GP for peer in await city.find("gp")):

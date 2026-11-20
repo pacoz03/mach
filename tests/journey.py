@@ -75,6 +75,8 @@ AGENT_DIRS = {str(REPO / f / "agent") for f in FOLDERS}
 START = datetime(2026, 11, 23, 8, tzinfo=UTC)  # lunedì 08:00 di agenda
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CIT, NEED = "citizen:T-1", "N-2026-11-23-0001"
+# Centro prenotazioni di un'altra ASST: fuori dal bus, scriptato in Bus.foreign (R:191-195).
+FOREIGN = "agent:asst-altra-booking"
 MAX_TURNS = 200
 
 
@@ -133,7 +135,7 @@ class Ledger:
               "checkin": FACILITIES, "report": {"specialist_care"}}
 
     def __init__(self, sc: dict, ids: dict[str, str]) -> None:
-        self.now = START
+        self.now = START + timedelta(days=sc.get("late_days", 0))  # late_days: slot tutti passati
         self.rules = {"P1": "off", "P2": "off", "P3": "off", **sc.get("rules", {})}
         self.folder = {v: k for k, v in ids.items()}
         self.slots = {s["slot_id"]: s for s in make_slots(ids)}
@@ -440,6 +442,7 @@ class Bus:
         self.turn, self.ledger_turns = 0, ledger_turns
         self.llm = Llm(self, sc["llm"]) if "llm" in sc else None
         self.llm_calls: list[str] = []
+        self.confirmed = False  # il centro dell'altra ASST ha già confermato
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -470,14 +473,32 @@ class Bus:
         # sc["after"]: messaggi che il cittadino scrive al gp a percorso fermo (livello 3: grazie,
         # domande, un secondo disturbo, un rinnovo chiesto a parole).
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ()))):
-            self.citizen.say(self.ids[to], text)
+            if self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
+                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
+            else:
+                self.citizen.say(self.ids[to], text)
             while self.queue and self.turn < MAX_TURNS:
                 m = self.queue.popleft()
                 self.turn += 1
                 if m.recipient == CIT:
                     self.citizen.react(m)
+                elif m.recipient == FOREIGN:
+                    self.foreign(m)
                 elif m.recipient in self.agents and m.recipient not in self.down:
                     await self.deliver(m)
+
+    def foreign(self, m: Message) -> None:
+        """Il centro di un'altra ASST (R:191-195): alla prima offerta rimanda la stessa richiesta
+        (consegna doppia: la struttura risponde una volta sola), poi conferma con il consenso."""
+        offers = parse_offers(m.text) if act(m) == "offer" else []
+        if not offers or self.confirmed:
+            return
+        self.confirmed = True
+        o = offers[0]
+        confirm = (f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen={CIT} "
+                   "consent_ref=cons-X-1 prescription_number=RX-X-1")
+        for text in (self.citizen.sc["start"][1], confirm):
+            self.queue.append(self.add(FOREIGN, m.sender, {"text": text}))
 
 
 # --- asserzioni --------------------------------------------------------------------------------
@@ -503,6 +524,8 @@ def general(b: Bus) -> list[str]:
         f, kind = fields(m.text), act(m)
         if kind == "booking.receipt" and not before("commit", "hold_id", f.get("booking_id"), i):
             errs.append(f"{b.name(m.sender)}: booking.receipt booking_id={f.get('booking_id')} senza commit prima (R:241)")
+        if m.recipient == FOREIGN and kind == "offer":  # offerte cross-ASST (R:192)
+            offered.update(o.get("slot_id") for o in parse_offers(m.text))
         if m.recipient != CIT:
             continue
         if f.get("booking_id") and f["booking_id"] not in L.holds:
@@ -668,6 +691,66 @@ def checkin_refused(b: Bus) -> str | None:
         return f"hospital non ha dato il motivo del rifiuto: «{after[0].text[:80]}»"
 
 
+# Chiave dell'offerta -> campo dello slot del Ledger: ogni altro attributo è inventato (R:243).
+SLOT_KEYS = {"slot_id": "slot_id", "doctor_id": "doctor_id", "facility": "facility", "procedure": "procedure",
+             "agenda_date": "at", "expiry": "at", "agenda_day": "day"}
+
+
+def cross_reply(rid: str, priority: str | None):
+    """R:191-192: una sola risposta dell'ospedale al centro dell'altra ASST per ``rid``.
+    ``priority``: le offerte attese (1-3 slot suoi, solo campi del Ledger); None: il cancel."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        got = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN and f"request_id={rid}" in m.text.split()]
+        if len(got) != 1:
+            return f"hospital ha risposto {len(got)} volte alla richiesta {rid} invece di una (R:192)"
+        m, offers = got[0], parse_offers(got[0].text)
+        if re.search(r"\b(?:prescription_number|citizen|patient)=", m.text):
+            return f"dati del cittadino nella risposta cross-ASST: «{m.text[:80]}» (R:191)"
+        if priority is None:
+            if act(m) != "cancel" or offers or not has(m.text, ("reason=no_availability",)):
+                return f"atteso cancel reason=no_availability request_id={rid}: «{m.text[:80]}»"
+            return None
+        if act(m) != "offer" or not 1 <= len(offers) <= 3:
+            return f"hospital non ha offerto da 1 a 3 slot: «{m.text[:80]}»"
+        for o in offers:
+            s = b.ledger.slots.get(o.get("slot_id", ""))
+            if s is None or s["facility"] != hosp:
+                return f"offerto uno slot non dell'ospedale: {o.get('slot_id')}"
+            if o.get("request_id") != rid or o.get("priority") != priority or not o.get("offer_id"):
+                return f"offerta senza request_id={rid}, priority={priority} o offer_id: {o}"
+            for k, v in o.items():
+                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                    return f"attributo {k}={v} non dal Ledger (R:243)"
+    return check
+
+
+def hospital_to_gp(expected: bool):
+    """Il gp sa della prenotazione solo se è del nostro centro: il cittadino di un'altra ASST
+    non è suo paziente (R:243 over-disclosure)."""
+    def check(b: Bus) -> str | None:
+        sent = any(m.sender == b.ids["hospital"] and m.recipient == b.ids["gp"] for m in b.log)
+        if sent and not expected:
+            return "hospital ha scritto al nostro gp per una prenotazione di un'altra ASST (R:243)"
+        if expected and not sent:
+            return "hospital non ha avvisato il nostro gp della prenotazione del nostro centro (R:249)"
+    return check
+
+
+def receipt_to_foreign(b: Bus) -> str | None:
+    if not any(m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+               and has(m.text, ("booking.receipt", "booking_id=", "ledger_ref=")) for m in b.log):
+        return "hospital non ha mandato booking.receipt al centro dell'altra ASST (R:195)"
+
+
+def no_world_of(proc: str):
+    def check(b: Bus) -> str | None:
+        if any(m.sender == b.ids["hospital"] and m.recipient == LEDGER and f"procedure={proc}" in m.text.split() for m in b.log):
+            return f"hospital ha letto world procedure={proc}: slot di un'altra struttura"
+    return check
+
+
+XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={rid} Buongiorno, cerchiamo disponibilità."
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
 ARRIVO = "Buongiorno, sono arrivata per la visita di fisiatria."
 ORARIO = "A che ora devo presentarmi?"
@@ -704,7 +787,7 @@ SCENARIOS: dict[str, dict] = {
     "injection_slot": dict(start=BACK, inject=True, expect=[wrote("commit", "R:243")]),
     "gp_handoff": dict(start=BACK, handoff=True, expect=[
         handed_over, wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
-    "checkin_body": dict(start=BACK, checkin="body", expect=CHECKED_IN),
+    "checkin_body": dict(start=BACK, checkin="body", expect=[*CHECKED_IN, hospital_to_gp(True)]),
     "checkin_libero": dict(start=BACK, checkin="libero", expect=CHECKED_IN),
     "domanda_orario": dict(start=BACK, checkin="orario", expect=[answered_time, *CHECKED_IN]),
     "checkin_rifiutato": dict(start=BACK, refuse_checkin=CHECKIN_REFUSED, expect=[
@@ -743,6 +826,18 @@ SCENARIOS: dict[str, dict] = {
                                  told_text("gp", "I understand your concern", cite="lingua")]),
     "gp_red_flag_en": dict(start=("gp", "I have a crushing chest pain since this morning"), expect=[
         told_text("gp", "Call 112", cite="R:242"), no_write("prescribe", "R:442")]),
+    # Cross-ASST (R:191-195): il centro di un'altra ASST chiede slot all'ospedale, poi conferma.
+    "cross_asst_prenota": dict(
+        start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-1")), foreign=True,
+        expect=[cross_reply("R-1", "B"), wrote("hold", "R:194", citizen=CIT),
+                wrote("commit", "R:194", consent_ref="cons-X-1"), receipt_to_foreign, hospital_to_gp(False),
+                *CHECKED_IN]),
+    "cross_asst_nessuno": dict(
+        start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-2")), foreign=True,
+        late_days=15, expect=[cross_reply("R-2", None), no_write("hold", "R:192")]),
+    "cross_asst_altra_struttura": dict(
+        start=("hospital", XREQ.format(svc="specialist_care.cardiology", proc="VIS-CARD", rid="R-3")),
+        foreign=True, expect=[cross_reply("R-3", None), no_world_of("VIS-CARD")]),
 }
 
 
