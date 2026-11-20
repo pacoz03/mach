@@ -1187,10 +1187,17 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     if message.sender == LEDGER:
         if first_word(message.text) == "refused" and "commit" in words(message.text):
             await _on_refused(city, message, chat, hold_self=True)
+        elif first_word(message.text) == "held":
+            slot = fields_of(message.text).get("slot_id", "")
+            if slot:
+                await _finish_booking(city, message, chat, slot, hold_self=True)
         elif _facility_turn(message):
             await _facility(city, message, chat, reports=False, hold_self=True)
         else:
-            await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
+            # Agenda/world replies already consumed by history must not replace live offers.
+            own = [r for r in chat if r.sender == city.agent_id and r.recipient.startswith("citizen:")]
+            if not any(first_word(r.text) in {"offer", "consent", "booking.receipt", "checkin"} for r in own):
+                await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
         return
     if not message.sender.startswith("citizen:"):
         return
@@ -1266,6 +1273,18 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     )
     if pending and denied:
         await _say(city, citizen, f"cancel offer_id={pending} reason=consent_denied")
+        return
+
+    cancelled = message.type == "cancel" or first_word(message.text) == "cancel"
+    if cancelled or (offers and not pending and denied):
+        rejected = data.get("offer_id", "")
+        if rejected and not any(o["offer_id"] == rejected for o in offers):
+            return
+        if offers:
+            for offer in offers:
+                if not rejected or offer["offer_id"] == rejected:
+                    await _say(city, citizen, f"cancel offer_id={offer['offer_id']} reason=citizen_declined")
+            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
         return
 
     explicit = message.type == "confirm" or first_word(message.text) == "confirm"
@@ -2098,6 +2117,16 @@ def _latest_hold(chat: list[Message], agent: str) -> tuple[str, str | None]:
     return consent, number
 
 
+async def _family_wait(city: City, chat: list[Message]) -> None:
+    citizen = _citizen(chat)
+    if citizen:
+        en = _family_preferences(chat, citizen).get("lang") == "en"
+        text = ("Your booking is still being verified. It is not confirmed yet."
+                if en else "La prenotazione è ancora in verifica. Non è ancora confermata.")
+        if not _exact(chat, city.agent_id, text):
+            await _say(city, citizen, text)
+
+
 async def _finish_booking(
     city: City, message: Message, chat: list[Message], slot: str, *, hold_self: bool
 ) -> None:
@@ -2106,6 +2135,8 @@ async def _finish_booking(
     found = await _await_line(city, message.need_id, chat, "held", f"slot_id={slot}", op="hold")
     if found is None:
         _LOG.info("care.held.missing", extra={"need_id": (message.need_id or "")[:48]})
+        if hold_self:
+            await _family_wait(city, chat)
         return
     reply, fresh = found
     if first_word(reply.text) == "refused":
@@ -2120,6 +2151,8 @@ async def _finish_booking(
     )
     if done is None:
         _LOG.info("care.commit.missing", extra={"need_id": (message.need_id or "")[:48]})
+        if hold_self:
+            await _family_wait(city, fresh)
         return
     reply, fresh = done
     if first_word(reply.text) == "committed":
