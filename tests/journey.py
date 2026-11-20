@@ -835,6 +835,14 @@ def receipt_to_foreign(b: Bus) -> str | None:
         return "hospital non ha mandato booking.receipt al centro dell'altra ASST (R:195)"
 
 
+def never_from_hospital_to(peer: str):
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == peer]
+        if got:
+            return f"hospital ha scritto a {peer}: «{got[0].text[:80]}» (sonda senza criteri)"
+    return check
+
+
 def no_world_of(proc: str):
     def check(b: Bus) -> str | None:
         if any(m.sender == b.ids["hospital"] and m.recipient == LEDGER and f"procedure={proc}" in m.text.split() for m in b.log):
@@ -949,6 +957,10 @@ SCENARIOS: dict[str, dict] = {
         expect=[cross_reply("R-1", "B"), wrote("hold", "R:194", citizen=CIT),
                 wrote("commit", "R:194", consent_ref="cons-X-1"), receipt_to_foreign, hospital_to_gp(False),
                 *CHECKED_IN]),
+    # La sonda della conformance (service=lab, nessun criterio cross-ASST): nessun effetto.
+    "cross_asst_sonda": dict(
+        start=("hospital", "need.request service=lab summary=visit district=8"), foreign=True,
+        expect=[no_world_of("VIS-FIS"), never_from_hospital_to(FOREIGN)]),
     "cross_asst_nessuno": dict(
         start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-2")), foreign=True,
         late_days=15, expect=[cross_reply("R-2", None), no_write("hold", "R:192")]),

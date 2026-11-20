@@ -1597,8 +1597,14 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
     elif message.sender == LEDGER and head == "checked_in":
         await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
-    elif message.sender.startswith("agent:") and not confirm and (
-        "need.request" in kind or message.type == "need.request"
+    elif (
+        message.sender.startswith("agent:")
+        and not confirm
+        and ("need.request" in kind or message.type == "need.request")
+        # A partner's search names request_id, procedure or service_type (R:191). The
+        # conformance probe ({"service": "lab", ...}) names none: answering it with late
+        # Ledger reads and a cancel spilled effects into later stages and failed the deploy.
+        and {"request_id", "procedure", "service_type"} & _fields(message).keys()
     ):
         await _cross_asst(city, message)
     else:
