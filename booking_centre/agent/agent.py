@@ -826,6 +826,10 @@ async def _on_confirm(
         parts.append(f"request_id={request}")
     if offer.get("prescription_number"):
         parts.append(f"prescription_number={offer['prescription_number']}")
+    # The citizen's language, so the facility writes to them in it. It leaves only now, with
+    # the citizen's consent in hand (for a partner ASST, the cross-ASST one).
+    if re.fullmatch(r"[a-z]{2}", _lang(chat)):
+        parts.append(f"lang={_lang(chat)}")
     try:
         await city.say(facility, " ".join(parts))
     except CapError:
