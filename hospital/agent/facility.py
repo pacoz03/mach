@@ -106,11 +106,36 @@ _NEGATED = re.compile(
     r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
     r"\s+(?:\w+\s+)?$"
 )
-ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
-_PICK = "Ecco le prime disponibilità: mi indichi quale preferisce."
+# Citizen prose (it/en). Never an act word (offer, confirm, cancel, consent, checkin, report,
+# hold, prescription) or a key=value token: understood() reads the last act word as the act.
+ESCALATION = (
+    "escalate.emergency reason=red_flag Capisco la sua preoccupazione: è importante agire "
+    "subito. Contatti subito il 112, il numero unico di emergenza. Quando sarà al sicuro, sono "
+    "qui per aiutarla con la prenotazione."
+)
+ESCALATION_EN = (
+    "escalate.emergency reason=red_flag I understand your concern: it is important to act right "
+    "away. Please call 112, the emergency number, now. Once you are safe, I am here to help you "
+    "with your appointment."
+)
+_PICK = (
+    "Ecco le prime disponibilità per lei, senza bisogno di ricetta: mi indichi quale preferisce "
+    "e penso io a fissarla. Se nessuna le va bene, me lo scriva e cerco altre date."
+)
+_PICK_EN = (
+    "Here are the first available appointments for you, no referral needed: tell me which one "
+    "you prefer and I will book it. If none suits you, just write to me and I will look for "
+    "other dates."
+)
 _NO_SLOTS = (
-    "cancel reason=no_slots Mi dispiace, al momento non ci sono appuntamenti liberi. "
-    "Può riscrivermi tra qualche giorno, oppure chiedere al centro prenotazioni."
+    "cancel reason=no_slots Mi dispiace, al momento non ci sono appuntamenti liberi adatti a "
+    "lei. Se mi riscrive tra qualche giorno ricontrollo subito l'agenda; può anche rivolgersi al "
+    "centro prenotazioni."
+)
+_NO_SLOTS_EN = (
+    "cancel reason=no_slots I'm sorry, there are no suitable free appointments right now. Write "
+    "to me again in a few days and I will check the agenda straight away; you can also ask the "
+    "booking centre."
 )
 
 
@@ -136,7 +161,8 @@ async def emergency(need: Need, city: City) -> bool:
     flagged = fields_of(text).get("is_emergency", "").lower() == "true"
     if not (need.is_emergency or flagged or red_flag(text)):
         return False
-    await _say(city, message.sender, ESCALATION)
+    en = fields_of(text).get("lang", "").lower() == "en"
+    await _say(city, message.sender, ESCALATION_EN if en else ESCALATION)
     return True
 
 
@@ -510,6 +536,48 @@ def _lang(chat: list[Message]) -> str:
     return "it"
 
 
+def _en(chat: list[Message]) -> bool:
+    return _lang(chat) == "en"
+
+
+_DAY_NAMES = {
+    "it": ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"),
+    "en": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+}
+
+
+def _slot_when(chat: list[Message], agent: str, slot_id: str) -> str:
+    """The slot we offered, in words ("lunedì 23/11 alle 10:00"), or "" if we never offered it."""
+
+    offers = _our_offers(chat, agent) if slot_id else []
+    offer = next((o for o in offers if o.get("slot_id") == slot_id), {})
+    at = _when(offer.get("agenda_date", ""))
+    if at is None:
+        return ""
+    if _en(chat):
+        return f"{_DAY_NAMES['en'][at.weekday()]} {at:%d/%m} at {at:%H:%M}"
+    return f"{_DAY_NAMES['it'][at.weekday()]} {at:%d/%m} alle {at:%H:%M}"
+
+
+def _receipt_note(chat: list[Message], agent: str, slot_id: str, booking_id: str) -> str:
+    """What the citizen does next after a booking: when, and the code for the check-in."""
+
+    when = _slot_when(chat, agent, slot_id)
+    if _en(chat):
+        head = f"Your appointment is booked for {when}." if when else "Your appointment is booked."
+        return (
+            f" {head} On the day, when you arrive, check in with your booking code {booking_id}."
+            " I am here if you need anything."
+        )
+    head = f"La sua prenotazione è confermata per {when}." if when else (
+        "La sua prenotazione è confermata."
+    )
+    return (
+        f" {head} Il giorno della visita, al suo arrivo, faccia il check-in con il codice di "
+        f"prenotazione {booking_id}. Per qualsiasi cosa sono a sua disposizione."
+    )
+
+
 def _gender(chat: list[Message]) -> str | None:
     for row in chat:
         if not row.sender.startswith("citizen:"):
@@ -676,7 +744,15 @@ async def _advance_alone(
             if offer_id in sent.offers:
                 return
             if not _we(chat, agent, token, to=citizen, word="offer"):
-                if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true"):
+                note = (
+                    "I can put you on the waiting list for this visit: let me know if that "
+                    "works for you."
+                    if _en(chat)
+                    else "Posso inserirla in lista d'attesa per questa visita: mi dica se le va "
+                    "bene."
+                )
+                text = f"offer offer_id={offer_id} waiting_list=true {note}"
+                if await _say(city, citizen, text):
                     sent.offers.add(offer_id)
             return
         procedure = fixed or (None if reply is None else reply.get("procedure"))
@@ -753,7 +829,8 @@ async def _advance_alone(
         if chosen:
             # Every offer in one message: the citizen chooses from that message only (R:95).
             lines = [_offer_line(slot, number, priority) for slot in chosen]
-            if await _say(city, citizen, "\n".join([*lines, _PICK])):
+            pick = _PICK_EN if _en(chat) else _PICK
+            if await _say(city, citizen, "\n".join([*lines, pick])):
                 for slot in chosen:
                     sent.offers.add(slot["slot_id"])
                     if replacing:
@@ -781,7 +858,7 @@ async def _advance_alone(
     if message.sender.startswith("citizen:") or not _we(
         chat, agent, "reason=no_slots", to=citizen, word="cancel"
     ):
-        await _say(city, citizen, _NO_SLOTS)
+        await _say(city, citizen, _NO_SLOTS_EN if _en(chat) else _NO_SLOTS)
 
 
 async def _on_confirm(
@@ -808,7 +885,19 @@ async def _confirm_alone(
         # Never silent (R:195): the sender learns which field is missing.
         missing = "slot_id" if not slot else "consent_ref"
         head = f"cancel offer_id={offer_id}" if offer_id else "cancel"
-        await _say(city, message.sender, f"{head} reason=missing_{missing}")
+        text = f"{head} reason=missing_{missing}"
+        if message.sender.startswith("citizen:"):
+            if _en(chat):
+                text += (
+                    " I'm sorry, one detail is still missing to complete the booking: send me"
+                    " your choice again with it and I will go ahead straight away."
+                )
+            else:
+                text += (
+                    " Mi dispiace, per completare la prenotazione manca ancora un dato: mi"
+                    " riscriva la sua scelta completa e procedo subito."
+                )
+        await _say(city, message.sender, text)
         if hold_self and message.sender.startswith("citizen:"):
             # A cancel drops the citizen's offers: send the ones still free again.
             await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
@@ -860,7 +949,10 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=citizen, word="booking.receipt"):
         return
-    await _say(city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+    note = _receipt_note(chat, city.agent_id, fields.get("slot_id", ""), booking_id)
+    await _say(
+        city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}{note}"
+    )
 
 
 async def _partner_cancel(
@@ -874,7 +966,14 @@ async def _partner_cancel(
         and citizen
         and not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel")
     ):
-        await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled")
+        note = (
+            "I'm sorry, the facility has called off this appointment. I am looking for other "
+            "dates for you right away."
+            if _en(chat)
+            else "Mi dispiace, la struttura ha annullato questo appuntamento. Cerco subito altre "
+            "date per lei."
+        )
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled {note}")
     await _advance(city, message, chat, fixed=fixed, replacing=True)
 
 
@@ -941,7 +1040,18 @@ async def _redirect(city: City, message: Message, chat: list[Message]) -> None:
     """Un messaggio del cittadino che non sappiamo gestire: rinvio al ruolo giusto, mai una
     risposta inventata, e una volta sola per caso."""
 
-    text = tools.redirect()
+    if _en(chat):
+        text = (
+            "Thank you for your message. I can't give you reliable information on this: your GP "
+            "can help with symptoms and referrals, the booking centre with booking, moving or "
+            "calling off a visit. If you already have an appointment here, check in with your "
+            "booking code when you arrive and I will take care of the rest."
+        )
+    else:
+        text = (
+            f"Grazie per il messaggio. {tools.redirect()} Se ha già un appuntamento qui, al suo "
+            "arrivo faccia il check-in con il codice di prenotazione e penso io al resto."
+        )
     if not _exact(chat, city.agent_id, text):
         await _say(city, message.sender, text)
 
@@ -1079,7 +1189,10 @@ async def _on_committed(city: City, message: Message, chat: list[Message]) -> No
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=target, word="booking.receipt"):
         return
-    await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+    text = f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}"
+    if target.startswith("citizen:"):
+        text += _receipt_note(chat, city.agent_id, slot, booking_id)
+    await _say(city, target, text)
 
 
 async def _on_refused(
@@ -1108,7 +1221,18 @@ async def _on_refused(
         code = fields_of(message.text).get("code") or "facility_cancelled"
         text = f"cancel offer_id={offer_id} reason={code}"
         if target.startswith("citizen:"):
-            text += " Mi dispiace, questo appuntamento non si può più prenotare."
+            if _en(chat):
+                text += " I'm sorry, this appointment can no longer be booked." + (
+                    " I am looking for other dates for you right away."
+                    if hold_self
+                    else " The booking centre can find you another date."
+                )
+            else:
+                text += " Mi dispiace, questo appuntamento non è più disponibile." + (
+                    " Cerco subito altre date per lei."
+                    if hold_self
+                    else " Il centro prenotazioni può trovarle un'altra data."
+                )
         await _say(city, target, text)
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
@@ -1136,9 +1260,18 @@ async def _on_checkin(city: City, message: Message, chat: list[Message], *, repo
     await _say(
         city,
         citizen,
-        f"{token} reason={code} Mi dispiace, non sono riuscito a registrare il suo arrivo. "
-        "Controlli il numero della prenotazione e riprovi; se il problema resta, chi le ha "
-        "fissato l'appuntamento può verificarla.",
+        f"{token} reason={code} "
+        + (
+            f"I'm sorry, I could not register your arrival with the code {booking_id}. Could "
+            "you check the code on the booking confirmation you received and send it to me "
+            "again? I will verify it right away. If it still does not work, whoever booked "
+            "the appointment for you can check the booking."
+            if _en(chat)
+            else f"Mi dispiace, non sono riuscito a registrare il suo arrivo con il codice "
+            f"{booking_id}. Può controllare il codice sulla conferma di prenotazione che ha "
+            "ricevuto e reinviarmelo? Lo verifico subito. Se il problema resta, chi le ha "
+            "fissato l'appuntamento può controllare la prenotazione."
+        ),
     )
 
 
@@ -1151,7 +1284,23 @@ async def _on_checked_in(
         return
     token = f"booking_id={booking_id}"
     if citizen and not _we(chat, city.agent_id, token, to=citizen, word="checkin"):
-        await _say(city, citizen, f"checkin booking_id={booking_id}")
+        if reports:
+            note = (
+                "Thank you, your arrival is registered. After the visit the specialist files "
+                "the visit summary and I will let you know straight away."
+                if _en(chat)
+                else "Grazie, il suo arrivo è registrato. Dopo la visita lo specialista archivia "
+                "il referto e la avviso subito."
+            )
+        else:
+            note = (
+                "Thank you, your arrival is registered: there is nothing else you need to do. "
+                "I wish you a good visit."
+                if _en(chat)
+                else "Grazie, il suo arrivo è registrato: non deve fare altro. Le auguro una buona "
+                "visita."
+            )
+        await _say(city, citizen, f"checkin booking_id={booking_id} {note}")
     if not reports:
         return
     if not citizen:
@@ -1164,9 +1313,16 @@ async def _on_checked_in(
         await _say(
             city,
             citizen,
-            f"consent purpose=report_sharing {token} Grazie, il check-in è registrato. "
-            "Posso condividere il suo referto? Se preferisce di no, lo archiviamo senza "
-            "condividerlo.",
+            f"consent purpose=report_sharing {token} "
+            + (
+                "One more thing: may I share your visit summary? If you agree, "
+                "just send me your approval. If you prefer not to, that is perfectly fine: we "
+                "file it without sharing it and you need do nothing else."
+                if _en(chat)
+                else "Un'ultima cosa: posso condividere il suo referto? Se è "
+                "d'accordo, mi invii il suo consenso. Se preferisce di no, nessun problema: lo "
+                "archiviamo senza condividerlo e non deve fare altro."
+            ),
         )
 
 
@@ -1302,16 +1458,23 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
     if not _we(chat, agent, token, to=citizen, word="report"):
         outcome = fields.get("outcome_code") or ours.get("outcome_code") or _OUTCOME
         shared = fields.get("consent_ref") or ours.get("consent_ref")
-        note = (
-            "Lo condividiamo come da suo consenso."
-            if shared
-            else "Senza il suo consenso non viene condiviso."
-        )
-        await _say(
-            city,
-            citizen,
-            f"report {token} outcome_code={outcome} Il referto della visita è archiviato. {note}",
-        )
+        if _en(chat):
+            note = (
+                "Your visit summary is filed and shared as you agreed."
+                if shared
+                else "Your visit summary is filed; without your agreement it is not shared and "
+                "stays private."
+            )
+            note += " Thank you for coming, and take care."
+        else:
+            note = (
+                "Il referto della sua visita è archiviato e lo condividiamo come da suo consenso."
+                if shared
+                else "Il referto della sua visita è archiviato; senza il suo consenso non viene "
+                "condiviso e resta riservato."
+            )
+            note += " Grazie per la fiducia e buona giornata."
+        await _say(city, citizen, f"report {token} outcome_code={outcome} {note}")
     number = ours.get("follow_up_prescription_number", "")
     rx = f"prescription_number={number}"
     if not number or _we(chat, agent, rx, to=citizen, word="prescription"):
@@ -1332,6 +1495,12 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
     await _say(
         city,
         citizen,
-        " ".join(parts) + " Con questa ricetta può prenotare la visita di controllo al centro "
-        "prenotazioni.",
+        " ".join(parts)
+        + (
+            " I have already arranged the referral for your follow-up visit, so you do not need "
+            "to go back to your GP: you can book it directly with the booking centre."
+            if _en(chat)
+            else " Le ho già preparato la ricetta per la visita di controllo, così non deve "
+            "tornare dal medico: può prenotarla direttamente al centro prenotazioni."
+        ),
     )
