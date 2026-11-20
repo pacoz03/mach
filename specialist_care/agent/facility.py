@@ -1737,7 +1737,14 @@ async def _cross_asst(
                 *lines,
                 f"Buongiorno, ecco le prime disponibilità {ours} per la vostra richiesta. "
                 f"{beyond}Per prenotarne una inviateci la scelta con il riferimento del consenso "
-                "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta.",
+                "del cittadino: la registriamo sul Ledger e vi mandiamo subito la ricevuta."
+                + (
+                    # A partner's confirm without the prescription is refused (POLICY_VIOLATION).
+                    " Nel confirm indicate offer_id, slot_id, citizen, prescription_number e "
+                    "consent_ref, più cross_asst_consent_ref se la regola lo richiede."
+                    if hospital
+                    else ""
+                ),
             ])
         else:
             text = (
