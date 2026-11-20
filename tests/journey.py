@@ -16,6 +16,7 @@ import asyncio  # noqa: E402
 import importlib.util  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import time  # noqa: E402
 import traceback  # noqa: E402
 from collections import Counter, deque  # noqa: E402
 from contextlib import contextmanager  # noqa: E402
@@ -35,7 +36,9 @@ REPLY = {
     "procedure={procedure} priority={priority} state=issued",
     "prescription": "prescription prescription_number={prescription_number} patient={patient} "
     "procedure={procedure} priority={priority} state={state}",
-    "agenda": "agenda agenda_now={now} agenda_day={day}",
+    # Campi di una risposta vera (episodes, 2026-11-20): il brain ne ricava l'orologio da sé.
+    "agenda": "agenda rate=60.0 paused=false agenda_day={day} agenda_now={now} epoch_real={real} "
+    "epoch_agenda={now}",
     "rules": "rules version=1 P1={P1} P2={P2} P3={P3}",
     "slots": "slots page={page}/{pages} count={count}",  # intestazione, poi una riga per slot
     "slot": "slot_id={slot_id} doctor_id={doctor_id} facility={facility} procedure={procedure} "
@@ -154,6 +157,8 @@ class Ledger:
         self.writes: list[dict] = []
         self.refuse_holds = sc.get("refuse_holds", 0)
         self.refuse_checkin = sc.get("refuse_checkin")
+        self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
+        self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -163,7 +168,15 @@ class Ledger:
         r = self.rx.get(number or "")
         return bool(r) and self.rules["P1"] == "on" and self.now - r["issued"] > timedelta(days=2)
 
+    def late(self, text: str) -> float:
+        if (text.split() or [""])[0] != "agenda":
+            return 0
+        self.agendas += 1
+        return self.slow_agenda if self.agendas > 1 else 0
+
     def taken(self, slot_id: str) -> bool:
+        if datetime.fromisoformat(self.slots[slot_id]["at"]) < self.full:
+            return True
         return any(h["slot_id"] == slot_id and h["state"] != "cancelled" for h in self.holds.values())
 
     def answer(self, by: str, need: str | None, text: str, i: int) -> str:
@@ -248,7 +261,8 @@ class Ledger:
             return REPLY["prescription"].format(
                 **r, state="expired" if self.expired(r["prescription_number"]) else "issued")
         if op == "agenda":
-            return REPLY["agenda"].format(now=self.now.isoformat(), day=DAYS[self.now.weekday()])
+            return REPLY["agenda"].format(now=self.now.isoformat(), day=DAYS[self.now.weekday()],
+                                          real=datetime.now(UTC).isoformat())
         if op == "rules":
             return REPLY["rules"].format(**self.rules)
         if op == "world":
@@ -327,10 +341,11 @@ class Port:
             raise CapError("TARGET_NOT_VISIBLE", to)
         m = b.add(self.me, to, body, need_id, conversation_id)
         if to == LEDGER:  # la risposta è subito nel log: il polling nel turno la vede
-            r = b.add(LEDGER, self.me, {"text": b.ledger.answer(self.me, need_id, m.text, len(b.log) - 1)},
-                      need_id, conversation_id)
-            if b.ledger_turns:
-                b.queue.append(r)
+            text = b.ledger.answer(self.me, need_id, m.text, len(b.log) - 1)
+            if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città
+                asyncio.get_running_loop().call_later(delay, b.reply, self.me, text, need_id, conversation_id)
+            else:
+                b.reply(self.me, text, need_id, conversation_id)
         else:
             b.queue.append(m)
         return m.msg_id
@@ -458,6 +473,7 @@ class Bus:
         self.llm = Llm(self, sc["llm"]) if "llm" in sc else None
         self.llm_calls: list[str] = []
         self.confirmed = False  # il centro dell'altra ASST ha già confermato
+        self.stamp: dict[str, float] = {}  # msg_id -> time.monotonic() dell'invio
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -471,7 +487,13 @@ class Bus:
                     need_id=need, conversation_id=conv, body=body)
         self.log.append(m)
         self.turn_of[m.msg_id] = self.turn
+        self.stamp[m.msg_id] = time.monotonic()
         return m
+
+    def reply(self, to: str, text: str, need: str | None, conv: str | None) -> None:
+        r = self.add(LEDGER, to, {"text": text}, need, conv)
+        if self.ledger_turns:
+            self.queue.append(r)
 
     async def deliver(self, m: Message) -> None:
         a = self.agents[m.recipient]
@@ -491,7 +513,9 @@ class Bus:
     async def run(self, start: tuple[str, str]) -> None:
         # sc["after"]: messaggi che il cittadino scrive al gp a percorso fermo (livello 3: grazie,
         # domande, un secondo disturbo, un rinnovo chiesto a parole).
-        for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ()))):
+        # sc["foreign_after"]: altre richieste del centro dell'altra ASST all'ospedale.
+        for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
+                         *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ()))):
             if self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
                 self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
             else:
@@ -515,7 +539,8 @@ class Bus:
         self.confirmed = True
         o = offers[0]
         confirm = (f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen={CIT} "
-                   "consent_ref=cons-X-1 prescription_number=RX-X-1")
+                   "consent_ref=cons-X-1 prescription_number=RX-X-1"
+                   + (" cross_asst_consent_ref=xc-X-1" if self.citizen.sc.get("xconsent") else ""))
         for text in (self.citizen.sc["start"][1], confirm):
             self.queue.append(self.add(FOREIGN, m.sender, {"text": text}))
 
@@ -759,6 +784,39 @@ def cross_reply(rid: str, priority: str | None):
     return check
 
 
+def told_text_to_foreign(rid: str, sub: str):
+    def check(b: Bus) -> str | None:
+        if not any(m.sender == b.ids["hospital"] and m.recipient == FOREIGN and f"request_id={rid}" in m.text.split()
+                   and sub in m.text for m in b.log):
+            return f"hospital non ha scritto «{sub}» nella risposta {rid}"
+    return check
+
+
+def cross_fast(rid: str, seconds: float):
+    """La risposta a ``rid`` parte entro ``seconds`` dalla richiesta (fast reply < 10 s, R:246)."""
+    def check(b: Bus) -> str | None:
+        hosp, tok = b.ids["hospital"], f"request_id={rid}"
+        asked = next((m for m in b.log if m.sender == FOREIGN and tok in m.text.split()), None)
+        got = next((m for m in b.log if m.sender == hosp and m.recipient == FOREIGN and tok in m.text.split()), None)
+        if asked is None or got is None:
+            return f"richiesta o risposta {rid} mancante"
+        took = b.stamp[got.msg_id] - b.stamp[asked.msg_id]
+        if took >= seconds:
+            return f"risposta a {rid} dopo {took:.1f} s, attesa sotto {seconds} s (orologio in cache?)"
+    return check
+
+
+def cross_doctors(rid: str, first: str, *keys: str):
+    """Il primo slot offerto per ``rid`` è del medico ``first``; ``keys``: medici presenti tra le offerte."""
+    def check(b: Bus) -> str | None:
+        m = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                  and f"request_id={rid}" in m.text.split()), None)
+        docs = [o.get("doctor_id", "").rsplit("-", 1)[-1] for o in parse_offers(m.text)] if m else []
+        if not docs or docs[0] != first or not set(keys) <= set(docs):
+            return f"offerte {rid}: medici {docs}, atteso primo {first} e anche {list(keys)}"
+    return check
+
+
 def hospital_to_gp(expected: bool):
     """Il gp sa della prenotazione solo se è del nostro centro: il cittadino di un'altra ASST
     non è suo paziente (R:243 over-disclosure)."""
@@ -785,6 +843,7 @@ def no_world_of(proc: str):
 
 
 XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={rid} Buongiorno, cerchiamo disponibilità."
+XFIS = "need.request service_type=hospital.physiatry procedure=VIS-FIS priority=B request_id={rid}{extra} Buongiorno."
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
 ARRIVO = "Buongiorno, sono arrivata per la visita di fisiatria."
 ORARIO = "A che ora devo presentarmi?"
@@ -894,6 +953,28 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_altra_struttura": dict(
         start=("hospital", XREQ.format(svc="specialist_care.cardiology", proc="VIS-CARD", rid="R-3")),
         foreign=True, expect=[cross_reply("R-3", None), no_world_of("VIS-CARD")]),
+    # Orologio in cache: la seconda agenda arriva dopo 5 s, ma l'ospedale non la aspetta.
+    "cross_asst_orologio": dict(
+        start=("hospital", XFIS.format(rid="R-4", extra="")), foreign_after=[XFIS.format(rid="R-5", extra="")],
+        foreign=True, slow_agenda=5.0, expect=[cross_reply("R-4", "B"), cross_reply("R-5", "B"), cross_fast("R-5", 4.0)]),
+    # Finestra B (2 giorni) tutta piena: offerte subito dopo, non cancel (alternativa rilassata, R:232).
+    "cross_asst_oltre_finestra": dict(
+        start=("hospital", XFIS.format(rid="R-6", extra="")), foreign=True, full_days=2,
+        expect=[cross_reply("R-6", "B"), told_text_to_foreign("R-6", "subito dopo")]),
+    # lang=sq: prima h3, l'unico che parla sq; lang=en: prima h1, ma un h3 resta tra le offerte.
+    "cross_asst_lingua_sq": dict(
+        start=("hospital", XFIS.format(rid="R-7", extra=" lang=sq")), foreign=True,
+        expect=[cross_reply("R-7", "B"), cross_doctors("R-7", "h3")]),
+    "cross_asst_lingua_en": dict(
+        start=("hospital", XFIS.format(rid="R-8", extra=" lang=en")), foreign=True,
+        expect=[cross_reply("R-8", "B"), cross_doctors("R-8", "h1", "h3")]),
+    "cross_asst_tutto_pieno": dict(
+        start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
+        expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
+    # P2: l'hold porta il consenso cross-ASST, il commit quello della prenotazione.
+    "cross_asst_consenso_p2": dict(
+        start=("hospital", XFIS.format(rid="R-10", extra="")), foreign=True, xconsent=True,
+        expect=[wrote("hold", "P2", consent_ref="xc-X-1"), wrote("commit", "R:194", consent_ref="cons-X-1")]),
 }
 
 
