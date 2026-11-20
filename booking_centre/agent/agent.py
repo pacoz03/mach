@@ -19,6 +19,7 @@ history because a Ledger push may not open a turn of its own.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -84,6 +85,7 @@ _PHRASES: dict[str, dict[str, str]] = {
         "waiting_p": "Per la priorità P la prenotazione passa dalla lista d'attesa: gliela propongo qui.",
         "which": "Mi scusi, non trovo questa scelta tra le offerte che le ho mandato: quale offerta sceglie?",
         "consent": "Perfetto. Per completare la prenotazione mi serve il suo consenso: può confermarlo?",
+        "consent_code": "Per completare la prenotazione mi serve il codice del consenso (consent_ref).",
         "no_consent": (
             "Capisco. Senza il consenso non posso completare questa prenotazione: se cambia idea, "
             "sono qui."
@@ -133,6 +135,7 @@ _PHRASES: dict[str, dict[str, str]] = {
         "waiting_p": "For priority P the booking goes through the waiting list: I am offering it to you here.",
         "which": "Sorry, I cannot match this choice with the slots I sent you: which one do you choose?",
         "consent": "Great. To complete the booking I need your agreement: could you give it?",
+        "consent_code": "To complete the booking I need the code of your consent (consent_ref).",
         "no_consent": "I understand. Without your agreement I cannot complete this booking: if you change your mind, I am here.",
         "down": (
             "Sorry, the facility cannot be reached right now, so this slot is withdrawn: I am "
@@ -270,15 +273,18 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     kind = words(message.text) | {message.type}
     sender = message.sender
     picked = _fields(message)
+    # Free text (level 3): which of our offers, a yes/no to consent, days, gender, language.
+    heard = await _hear(city, message, chat) if sender.startswith("citizen:") else {}
     # A choice, a consent, or the answer to our consent request (a "no" comes in plain words).
     if sender.startswith("citizen:") and (
         "confirm" in kind
         or "consent" in kind
         or "offer_id" in picked
         or "consent_ref" in picked
+        or heard.get("offer_id")
         or _consent_offer(chat, city.agent_id, sender)
     ):
-        await _on_confirm(city, message, chat)
+        await _on_confirm(city, message, chat, heard)
         return
     if sender.startswith("agent:") and picked.get("handoff") == "gp":
         await _accept_handoff(city, message, chat)
@@ -570,7 +576,9 @@ async def _renewal(city: City, chat: list[Message], citizen: str, *, again: bool
     await _tell(city, chat, citizen, ask, again=again)
 
 
-async def _on_confirm(city: City, message: Message, chat: list[Message]) -> None:
+async def _on_confirm(
+    city: City, message: Message, chat: list[Message], heard: dict[str, object] | None = None
+) -> None:
     """The citizen picked an offer: ask the owning facility to hold and commit it.
 
     Slot, facility and prescription come only from our own offer, found by its ``offer_id``.
@@ -580,7 +588,13 @@ async def _on_confirm(city: City, message: Message, chat: list[Message]) -> None
     agent = city.agent_id
     citizen = message.sender
     fields = _fields(message)
-    offer_id = fields.get("offer_id") or _consent_offer(chat, agent, citizen)
+    heard = heard or {}
+    # The offer named in free text is one of OUR offers (``_hear`` only picks from them).
+    offer_id = (
+        fields.get("offer_id")
+        or _consent_offer(chat, agent, citizen)
+        or str(heard.get("offer_id") or "")
+    )
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
     if offer.get("waiting_list") == "true":
         return  # The waiting list ends the case here: nothing to book.
@@ -594,8 +608,13 @@ async def _on_confirm(city: City, message: Message, chat: list[Message]) -> None
     consent = fields.get("consent_ref", "")
     if not consent:
         ask = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent')}"
+        again = f"consent purpose=booking offer_id={offer_id} {_phrase(chat, 'consent_code')}"
         if not _exact(chat, agent, ask):
             await _say(city, citizen, ask)
+        elif heard.get("consent") == "yes" and not _exact(chat, agent, again):
+            # "Sì, acconsento" without the code: we cannot commit without consent_ref, so we
+            # ask for the code once, instead of reading the yes as a no.
+            await _say(city, citizen, again)
         else:
             # Asked once and the answer has no consent_ref: that is a no. Say so and move on.
             await _say(
@@ -1053,15 +1072,6 @@ def _number(chat: list[Message]) -> str | None:
     return None
 
 
-def _lang(chat: list[Message]) -> str:
-    for row in chat:
-        if row.sender.startswith("citizen:") or _from_gp(row):
-            lang = _fields(row).get("lang", "")
-            if lang:
-                return lang
-    return "it"
-
-
 _WEEKDAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri"}
 
 
@@ -1078,8 +1088,25 @@ async def _preferences_ready(city: City, chat: list[Message], citizen: str, miss
     return False
 
 
+def _lang(chat: list[Message]) -> str:
+    """The case's language: a ``lang=`` token, else what the citizen's own words show."""
+
+    for row in chat:
+        if row.sender.startswith("citizen:") or _from_gp(row):
+            lang = _fields(row).get("lang", "")
+            if lang:
+                return lang
+    for row in chat:
+        if row.sender.startswith("citizen:"):
+            lang = _heard(row).get("lang")
+            if isinstance(lang, str) and lang:
+                return lang
+    return "it"
+
+
 def _days(chat: list[Message]) -> frozenset[str]:
-    """Agenda days the citizen prefers (``days=mon/wed``) as mon..fri; empty when not said."""
+    """Agenda days the citizen prefers as mon..fri (token ``days=`` or free text, latest
+    message first); empty when not said."""
 
     for row in reversed(chat):
         if not row.sender.startswith("citizen:"):
@@ -1095,10 +1122,15 @@ def _days(chat: list[Message]) -> frozenset[str]:
             names = raw if isinstance(raw, list) else re.split(r"[/,|;]", raw)
             short = {str(name).strip().lower()[:3] for name in names}
             return frozenset({_WEEKDAYS.get(day, day) for day in short} & set(_WEEKDAYS.values()))
+        said = _heard(row).get("days")
+        if isinstance(said, frozenset) and said:
+            return said
     return frozenset()
 
 
 def _gender(chat: list[Message]) -> str | None:
+    """Doctor gender the citizen asked for: a token first, else free text (latest first)."""
+
     for row in chat:
         if not row.sender.startswith("citizen:"):
             continue
@@ -1106,7 +1138,330 @@ def _gender(chat: list[Message]) -> str | None:
         raw = fields.get("gender_preference") or fields.get("gender")
         if raw in {"m", "f"}:
             return raw
+    for row in reversed(chat):
+        if row.sender.startswith("citizen:"):
+            said = _heard(row).get("gender")
+            if said in {"m", "f"}:
+                return str(said)
     return None
+
+
+# --- free text (level 3) -----------------------------------------------------------------------
+# Rules first: they are instant and free. The team model (city.llm, city-default) only fills
+# what the rules leave open, under a short timeout, and its answer is checked against closed
+# lists and our own offers. It reads the citizen; it never writes a token or a fact.
+
+_LLM_TIMEOUT = 3.0
+_HEARD_MAX = 4096
+# msg_id -> what the model read in that citizen message (this process only; rules need no cache).
+_HEARD: OrderedDict[str, dict[str, object]] = OrderedDict()
+_WEEK = ("mon", "tue", "wed", "thu", "fri")
+_DAY_RX = {
+    "mon": r"lunedi|mondays?", "tue": r"martedi|tuesdays?", "wed": r"mercoledi|wednesdays?",
+    "thu": r"giovedi|thursdays?", "fri": r"venerdi|fridays?",
+}
+# Right before a day: "non il venerdì", "tranne giovedì", "not on Friday" (excluded) ...
+_DAY_NOT = re.compile(
+    r"(?:\bnon|\bno|\btranne|\beccetto|\bescluso|\bnot|\bexcept|\bbut not|\bapart from|\bcan'?t do)"
+    r"\W+(?:(?:il|lo|la|di|de|on|the|a|do|il giorno)\W+)?$"
+)
+# ... "da lunedì", "since Monday" (when it started, not a preference).
+_DAY_SINCE = re.compile(r"(?:\bda|\bdal|\bdi|\bsince|\blast|\bscorso|\bsorso)\W+$")
+_FEMALE = re.compile(r"\b(?:dottoressa|donna|femmina|female|woman|lady)\b")
+_MALE = re.compile(r"\b(?:uomo|maschio|male doctor|a male|male gp|a man|man doctor)\b")
+_IT_WORDS = frozenset(
+    "vorrei buongiorno buonasera grazie prenotare prenotazione ricetta visita sono che non mi ho "
+    "bene preferisco giorno dottoressa dottore medico posso ciao salve avete potete numero della "
+    "del gli perche anche sempre lavoro mattina pomeriggio settimana".split()
+)
+_EN_WORDS = frozenset(
+    "i i'd i'm my please would like book booking appointment thanks thank hello hi the is to "
+    "for only prefer doctor need can yes with on any morning afternoon week work".split()
+)
+_YES = re.compile(
+    r"\b(?:si|ok|okay|va bene|perfetto|confermo|accetto|prenoto|d'accordo|certo|acconsento|"
+    r"yes|yep|sure|fine|book it|great|perfect|agree|i agree|deal)\b"
+)
+_NO = re.compile(
+    r"\b(?:no|non|nessun\w*|rifiuto|preferisco di no|not|don'?t|do not|none|neither|refuse|"
+    r"altr[oaie]|other|another|different|divers[oaie])\b"
+)
+_ORDINALS = (
+    (1, r"prim[oa]|first|1st|1°|numero 1|n\.? ?1|#1|opzione 1|option 1"),
+    (2, r"second[oa]|second|2nd|2°|numero 2|n\.? ?2|#2|opzione 2|option 2"),
+    (3, r"terz[oa]|third|3rd|3°|numero 3|n\.? ?3|#3|opzione 3|option 3"),
+)
+_HOUR = re.compile(
+    r"\b(?:alle|delle|dalle|ore|le|at|h)\s*(\d{1,2})(?:[:.](\d{2}))?\b|\b(\d{1,2})[:.](\d{2})\b"
+)
+_ANY_DAY = "|".join(_DAY_RX.values())
+# "venerdì non posso", "non il venerdì", "not Friday": a day ruled out, cut before picking.
+_DAY_OUT = re.compile(
+    rf"(?:\b(?:non|not|no|tranne|eccetto|except)\W+(?:(?:il|la|di|on|the)\W+)?(?:{_ANY_DAY})\b)"
+    rf"|(?:\b(?:quell[oa]\W+)?(?:di\W+|del\W+|on\W+)?(?:{_ANY_DAY})\W+(?:\w+\W+)?"
+    r"(?:non (?:posso|riesco|va bene|mi va)|no\b|not possible|doesn'?t work|can'?t|won'?t work))"
+)
+# Scripts that say the language on their own when the model is slow.
+_SCRIPTS = (
+    ("ar", "\u0600-\u06ff"), ("ru", "\u0400-\u04ff"), ("zh", "\u4e00-\u9fff"),
+    ("hi", "\u0900-\u097f"), ("bn", "\u0980-\u09ff"), ("ur", "\u0750-\u077f"),
+)
+
+
+def _plain(text: str) -> str:
+    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
+    return " ".join(plain.decode().lower().split())
+
+
+def _said_days(plain: str) -> frozenset[str] | None:
+    """Weekdays wanted in free text: named days, minus the ones the citizen rules out."""
+
+    wanted: set[str] = set()
+    excluded: set[str] = set()
+    for day, pattern in _DAY_RX.items():
+        for match in re.finditer(rf"\b(?:{pattern})\b", plain):
+            before = plain[max(0, match.start() - 25) : match.start()]
+            if _DAY_NOT.search(before):
+                excluded.add(day)
+            elif not _DAY_SINCE.search(before):
+                wanted.add(day)
+    if not wanted and not excluded:
+        return None
+    days = (wanted or set(_WEEK)) - excluded
+    return frozenset(days) if days and len(days) < len(_WEEK) else None
+
+
+def _said_gender(plain: str) -> str | None:
+    female, male = bool(_FEMALE.search(plain)), bool(_MALE.search(plain))
+    if female == male:
+        return None
+    return "f" if female else "m"
+
+
+def _said_lang(text: str, plain: str) -> str | None:
+    """it or en from distinctive words; None (ask the model) for anything else or a tie."""
+
+    if any(ch.isalpha() and ord(ch) > 0x24F for ch in text):
+        # Another script: the model names it; a well-known script is our answer meanwhile.
+        for code, letters in _SCRIPTS:
+            if re.search(f"[{letters}]", text):
+                return code
+        return None
+    tokens = re.findall(r"[a-z']+", plain)
+    it = sum(token in _IT_WORDS for token in tokens)
+    en = sum(token in _EN_WORDS for token in tokens)
+    if it >= 1 and en == 0 and it >= min(2, len(tokens)):
+        return "it"
+    if en >= 1 and it == 0 and en >= min(2, len(tokens)):
+        return "en"
+    if abs(it - en) >= 2:
+        return "it" if it > en else "en"
+    return None
+
+
+def _heard(row: Message) -> dict[str, object]:
+    """Days, gender and language in one citizen message: the rules, then the model's reading."""
+
+    plain = _plain(row.text or "")
+    found: dict[str, object] = {}
+    days = _said_days(plain)
+    if days:
+        found["days"] = days
+    gender = _said_gender(plain)
+    if gender:
+        found["gender"] = gender
+    lang = _said_lang(row.text or "", plain)
+    if lang:
+        found["lang"] = lang
+    for key, value in _HEARD.get(row.msg_id, {}).items():
+        found.setdefault(key, value)
+    return found
+
+
+def _live_offers(chat: list[Message], agent: str, citizen: str) -> list[dict[str, str]]:
+    """Our latest offers to the citizen, in the order sent, while none is confirmed yet."""
+
+    latest: list[dict[str, str]] = []
+    cancelled: set[str] = set()
+    for row in chat:
+        if row.sender != agent:
+            continue
+        head = first_word(row.text)
+        if row.recipient == citizen and head == "offer":
+            latest = [offer for offer in _offers_in(row.text) if offer.get("slot_id")]
+        elif row.recipient == citizen and head == "cancel":
+            cancelled.add(fields_of(row.text).get("offer_id", ""))
+        elif head in ("confirm", "booking.receipt") and f"citizen={citizen}" in row.text.split():
+            return []  # already on its way to the facility
+        elif row.recipient == citizen and head == "booking.receipt":
+            return []
+    return [offer for offer in latest if offer.get("offer_id") not in cancelled]
+
+
+def _offer_hour(offer: dict[str, str]) -> tuple[int, int] | None:
+    match = re.search(r"T(\d{2}):(\d{2})", offer.get("agenda_date", ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _pick_by_rules(plain: str, offers: list[dict[str, str]]) -> str | None:
+    """The offer the citizen names by position, day or hour; None when unsure."""
+
+    plain = _DAY_OUT.sub(" ", plain)
+    if not offers or _NO.search(plain):
+        return None  # "no", "un altro", "not that one": let the model read it
+    sets: list[set[int]] = []
+    for number, pattern in _ORDINALS:
+        if re.search(rf"(?:{pattern})(?!\w)", plain):
+            sets.append({number - 1} if number <= len(offers) else set())
+    if re.search(r"\b(?:ultim[oa]|last)\b", plain):
+        sets.append({len(offers) - 1})
+    days = {day for day, pattern in _DAY_RX.items() if re.search(rf"\b(?:{pattern})\b", plain)}
+    if days:
+        sets.append({i for i, offer in enumerate(offers) if offer.get("agenda_day") in days})
+    hours = [
+        (int(m.group(1) or m.group(3)), int(m.group(2) or m.group(4) or 0))
+        for m in _HOUR.finditer(plain)
+    ]
+    if hours:
+        sets.append(
+            {
+                i
+                for i, offer in enumerate(offers)
+                if (at := _offer_hour(offer)) is not None
+                and any(at[0] == h and (m == 0 or at[1] == m) for h, m in hours)
+            }
+        )
+    if not sets:
+        return offers[0]["offer_id"] if len(offers) == 1 and _YES.search(plain) else None
+    chosen = set(range(len(offers)))
+    for found in sets:
+        chosen &= found
+    return offers[chosen.pop()]["offer_id"] if len(chosen) == 1 else None
+
+
+def _asked_preferences(chat: list[Message], agent: str, citizen: str) -> bool:
+    """Our latest word to the citizen asks for days or gender."""
+
+    latest = ""
+    for row in chat:
+        if row.sender == agent and row.recipient == citizen:
+            latest = row.text
+    fields = fields_of(latest)
+    return first_word(latest) == "data.request" and fields.get("fields") in {"days", "gender"}
+
+
+async def _hear(city: City, message: Message, chat: list[Message]) -> dict[str, object]:
+    """What a citizen's free-text message means for the desk.
+
+    ``offer_id`` (one of OUR live offers), ``consent`` (yes/no while our consent request is
+    open), plus days, gender and language. Tokens win: a message with ``key=value`` tokens is
+    read as before and never goes to the model.
+    """
+
+    try:
+        agent, citizen = city.agent_id, message.sender
+        text = message.text or ""
+        plain = _plain(text)
+        heard: dict[str, object] = dict(_heard(message))
+        offers = _live_offers(chat, agent, citizen)
+        pending = _consent_offer(chat, agent, citizen)
+        if offers and not pending:
+            chosen = _pick_by_rules(plain, offers)
+            if chosen:
+                heard["offer_id"] = chosen
+        if pending:
+            yes, no = bool(_YES.search(plain)), bool(_NO.search(plain))
+            if yes != no:
+                heard["consent"] = "yes" if yes else "no"
+        if fields_of(text) or not plain:
+            return heard
+        lang_known = any(
+            row.sender.startswith("citizen:") and (_fields(row).get("lang") or _heard(row).get("lang"))
+            for row in chat
+        )
+        needs = (
+            (offers and not pending and "offer_id" not in heard)
+            or (pending and "consent" not in heard)
+            or (
+                _asked_preferences(chat, agent, citizen)
+                and "days" not in heard
+                and "gender" not in heard
+            )
+            or not lang_known
+        )
+        if not needs:
+            return heard
+        read = await _read_with_model(city, text, [] if pending else offers, bool(pending))
+        if read:
+            _HEARD[message.msg_id] = {k: v for k, v in read.items() if k in ("days", "gender", "lang")}
+            while len(_HEARD) > _HEARD_MAX:
+                _HEARD.popitem(last=False)
+            for key, value in read.items():
+                heard.setdefault(key, value)
+        return heard
+    except Exception:  # noqa: BLE001 - reading free text must never stop the desk
+        return {}
+
+
+async def _read_with_model(
+    city: City, text: str, offers: list[dict[str, str]], consent: bool
+) -> dict[str, object]:
+    """One city.llm call; only values from closed lists (and our own offer ids) come back."""
+
+    keys = []
+    if offers:
+        listed = "\n".join(
+            f"{i}. {offer.get('agenda_day', '?')} {offer.get('agenda_date', '?')}"
+            for i, offer in enumerate(offers, 1)
+        )
+        keys.append(
+            f'"choice": the number (1-{len(offers)}) of the offer the citizen accepts; 0 if they '
+            "accept none, ask for something else, or it is unclear. Offers sent, in order:\n" + listed
+        )
+    if consent:
+        keys.append('"consent": "yes" if the citizen gives the requested consent, "no" if they refuse, "unclear" otherwise')
+    keys += [
+        '"days": weekdays the citizen wants, from [mon, tue, wed, thu, fri]; [] if not said',
+        '"not_days": weekdays the citizen cannot do, from the same list; [] if not said',
+        '"gender": "f" if they want a female doctor, "m" a male doctor, "none" otherwise',
+        '"lang": ISO 639-1 code of the language the message is written in',
+    ]
+    system = (
+        "You read one message a citizen wrote to a healthcare booking desk. Reply with one JSON "
+        "object and nothing else, with these keys:\n- " + "\n- ".join(keys)
+    )
+    try:
+        answer = await asyncio.wait_for(
+            city.llm([{"role": "system", "content": system}, {"role": "user", "content": text[:1000]}]),
+            _LLM_TIMEOUT,
+        )
+        match = re.search(r"\{.*\}", str(answer.get("content", "")), re.S)
+        data = json.loads(match.group(0)) if match else {}
+    except Exception:  # noqa: BLE001 - CapError, timeout, bad JSON: the rules stand alone
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    read: dict[str, object] = {}
+    choice = data.get("choice")
+    if offers and isinstance(choice, int) and 1 <= choice <= len(offers):
+        read["offer_id"] = offers[choice - 1]["offer_id"]
+    if consent and data.get("consent") in ("yes", "no"):
+        read["consent"] = data["consent"]
+
+    def week(value: object) -> set[str]:
+        return {str(d).lower()[:3] for d in value} & set(_WEEK) if isinstance(value, list) else set()
+
+    wanted, excluded = week(data.get("days")), week(data.get("not_days"))
+    if wanted or excluded:
+        days = (wanted or set(_WEEK)) - excluded
+        if days and len(days) < len(_WEEK):
+            read["days"] = frozenset(days)
+    if data.get("gender") in ("f", "m"):
+        read["gender"] = data["gender"]
+    lang = str(data.get("lang", "")).lower()
+    if re.fullmatch(r"[a-z]{2}", lang):
+        read["lang"] = lang
+    return read
 
 
 # --- address -----------------------------------------------------------------------------------
