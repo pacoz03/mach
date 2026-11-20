@@ -2,8 +2,8 @@
 
 Fonte unica in ``shared/facility.py``; ``shared/sync.sh`` lo copia in ``hospital/``,
 ``specialist_care/`` e ``family_counseling/`` (``agent/facility.py``): non modificare le copie.
-Ogni ``agent.py`` fa il controllo clinico e ``tools.start_turn``, poi chiama
-``handle(role, need, city)`` con il proprio ruolo scritto nel codice.
+Ogni ``agent.py`` chiama ``emergency`` (red flag → ``escalate.emergency``), poi fa il controllo
+clinico e ``tools.start_turn``, poi chiama ``handle(role, need, city)`` con il proprio ruolo.
 
 Deriva dall'esempio del kit (care protocol, un messaggio in ingresso per passo) senza i rami
 del medico di base e del centro prenotazioni. Le scritture al Ledger sono chat a
@@ -15,8 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import unicodedata
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -50,6 +53,91 @@ _SENT_NEEDS = 4096
 _OUTCOME = "VISIT"
 # Catalogue code of the cardiology control visit (city-cli chat_play CODES: "cardiology follow-up").
 _CONTROL = "CTRL-CARD"
+# Red flags in the citizen's own words (it/en), on text without accents. Copied from the gp
+# (gp/agent/agent.py): the consultorio is a front door too and the first agent holding a
+# red-flag case must escalate (R:242). ponytail: two copies until the shared tool (plan T).
+_PAIN = (
+    r"(?:dolor\w*|mal(?:e|issimo)?\b|fitt\w*|strett\w*|oppress\w*|bruci\w*|pain\w*|hurt\w*"
+    r"|ach\w*|tight\w*|pressure|squeez\w*)"
+)
+_CHEST = r"(?:petto|torace|chest)"
+_NEAR = r"\W+(?:\w+\W+){0,4}?"
+_RED_FLAG = re.compile(
+    "|".join(
+        (
+            _PAIN + _NEAR + _CHEST,
+            _CHEST + _NEAR + _PAIN,
+            r"peso (?:sul|al) petto|dolor\w* toracic\w*",
+            r"(?:dolor\w*|male|pain\w*|hurt\w*)" + _NEAR + r"(?:braccio sinistro|left arm)",
+            r"fiato corto|cort\w* di fiato|senza fiato|affann\w*|dispne\w*",
+            r"manc\w*\W+(?:\w+\W+){0,2}?(?:fiato|respiro|aria)\b",
+            r"(?:non riesco|fatic\w*|difficolt\w*)\W+(?:\w+\W+){0,2}?respir\w*",
+            r"short(?:ness)? of breath|out of breath|breathless\w*",
+            r"(?:can'?t|cannot|hard to|trouble|difficult\w*|struggl\w*)"
+            r"\W+(?:\w+\W+){0,2}?breath\w*",
+            r"svenu\w*|svenim\w*|sven(?:go|gono|ire)\b"
+            r"|(?:pers\w*|perdo)\W+(?:i sensi|conoscenza|coscienza)",
+            r"faint(?:ed|ing)\b|(?:feel\w*|felt) faint|pass(?:ed|ing)? out|lost consciousness"
+            r"|black(?:ed)? out",
+            r"(?:perdita di forza|perdo (?:la )?forza|debolezza|non sento)"
+            r"\W+(?:\w+\W+){0,3}?gamb\w*",
+            r"gamb\w*\W+(?:\w+\W+){0,2}?"
+            r"(?:cedono|non (?:mi )?(?:reggono|rispondono)|paralizzat\w*)",
+            r"(?:loss of strength|losing strength|weakness|can'?t feel)\W+(?:\w+\W+){0,3}?legs?\b",
+            r"legs?\W+(?:\w+\W+){0,2}?(?:giving (?:out|way)|gave (?:out|way)|won'?t hold)",
+            r"incontinen\w*"
+            r"|(?:controll\w*|controllo)\W+(?:\w+\W+){0,2}?(?:vescica|intestino|sfinter\w*)",
+            r"(?:loss of|lost|can'?t control)\W+(?:\w+\W+){0,2}?(?:bladder|bowel)",
+            r"(?:sput\w*|tossisc\w*|tosse con|vomit\w*|perd\w*)\W+(?:\w+\W+){0,2}?sangue",
+            r"sangue\W+(?:\w+\W+)?(?:nelle urine|nelle feci|nel vomito|dalla bocca)",
+            r"sanguin\w*\W+(?:\w+\W+)?(?:molto|tanto|abbondant\w*|non si ferma)|emorragi\w*",
+            r"(?:cough\w*|vomit\w*|spit\w*)\W+(?:\w+\W+)?blood"
+            r"|blood in (?:my |the )?(?:urine|stool|vomit)",
+            r"bleed\w*\W+(?:\w+\W+)?(?:heavily|a lot|won'?t stop)"
+            r"|heavy bleeding|h(?:a)?emorrhag\w*",
+            r"paralis\w*|paralizz\w*|paraly\w*|(?:faccia|bocca) storta|slurred speech"
+            r"|face droop\w*",
+            r"convulsion\w*|seizure\w*|crisi epilettic\w*",
+        )
+    )
+)
+# "non ho dolore al petto": a negation right before the words is not a red flag.
+_NEGATED = re.compile(
+    r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
+    r"\s+(?:\w+\s+)?$"
+)
+ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
+_PICK = "Ecco le prime disponibilità: mi indichi quale preferisce."
+_NO_SLOTS = (
+    "cancel reason=no_slots Mi dispiace, al momento non ci sono appuntamenti liberi. "
+    "Può riscrivermi tra qualche giorno, oppure chiedere al centro prenotazioni."
+)
+
+
+def red_flag(text: str) -> bool:
+    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
+    lowered = plain.decode().lower()
+    return any(
+        not _NEGATED.search(lowered[max(0, match.start() - 40) : match.start()])
+        for match in _RED_FLAG.finditer(lowered)
+    )
+
+
+async def emergency(need: Need, city: City) -> bool:
+    """A citizen's red flag: ``escalate.emergency`` and True, before any clinical refusal.
+
+    Every agent.py calls this first. No ``tools.start_turn``: the citizen's text is clinical.
+    """
+
+    message = city.inbound
+    if message is None or not message.sender.startswith("citizen:"):
+        return False
+    text = message.text or need.summary
+    flagged = fields_of(text).get("is_emergency", "").lower() == "true"
+    if not (need.is_emergency or flagged or red_flag(text)):
+        return False
+    await _say(city, message.sender, ESCALATION)
+    return True
 
 
 def _asks_address(message: Message) -> bool:
@@ -275,10 +363,13 @@ def fitting(
     priority: str | None,
     lang: str,
     gender: str | None = None,
-    facility: str | None = None,
     procedure: str | None = None,
 ) -> list[dict[str, str]]:
-    """Slots a citizen can accept: future, free, in the priority window, spoken language."""
+    """Slots a citizen can accept: future, free, in the priority window, spoken language.
+
+    A doctor missing from ``_DOCTORS`` is not filtered on language, gender or days: we do not
+    know them, so we neither drop the slot nor claim anything about the doctor.
+    """
 
     if priority == "U":
         horizon: datetime | None = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -297,8 +388,6 @@ def fitting(
             continue
         if procedure and slot.get("procedure") not in (None, procedure):
             continue
-        if facility and slot.get("facility") != facility:
-            continue
         free = slot.get("free")
         if free is not None and free.isdigit() and int(free) <= 0:
             continue
@@ -307,16 +396,15 @@ def fitting(
             continue
         if not earliest < at or (horizon is not None and at >= horizon):
             continue
-        if not _speaks(doctor, lang):
-            continue
         spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
-        if spec is None:
-            continue
-        day = slot.get("day", "")
-        if day and day not in spec[2]:
-            continue
-        if gender and spec[1] != gender:
-            continue
+        if spec is not None:
+            if not _speaks(doctor, lang):
+                continue
+            day = slot.get("day", "")
+            if day and day not in spec[2]:
+                continue
+            if gender and spec[1] != gender:
+                continue
         chosen.append((at, slot))
     chosen.sort(key=lambda item: (item[0], item[1].get("slot_id", "")))
     return [slot for _, slot in chosen]
@@ -358,34 +446,39 @@ def _asked(chat: list[Message], agent: str, procedure: str, page: int) -> bool:
     return False
 
 
+def _our_offers(chat: list[Message], agent: str) -> list[dict[str, str]]:
+    """Every offer we sent. One message carries several, one ``offer`` line each (R:95)."""
+
+    return [
+        fields_of(line)
+        for row in chat
+        if row.sender == agent
+        for line in row.text.splitlines()
+        if first_word(line) == "offer"
+    ]
+
+
 def _offered(chat: list[Message], agent: str) -> set[str]:
-    found: set[str] = set()
-    for row in chat:
-        if row.sender != agent or "offer" not in words(row.text):
-            continue
-        slot = fields_of(row.text).get("slot_id")
-        if slot:
-            found.add(slot)
-    return found
+    return {offer["slot_id"] for offer in _our_offers(chat, agent) if offer.get("slot_id")}
 
 
 def _withdrawn(chat: list[Message], agent: str) -> set[str]:
-    """Slots we cancelled. The citizen drops the rest, so those are offered again."""
+    """Slots we cancelled or the Ledger refused. The citizen drops the rest, so those are
+    offered again."""
 
-    by_offer: dict[str, str] = {}
-    for row in chat:
-        if row.sender != agent or "offer" not in words(row.text):
-            continue
-        fields = fields_of(row.text)
-        offer_id = fields.get("offer_id")
-        slot = fields.get("slot_id")
-        if offer_id and slot:
-            by_offer[offer_id] = slot
+    by_offer = {
+        offer["offer_id"]: offer["slot_id"]
+        for offer in _our_offers(chat, agent)
+        if offer.get("offer_id") and offer.get("slot_id")
+    }
     dropped: set[str] = set()
     for row in chat:
+        fields = fields_of(row.text)
+        if row.sender == LEDGER and first_word(row.text) == "refused" and fields.get("slot_id"):
+            dropped.add(fields["slot_id"])
         if "cancel" not in words(row.text):
             continue
-        slot = by_offer.get(fields_of(row.text).get("offer_id", ""))
+        slot = by_offer.get(fields.get("offer_id", ""))
         if slot:
             dropped.add(slot)
     return dropped
@@ -439,11 +532,7 @@ def _offer_line(slot: dict[str, str], number: str | None, priority: str | None) 
 
 
 def _our_offer(chat: list[Message], agent: str, offer_id: str) -> dict[str, str]:
-    token = f"offer_id={offer_id}"
-    for row in chat:
-        if row.sender == agent and token in row.text.split() and "offer" in words(row.text):
-            return fields_of(row.text)
-    return {}
+    return next((o for o in _our_offers(chat, agent) if o.get("offer_id") == offer_id), {})
 
 
 class _Gate:
@@ -461,14 +550,16 @@ class _Sent:
 
     ``offers`` holds every slot id (and waiting-list offer id) sent. A cancel makes the
     citizen drop all offers, so ``again`` holds only what was re-sent for ``trigger``.
+    ``holds`` holds the slots we sent a ``hold`` for, so a duplicate confirm does not hold twice.
     """
 
-    __slots__ = ("offers", "trigger", "again")
+    __slots__ = ("offers", "trigger", "again", "holds")
 
     def __init__(self) -> None:
         self.offers: set[str] = set()
         self.trigger = ""
         self.again: set[str] = set()
+        self.holds: set[str] = set()
 
 
 # Every Ledger or citizen message opens its own turn, and turns of one need run at the same
@@ -487,6 +578,23 @@ def _sent(key: str) -> _Sent:
     else:
         _SENT.move_to_end(key)
     return entry
+
+
+@asynccontextmanager
+async def _gated(key: str) -> AsyncIterator[None]:
+    """Run alone among the turns holding ``key``. Not re-entrant: confirms use their own key."""
+
+    gate = _GATES.get(key)
+    if gate is None:
+        gate = _GATES[key] = _Gate()
+    gate.turns += 1
+    try:
+        async with gate.lock:
+            yield
+    finally:
+        gate.turns -= 1
+        if gate.turns == 0 and _GATES.get(key) is gate:
+            del _GATES[key]
 
 
 async def _desk(
@@ -524,17 +632,8 @@ async def _advance(
     replacing: bool,
 ) -> None:
     key = message.need_id or message.msg_id
-    gate = _GATES.get(key)
-    if gate is None:
-        gate = _GATES[key] = _Gate()
-    gate.turns += 1
-    try:
-        async with gate.lock:
-            await _advance_alone(city, message, chat, key, fixed=fixed, replacing=replacing)
-    finally:
-        gate.turns -= 1
-        if gate.turns == 0 and _GATES.get(key) is gate:
-            del _GATES[key]
+    async with _gated(key):
+        await _advance_alone(city, message, chat, key, fixed=fixed, replacing=replacing)
 
 
 async def _advance_alone(
@@ -627,35 +726,67 @@ async def _advance_alone(
         taken = _withdrawn(chat, agent) | sent.again
     else:
         taken = _offered(chat, agent) | sent.offers
-    chosen = [
-        slot
-        for slot in fitting(
-            [line for line in world.splitlines() if "slot_id=" in line],
-            now=now,
-            priority=priority,
-            lang=_lang(chat),
-            gender=_gender(chat),
-            facility=agent if fixed == "CONS-GIN" else None,
-            procedure=procedure,
+    # ``world`` is this ASST's slots and ``procedure=`` narrows it to our service (SKILL.md),
+    # so no filter on ``facility=``: the slot names the facility's seat, not always our id.
+    while True:
+        chosen = [
+            slot
+            for slot in fitting(
+                [line for line in world.splitlines() if "slot_id=" in line],
+                now=now,
+                priority=priority,
+                lang=_lang(chat),
+                gender=_gender(chat),
+                procedure=procedure,
+            )
+            if slot.get("slot_id") not in taken
+        ][:3]
+        if chosen:
+            # Every offer in one message: the citizen chooses from that message only (R:95).
+            lines = [_offer_line(slot, number, priority) for slot in chosen]
+            if await _say(city, citizen, "\n".join([*lines, _PICK])):
+                for slot in chosen:
+                    sent.offers.add(slot["slot_id"])
+                    if replacing:
+                        sent.again.add(slot["slot_id"])
+            return
+        if taken and not replacing:
+            return
+        page, pages = _page(world)
+        if page >= pages or page >= _MAX_PAGE:
+            break
+        if not _asked(chat, agent, procedure, page + 1):
+            await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+        # The next page's reply may never open a turn: read it back here.
+        chat = await _until(
+            city,
+            message.need_id,
+            chat,
+            lambda rows, seen=page: _page(_latest_slots(rows) or "")[0] > seen,
         )
-        if slot.get("slot_id") not in taken
-    ]
-    if chosen:
-        for slot in chosen[:3]:
-            if await _say(city, citizen, _offer_line(slot, number, priority)):
-                sent.offers.add(slot["slot_id"])
-                if replacing:
-                    sent.again.add(slot["slot_id"])
-        return
-    if taken and not replacing:
-        return
-    page, pages = _page(world)
-    if page < pages and page < _MAX_PAGE and not _asked(chat, agent, procedure, page + 1):
-        await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+        world = _latest_slots(chat) or ""
+        if _page(world)[0] <= page:
+            return
+    # No fitting slot on any page: say so, never silence (R:248). Once per case, unless the
+    # citizen writes again.
+    if message.sender.startswith("citizen:") or not _we(
+        chat, agent, "reason=no_slots", to=citizen, word="cancel"
+    ):
+        await _say(city, citizen, _NO_SLOTS)
 
 
 async def _on_confirm(
     city: City, message: Message, chat: list[Message], *, hold_self: bool
+) -> None:
+    # Duplicate confirms of one need run one at a time, so the slot is held once. A key of its
+    # own: a refusal inside goes on to _advance, which takes the need's offer gate.
+    key = message.need_id or message.msg_id
+    async with _gated(f"confirm:{key}"):
+        await _confirm_alone(city, message, chat, key, hold_self=hold_self)
+
+
+async def _confirm_alone(
+    city: City, message: Message, chat: list[Message], key: str, *, hold_self: bool
 ) -> None:
     agent = city.agent_id
     fields = fields_of(message.text)
@@ -665,6 +796,13 @@ async def _on_confirm(
     slot = fields.get("slot_id") or offer.get("slot_id", "")
     facility = fields.get("facility") or offer.get("facility", "")
     if not slot or not consent:
+        # Never silent (R:195): the sender learns which field is missing.
+        missing = "slot_id" if not slot else "consent_ref"
+        head = f"cancel offer_id={offer_id}" if offer_id else "cancel"
+        await _say(city, message.sender, f"{head} reason=missing_{missing}")
+        if hold_self and message.sender.startswith("citizen:"):
+            # A cancel drops the citizen's offers: send the ones still free again.
+            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
         return
     citizen = fields.get("citizen") or (
         message.sender if message.sender.startswith("citizen:") else ""
@@ -672,7 +810,9 @@ async def _on_confirm(
     number = fields.get("prescription_number") or offer.get("prescription_number")
     book_here = hold_self or message.sender.startswith("agent:") or facility == agent
     if book_here:
-        if not _we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold"):
+        sent = _sent(key)
+        held = slot in sent.holds or _we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
+        if not held:
             parts = ["hold", f"slot_id={slot}"]
             if citizen:
                 parts.append(f"citizen={citizen}")
@@ -681,6 +821,7 @@ async def _on_confirm(
             parts.append(f"consent_ref={consent}")
             if not await _say(city, LEDGER, " ".join(parts)):
                 return
+            sent.holds.add(slot)
         await _finish_booking(city, message, chat, slot, hold_self=hold_self)
         return
     if not facility or not citizen:
@@ -945,14 +1086,21 @@ async def _on_refused(
     target, _, _ = _booking_of(chat, agent, slot)
     offer_id = ""
     for row in chat:
-        if f"slot_id={slot}" in row.text.split():
-            offer_id = fields_of(row.text).get("offer_id", offer_id)
+        for line in row.text.splitlines():
+            if f"slot_id={slot}" in line.split():
+                offer_id = fields_of(line).get("offer_id", offer_id)
     if (
         target
         and offer_id
         and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        await _say(city, target, f"cancel offer_id={offer_id} reason=facility_cancelled")
+        # The Ledger's code goes on, so the booking centre can react: PRESCRIPTION_EXPIRED →
+        # renewal (P1), CONSENT_MISSING → consent (P2), NO_CAPACITY → another slot (P3).
+        code = fields_of(message.text).get("code") or "facility_cancelled"
+        text = f"cancel offer_id={offer_id} reason={code}"
+        if target.startswith("citizen:"):
+            text += " Mi dispiace, questo appuntamento non si può più prenotare."
+        await _say(city, target, text)
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 
@@ -973,6 +1121,16 @@ async def _on_checkin(city: City, message: Message, chat: list[Message], *, repo
     reply, fresh = found
     if first_word(reply.text) == "checked_in":
         await _on_checked_in(city, reply, fresh, reports=reports)
+        return
+    # Refused by the Ledger: tell the citizen why. No ``checkin`` word, it was not honoured.
+    code = fields_of(reply.text).get("code") or "refused"
+    await _say(
+        city,
+        citizen,
+        f"{token} reason={code} Mi dispiace, non sono riuscito a registrare il suo arrivo. "
+        "Controlli il numero della prenotazione e riprovi; se il problema resta, chi le ha "
+        "fissato l'appuntamento può verificarla.",
+    )
 
 
 async def _on_checked_in(
