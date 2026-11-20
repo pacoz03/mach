@@ -101,8 +101,16 @@ def parse_offers(text: str) -> list[dict[str, str]]:
     return out
 
 
+# Le parole d'atto con cui i nostri agenti aprono un messaggio. understood() legge l'ULTIMA parola
+# d'atto del testo: "data.request ... I have checked your prescription" diventava "prescription"
+# e il cittadino finto taceva. I cittadini veri rispondono (percorso 000100): conta la prima.
+ACTS = {"prescription", "offer", "cancel", "data.request", "data.response", "consent",
+        "booking.receipt", "checkin", "escalate.emergency", "report", "need.request"}
+
+
 def act(m: Message) -> str:
-    return understood(m).type
+    first = (m.text or "").split()[:1]
+    return first[0] if first and first[0] in ACTS else understood(m).type
 
 
 def has(text: str, tokens: tuple[str, ...]) -> bool:
@@ -623,6 +631,21 @@ def writes(op: str, n: int, cite: str):
     return check
 
 
+def handoff_tokens(*tokens: str, absent: tuple[str, ...] = ()):
+    """Il passaggio del gp al centro prenotazioni porta (o non porta) questi token."""
+    def check(b: Bus) -> str | None:
+        sent = [m.text for m in b.log if m.sender == b.ids["gp"] and m.recipient == b.ids["booking_centre"]
+                and "handoff=gp" in m.text.split()]
+        if not sent:
+            return "il gp non ha passato la ricetta al centro prenotazioni"
+        if not has(sent[0], tokens):
+            return f"handoff senza «{' '.join(tokens)}»: «{sent[0][:160]}»"
+        bad = [t for t in absent if any(w.startswith(t) for w in sent[0].split())]
+        if bad:
+            return f"handoff con preferenze inventate {bad}: «{sent[0][:160]}»"
+    return check
+
+
 def asked_ledger(folder: str, *tokens: str):
     """Una lettura sul Ledger (le letture non finiscono in ledger.writes)."""
     def check(b: Bus) -> str | None:
@@ -776,12 +799,16 @@ RODILLA = "Me duele la rodilla cuando subo escaleras"
 GRAZIE = "Grazie mille! E adesso cosa devo fare?"
 RINNOVO = "Il centro prenotazioni dice che la ricetta è scaduta, me la può rinnovare?"
 NONE_IT = '{"code": "NONE", "red_flag": false, "lang": "it"}'
+PREF_EN = "Hello, I have back pain and I was hoping for an English-speaking doctor, ideally on Monday."
+PREF_DOPO = "Grazie! Se possibile preferirei una dottoressa."
 SCENARIOS: dict[str, dict] = {
     "felice_fisiatria": dict(start=BACK, expect=[
         wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), wrote("checkin", "R:234")]),
     "cardiologia_referto": dict(start=("gp", "Sento le palpitazioni da qualche giorno."), expect=[
         wrote("prescribe", "R:228", procedure="VIS-CARD", priority="B"), wrote("checkin", "R:234"),
-        wrote("report", "R:208/236", consent_ref=f"cons-{NEED}-report_sharing")]),
+        # Specialist files the report right after the check-in, unshared: live citizens never
+        # answered the report_sharing ask (judge: report_missing 3/3 in wave 1).
+        wrote("report", "R:208/236")]),
     "red_flag": dict(start=("gp", "Ho un forte dolore al petto da stamattina."), expect=[
         told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442")]),
     "richiesta_clinica": dict(start=("gp", "Che dose di ibuprofene devo prendere? 400 mg vanno bene?"),
@@ -844,6 +871,17 @@ SCENARIOS: dict[str, dict] = {
                                  told_text("gp", "I understand your concern", cite="lingua")]),
     "gp_red_flag_en": dict(start=("gp", "I have a crushing chest pain since this morning"), expect=[
         told_text("gp", "Call 112", cite="R:242"), no_write("prescribe", "R:442")]),
+    # Preferenze dette al gp (console, percorsi 0071/0093/0094): confermate e passate al centro.
+    "gp_preferenze": dict(start=("gp", PREF_EN), handoff=True, expect=[
+        handoff_tokens("lang=en", "doctor_lang=en", "days=mon"),
+        told_text("gp", "I have noted your preferences (a doctor who speaks English; Monday)", cite="proattività"),
+        wrote("commit", "R:241")]),
+    # "Gentile Dottoressa" e "da lunedì" non sono preferenze: niente token inventati (AGENT.md 9).
+    "gp_preferenze_falsi": dict(start=("gp", "Gentile Dottoressa, ho mal di schiena da lunedì."), handoff=True, expect=[
+        handoff_tokens("lang=it", absent=("gender_preference=", "days=", "doctor_lang=")),
+        never_told("gp", "Ho preso nota", cite="AGENT.md 9")]),
+    "gp_preferenze_dopo": dict(start=BACK, handoff=True, after=[PREF_DOPO], llm={PREF_DOPO: NONE_IT}, expect=[
+        writes("prescribe", 1, "una sola ricetta"), told_text("gp", "(una dottoressa)", cite="promemoria")]),
     # Cross-ASST (R:191-195): il centro di un'altra ASST chiede slot all'ospedale, poi conferma.
     "cross_asst_prenota": dict(
         start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-1")), foreign=True,
