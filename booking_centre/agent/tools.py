@@ -292,7 +292,7 @@ async def web_search(query: str, n: int = 3) -> list[dict[str, str]]:
         "query": query,
         "numResults": n,
         "type": "auto",
-        "contents": {"highlights": {"verbosity": "standard"}},
+        "contents": {"highlights": True},  # verificato sull'API: un oggetto con verbosity=standard dà 400
     }
     headers = {"x-api-key": EXA_KEY}
     try:
