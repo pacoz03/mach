@@ -1,7 +1,7 @@
-agent_id: agent:q3fsbpty1da5
+agent_id: agent:sbdpbpqz5sxe
 team: team:the-promptfather-s
 name: booking_centre
-version: 1.0.0
+version: 1.0.1
 cap_versions:
   - "1.0"
 profiles:
@@ -11,4 +11,4 @@ capabilities:
   - booking_centre
 no_clinical_advice: true
 endpoints:
-  mailbox: agent:q3fsbpty1da5
+  mailbox: agent:sbdpbpqz5sxe
