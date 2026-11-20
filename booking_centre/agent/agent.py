@@ -49,6 +49,7 @@ _DEADLINE_DAYS = {"B": 2, "D": 5}
 _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
 _SENT_NEEDS = 4096
+_GP_RX = re.compile(r"(?<![\w-])prescription_number-([0-9a-f]{24})(?![\w-])", re.IGNORECASE)
 # A facility whose mailbox refused our confirm (TARGET_NOT_VISIBLE, partner_down) is left out
 # of new offers for a while; the city does not say when it is back.
 # ponytail: fixed pause per process, a probe or a city signal if outages get shorter.
@@ -327,19 +328,8 @@ async def _advance_alone(
             return
         # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
         refresh = refresh or bool(sent.mark) or _ledger(chat, "agenda") is not None
-    if refresh or (
-        not sent.mark and _ledger(chat, "agenda") is None and not _exact(chat, agent, "agenda")
-    ):
-        mark = await _say(city, LEDGER, "agenda")
-        if mark:
-            sent.mark = mark
-        await _say(city, LEDGER, "rules")
-
-    def ready(rows: list[Message]) -> bool:
-        return _prescription(rows, number) is not None and _has_agenda(_after(rows, sent.mark))
-
-    if not ready(chat):
-        chat = await _until(city, need_id, chat, ready)
+    if _prescription(chat, number) is None:
+        chat = await _until(city, need_id, chat, lambda rows: _prescription(rows, number) is not None)
     reply = _prescription(chat, number)
     if reply is None:
         # The Ledger is slow: its answer opens a turn, or the citizen writes again. A citizen
@@ -363,13 +353,24 @@ async def _advance_alone(
         if offer_id in sent.offers or _we(
             chat, agent, f"offer_id={offer_id}", to=citizen, word="offer"
         ):
-            if again:
-                await _tell(city, chat, citizen, _phrase(chat, "redirect"), again=again)
             return
         text = f"offer offer_id={offer_id} waiting_list=true {_phrase(chat, 'waiting_p')}"
         if await _say(city, citizen, text):
             sent.offers.add(offer_id)
         return
+
+    days, gender = _days(chat), _gender(chat)
+    if not replacing and not sent.offers and not _offered(chat, agent):
+        missing = [name for name, value in (("days", days), ("gender", gender)) if not value]
+        if missing and not await _preferences_ready(city, chat, citizen, missing):
+            return
+    if refresh or (
+        not sent.mark and _ledger(chat, "agenda") is None and not _exact(chat, agent, "agenda")
+    ):
+        mark = await _say(city, LEDGER, "agenda")
+        if mark:
+            sent.mark = mark
+        await _say(city, LEDGER, "rules")
     recent = _after(chat, sent.mark)
     if _latest_slots(recent) is None and not _asked(recent, agent, procedure, 1):
         await _say(city, LEDGER, f"world procedure={procedure} page=1")
@@ -397,23 +398,27 @@ async def _advance_alone(
         "now": now,
         "priority": priority,
         "lang": _lang(chat),
-        "gender": _gender(chat),
-        "days": _days(chat),
+        "gender": gender,
+        "days": days,
         "procedure": procedure,
         # The urgent reserve is closed to B, D and P while P3 is in force, or if unknown.
         "reserve": rules is None or "P3" in rules,
     }
     blocked = False
+    fallback: list[dict[str, str]] = []
     while True:
         lines = [line for line in world.splitlines() if "slot_id=" in line]
         fit = [slot for slot in fitting(lines, **pick) if slot.get("slot_id") not in taken]
         chosen = [slot for slot in fit if not _down(slot.get("facility", ""))]
         blocked = blocked or len(chosen) < len(fit)
         if chosen:
-            picked = chosen[:_MAX_OFFERS]
-            await _offer(city, citizen, picked, number, priority, sent, replacing, chat, "offers")
-            return
-        if taken and not replacing:
+            preferred = [slot for slot in chosen if _preferred(slot, _lang(chat), gender, days)]
+            if preferred or not (days or gender):
+                picked = (preferred or chosen)[:_MAX_OFFERS]
+                await _offer(city, citizen, picked, number, priority, sent, replacing, chat, "offers")
+                return
+            fallback.extend(chosen[:_MAX_OFFERS - len(fallback)])
+        if taken and not replacing and not fallback:
             # Nothing new to offer. A booked citizen (a "grazie") needs no rinvio.
             if not any(r.sender == agent and first_word(r.text) == "booking.receipt" for r in chat):
                 await _tell(city, chat, citizen, _phrase(chat, "redirect"), again=again)
@@ -433,6 +438,9 @@ async def _advance_alone(
             return  # The Ledger is slow: its answer opens a turn of its own.
         recent = _after(chat, sent.mark)
         world = _latest_slots(recent) or ""
+    if fallback:
+        await _offer(city, citizen, fallback, number, priority, sent, replacing, chat, "offers")
+        return
     if blocked:
         # Only a facility that is down had room: the citizen already has our cancel and reason.
         return
@@ -542,11 +550,13 @@ async def _on_confirm(city: City, message: Message, chat: list[Message]) -> None
 
 
 async def _forward_receipt(city: City, message: Message, chat: list[Message]) -> None:
-    fields = fields_of(message.text)
+    fields = _fields(message)
     booking_id = fields.get("booking_id", "")
     ledger_ref = fields.get("ledger_ref", "")
     citizen = _citizen(chat)
     if not booking_id or not ledger_ref or not citizen:
+        return
+    if not _we(chat, city.agent_id, f"citizen={citizen}", to=message.sender, word="confirm"):
         return
     if _we(chat, city.agent_id, f"booking_id={booking_id}", to=citizen, word="booking.receipt"):
         return
@@ -585,6 +595,15 @@ def _speaks(doctor_id: str, lang: str) -> bool:
     if lang in spec[0]:
         return True
     return "*" in spec[0] and lang not in {"it", "en"}
+
+
+def _preferred(slot: dict[str, str], lang: str, gender: str | None, days: frozenset[str]) -> bool:
+    doctor = slot.get("doctor_id", "")
+    spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
+    return (
+        spec is not None and _speaks(doctor, lang)
+        and (not gender or spec[1] == gender) and (not days or slot.get("day") in days)
+    )
 
 
 def fitting(
@@ -633,12 +652,7 @@ def fitting(
         if spec is not None and day and day not in spec[2]:
             continue
         # A doctor missing from our table is still in S; we just cannot call it preferred.
-        preferred = (
-            spec is not None
-            and _speaks(doctor, lang)
-            and (not gender or spec[1] == gender)
-            and (not days or day in days)
-        )
+        preferred = _preferred(slot, lang, gender, days)
         chosen.append((not preferred, at, slot_id, slot))
     chosen.sort(key=lambda item: item[:3])
     return [item[3] for item in chosen]
@@ -926,8 +940,13 @@ def _number(chat: list[Message]) -> str | None:
     for row in reversed(chat):
         if row.sender.startswith("citizen:"):
             number = _fields(row).get("prescription_number")
-            if number:
+            if number and not any(character.isspace() for character in number):
                 return number
+            mentions = {match.upper() for match in _GP_RX.findall(row.text)}
+            if len(mentions) == 1:
+                return f"prescription_number-{next(iter(mentions))}"
+            if mentions:
+                return None
     return None
 
 
@@ -943,6 +962,19 @@ def _lang(chat: list[Message]) -> str:
 _WEEKDAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri"}
 
 
+async def _preferences_ready(city: City, chat: list[Message], citizen: str, missing: list[str]) -> bool:
+    for index, row in enumerate(chat):
+        if row.sender != city.agent_id or row.recipient != citizen or first_word(row.text) != "data.request":
+            continue
+        fields = fields_of(row.text)
+        if fields.get("purpose") == "booking" and fields.get("fields") in {"days", "gender"}:
+            # A plain-language refusal also ends the preference request.
+            return any(reply.sender == citizen for reply in chat[index + 1:])
+    text = f"data.request purpose=booking fields={','.join(missing)}"
+    await _say(city, citizen, text)
+    return False
+
+
 def _days(chat: list[Message]) -> frozenset[str]:
     """Agenda days the citizen prefers (``days=mon/wed``) as mon..fri; empty when not said."""
 
@@ -950,8 +982,11 @@ def _days(chat: list[Message]) -> frozenset[str]:
         if not row.sender.startswith("citizen:"):
             continue
         raw = row.body.get("days")
+        provided = row.body.get("provided")
+        if isinstance(provided, dict):
+            raw = provided.get("days", raw)
         if not isinstance(raw, (str, list)):
-            match = re.search(r"\bdays=(\S+)", row.text)
+            match = re.search(r"(?<!\S)days=([a-z]+(?:\s*[/,|;]\s*[a-z]+)*)", row.text, re.IGNORECASE)
             raw = match.group(1) if match else None
         if raw:
             names = raw if isinstance(raw, list) else re.split(r"[/,|;]", raw)

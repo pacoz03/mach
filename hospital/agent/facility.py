@@ -228,6 +228,14 @@ def fields_of(text: str) -> dict[str, str]:
     return found
 
 
+def _fields(row: Message) -> dict[str, str]:
+    fields = fields_of(row.text)
+    for key, value in row.body.items():
+        if key != "text" and isinstance(value, str) and value:
+            fields.setdefault(key, value)
+    return fields
+
+
 def _when(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -496,7 +504,7 @@ def _number(chat: list[Message]) -> str | None:
 def _lang(chat: list[Message]) -> str:
     for row in chat:
         if row.sender.startswith("citizen:"):
-            lang = fields_of(row.text).get("lang", "")
+            lang = _fields(row).get("lang", "")
             if lang:
                 return lang
     return "it"
@@ -506,7 +514,8 @@ def _gender(chat: list[Message]) -> str | None:
     for row in chat:
         if not row.sender.startswith("citizen:"):
             continue
-        raw = fields_of(row.text).get("gender_preference") or fields_of(row.text).get("gender")
+        fields = _fields(row)
+        raw = fields.get("gender_preference") or fields.get("gender")
         if raw in {"m", "f"}:
             return raw
     return None
@@ -789,12 +798,12 @@ async def _confirm_alone(
     city: City, message: Message, chat: list[Message], key: str, *, hold_self: bool
 ) -> None:
     agent = city.agent_id
-    fields = fields_of(message.text)
+    fields = _fields(message)
     offer_id = fields.get("offer_id", "")
     consent = fields.get("consent_ref", "")
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
-    slot = fields.get("slot_id") or offer.get("slot_id", "")
-    facility = fields.get("facility") or offer.get("facility", "")
+    slot = offer.get("slot_id") or fields.get("slot_id", "")
+    facility = offer.get("facility") or fields.get("facility", "")
     if not slot or not consent:
         # Never silent (R:195): the sender learns which field is missing.
         missing = "slot_id" if not slot else "consent_ref"
@@ -881,7 +890,7 @@ def _facility_turn(message: Message) -> bool:
         return True
     if "checkin" in kind and message.sender.startswith("citizen:"):
         return True
-    return "confirm" in kind and (
+    return ("confirm" in kind or message.type == "confirm") and (
         message.sender.startswith("agent:") or message.sender.startswith("citizen:")
     )
 
@@ -922,7 +931,7 @@ async def _facility(
     ):
         # The citizen's answer to our report_sharing request, a consent or a no in prose.
         await _on_consent(city, message, chat, asked)
-    elif "confirm" in kind:
+    elif "confirm" in kind or message.type == "confirm":
         await _on_confirm(city, message, chat, hold_self=hold_self)
     elif message.sender.startswith("citizen:"):
         await _redirect(city, message, chat)
