@@ -57,9 +57,10 @@ class FakeCity:
         self.fail = fail
         self.yields = yields
         self.sent: list[tuple[str, str]] = []
+        self.peers: list[Peer] = []  # what the Index returns to city.find
 
     async def search(self, query: str) -> list[Peer]:
-        return []
+        return list(self.peers)
 
     async def post(self, *, to, message_type, body, need_id, conversation_id, traceparent) -> str:
         text = str(body["text"])

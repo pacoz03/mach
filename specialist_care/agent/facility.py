@@ -245,7 +245,24 @@ async def handle(role: str, need: Need, city: City) -> None:
                 city, message, procedures=_CARDIOLOGY, ours="del nostro ambulatorio di cardiologia"
             )
         else:
-            await _facility(city, message, chat, reports=True, hold_self=False)
+            confirm = "confirm" in kind or message.type == "confirm"
+            booking = _facility(city, message, chat, reports=True, hold_self=False)
+            if confirm and message.sender != LEDGER:
+                # As the hospital: the visit's time from one world page, read alongside the hold.
+                await asyncio.gather(_ask_slots(city, message, chat), booking)
+            else:
+                await booking
+            if confirm or (
+                message.sender == LEDGER and first_word(message.text) in {"held", "committed"}
+            ):
+                # Proactive (R:249): when and how to check in, then our GP hears it is booked
+                # (collaboration, R:250; only our booking centre's bookings, _tell_gp).
+                await _welcome(
+                    city,
+                    message,
+                    place_it="l'ambulatorio di cardiologia dove si svolgerà la sua visita",
+                    place_en="the cardiology clinic where your visit will take place",
+                )
     elif role == "family_counseling":
         await _family(city, message, chat)
 
@@ -2156,7 +2173,13 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
     await _say(city, citizen, text)
 
 
-async def _welcome(city: City, message: Message) -> None:
+async def _welcome(
+    city: City,
+    message: Message,
+    *,
+    place_it: str = "l'ospedale dove si svolgerà la sua visita",
+    place_en: str = "the hospital where your visit will take place",
+) -> None:
     """After our receipt to the booking centre, a word of our own to the citizen: when, the
     code, how to register the arrival. Once per booking."""
 
@@ -2213,7 +2236,7 @@ async def _welcome(city: City, message: Message) -> None:
                     else "in the half day of the visit (08:00-13:00 or 13:00-18:00)"
                 )
                 note = (
-                    f"Hello, this is the hospital where your visit will take place: your "
+                    f"Hello, this is {place_en}: your "
                     f"booking is confirmed and registered{when}. Your booking code is "
                     f"{booking_id}. On the day, as soon as you arrive ({window}), write to me "
                     f"that you are here with the code {booking_id}: I will register your arrival "
@@ -2227,7 +2250,7 @@ async def _welcome(city: City, message: Message) -> None:
                     else "nella mezza giornata della visita: 08:00-13:00 o 13:00-18:00"
                 )
                 note = (
-                    f"Buongiorno, sono l'ospedale dove si svolgerà la sua visita: la prenotazione "
+                    f"Buongiorno, sono {place_it}: la prenotazione "
                     f"è confermata e registrata{when}. Il suo codice di prenotazione è "
                     f"{booking_id}. Il giorno della visita, appena arriva ({window}), mi scriva "
                     f"che è qui con il codice {booking_id}: registro io il suo arrivo e non deve "
@@ -2835,18 +2858,24 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
             note = (
                 "Your visit summary is filed and shared as you agreed."
                 if shared
-                else "Your visit summary is filed; without your agreement it is not shared and "
-                "stays private."
+                else "Your visit summary is filed and stays private."
             )
-            note += " Thank you for coming, and take care."
+            note += (
+                " If the specialist recommends a control visit, the booking centre will help you "
+                "book it; for any question just write to me here. Thank you for coming, and take "
+                "care."
+            )
         else:
             note = (
                 "Il referto della sua visita è archiviato e lo condividiamo come da suo consenso."
                 if shared
-                else "Il referto della sua visita è archiviato; senza il suo consenso non viene "
-                "condiviso e resta riservato."
+                else "Il referto della sua visita è archiviato e resta riservato."
             )
-            note += " Grazie per la fiducia e buona giornata."
+            note += (
+                " Se lo specialista le indica un controllo, il centro prenotazioni la aiuta a "
+                "fissarlo; per qualsiasi domanda mi scriva pure qui. Grazie per la fiducia e "
+                "buona giornata."
+            )
         await _say(city, citizen, f"report {token} outcome_code={outcome} {note}")
     number = ours.get("follow_up_prescription_number", "")
     rx = f"prescription_number={number}"
