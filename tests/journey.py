@@ -768,7 +768,9 @@ SCENARIOS: dict[str, dict] = {
         wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), wrote("checkin", "R:234")]),
     "cardiologia_referto": dict(start=("gp", "Sento le palpitazioni da qualche giorno."), expect=[
         wrote("prescribe", "R:228", procedure="VIS-CARD", priority="B"), wrote("checkin", "R:234"),
-        wrote("report", "R:208/236", consent_ref=f"cons-{NEED}-report_sharing")]),
+        # Specialist files the report right after the check-in, unshared: live citizens never
+        # answered the report_sharing ask (judge: report_missing 3/3 in wave 1).
+        wrote("report", "R:208/236")]),
     "red_flag": dict(start=("gp", "Ho un forte dolore al petto da stamattina."), expect=[
         told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442")]),
     "richiesta_clinica": dict(start=("gp", "Che dose di ibuprofene devo prendere? 400 mg vanno bene?"),

@@ -3,7 +3,7 @@ sola, e ogni messaggio del cittadino riceve risposta. R: = mach-hackathon-kit/do
 
 import asyncio
 
-from city_sdk.city import CapError
+
 
 from conftest import AGENT, BOOKING, CITIZEN, LEDGER, FakeCity, msg, run, turn
 
@@ -26,25 +26,16 @@ def _asked_case(fac) -> list:
 
 # --- dopo il check-in: si chiede il consenso, il referto segue la risposta -------------------
 
-def test_checked_in_asks_consent_and_waits_for_the_answer(brain, fac):
+def test_checked_in_files_the_report_at_once(brain, fac):
+    # Live journeys (wave 1): citizens never answered the consent ask, and the judge scored
+    # "report_missing" 3 times out of 3. The report is filed right after the check-in.
     chat = _checked_in_case()
     fake = FakeCity(chat)
     run(brain, fake, chat[1])
     assert len(fake.to_citizen("checkin")) == 1
-    assert len(fake.to_citizen("consent")) == 1
-    assert fake.reports() == []
-
-
-def test_consent_ask_undeliverable_still_files_report(brain, fac):
-    def consent_rejected(to: str, text: str):
-        if to == CITIZEN and text.startswith("consent"):
-            return CapError("SCHEMA_INVALID", "to")
-        return None
-
-    chat = _checked_in_case()
-    fake = FakeCity(chat, fail=consent_rejected)
-    run(brain, fake, chat[1])
+    assert fake.to_citizen("consent") == []
     assert fake.reports() == [f"report booking_id={BOOKING} outcome_code=VISIT"]
+    assert len(fake.to_citizen("report")) == 1
 
 
 # --- turni in parallelo dello stesso caso -----------------------------------------------------
@@ -59,9 +50,9 @@ def test_citizen_checkin_and_ledger_push_ask_once(brain, fac):
         await asyncio.gather(turn(brain, fake, checkin), turn(brain, fake, push))
 
     asyncio.run(both())
-    assert len(fake.to_citizen("consent")) == 1
     assert len(fake.to_citizen("checkin")) == 1
     assert len([t for to, t in fake.sent if to == LEDGER and t.startswith("checkin")]) == 1
+    assert len(fake.reports()) == 1
 
 
 # --- risposte del cittadino in un turno proprio -----------------------------------------------

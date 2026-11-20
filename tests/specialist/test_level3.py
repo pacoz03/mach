@@ -31,7 +31,7 @@ def test_prose_arrival_checks_in_our_booking(brain):
     fake = FakeCity(_booked())
     run(brain, fake, msg(CITIZEN, "Buongiorno, sono arrivata per la visita cardiologica."))
     assert _ledger_checkins(fake) == [f"checkin booking_id={B} citizen={CITIZEN}"]
-    assert fake.to_citizen("consent")
+    assert fake.reports() == [f"report booking_id={B} outcome_code=VISIT"]
 
 
 def test_prose_booking_code_checks_in(brain):

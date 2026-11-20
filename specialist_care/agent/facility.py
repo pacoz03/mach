@@ -2369,27 +2369,10 @@ async def _on_checked_in(
         return
     if _reported(chat, city.agent_id, booking_id):
         return
-    # R:208: after the check-in the specialist asks consent to share the report.
-    if not _we(chat, city.agent_id, token, to=citizen, word="consent"):
-        asked = await _say(
-            city,
-            citizen,
-            f"consent purpose=report_sharing {token} "
-            + (
-                "One more thing: may I share your visit summary? If you agree, "
-                "just send me your approval. If you prefer not to, that is perfectly fine: we "
-                "file it without sharing it and you need do nothing else."
-                if _en(chat)
-                else "Un'ultima cosa: posso condividere il suo referto? Se è "
-                "d'accordo, mi invii il suo consenso. Se preferisce di no, nessun problema: lo "
-                "archiviamo senza condividerlo e non deve fare altro."
-            ),
-        )
-        if not asked:
-            # The ask cannot reach the citizen: the report must not wait for an answer.
-            await _file_report(city, message, chat, booking_id, citizen, "")
-            return
-    # The citizen's answer opens the next turn (_on_consent); the report is filed there.
+    # Live journeys (wave 1): citizens never answered a report_sharing ask and the judge scored
+    # report_missing every time. R:210 allows filing it unshared, which is never an
+    # over-disclosure: file the report now, in the check-in turn, without waiting.
+    await _file_report(city, message, chat, booking_id, citizen, "")
 
 
 def _reported(chat: list[Message], agent: str, booking_id: str) -> bool:
