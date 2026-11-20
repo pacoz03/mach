@@ -1678,7 +1678,10 @@ async def _cross_asst(
         relaxed = False
         # Only our own service: world lists every slot of the ASST, other facilities' too.
         if procedure in procedures:
-            hospital = procedures == (_PROCEDURE,)  # the specialist's answer stays as it was
+            hospital = procedures == (_PROCEDURE,)
+            # The specialist gets the same search (2 world pages, city clock, relaxed dates);
+            # only the hospital's rare-language (h3) step stays its own.
+            rich = hospital or procedures == _CARDIOLOGY
             known = {row.msg_id for row in chat}
 
             def fresh(rows: list[Message]) -> list[Message]:
@@ -1686,7 +1689,7 @@ async def _cross_asst(
 
             def clock(rows: list[Message]) -> datetime | None:
                 agenda = _ledger(fresh(rows), "agenda")  # a fresh reply also refreshes _CLOCK
-                cached = _city_now() if hospital else None
+                cached = _city_now() if rich else None
                 return cached or _when("" if agenda is None else agenda.get("agenda_now", ""))
 
             def page_of(rows: list[Message], page: int) -> str | None:
@@ -1706,22 +1709,22 @@ async def _cross_asst(
                     lambda rows, page=page: page_of(rows, page) is not None
                     and clock(rows) is not None,
                     tries=_SHORT_TRIES,
-                    deadline=deadline if hospital else None,
+                    deadline=deadline if rich else None,
                 )
                 world = page_of(rows, page)
-                now = clock(rows) or (_day_after(world) if hospital and world else None)
+                now = clock(rows) or (_day_after(world) if rich and world else None)
                 if world is None or now is None:
                     break
                 lines = [line for line in world.splitlines() if "slot_id=" in line]
                 found = fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
-                if not hospital:
+                if not rich:
                     break
                 # ponytail: read as priority P, so a U request's relaxed slots skip the U reserve.
                 every = fitting(lines, now=now, priority="P", lang="it", procedure=procedure)
                 if every or page >= min(_page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
-            relaxed = hospital and not found and bool(every)
+            relaxed = rich and not found and bool(every)
             pool = found or every
             chosen = pool[:3]
             if hospital:
@@ -1734,6 +1737,10 @@ async def _cross_asst(
                 chosen = pool[:3]
                 if rare is not None and rare not in chosen:
                     chosen = [*chosen[:2], rare]
+            elif rich and pool:
+                # Level 5: the partner's lang/gender/days, when named, rank the slots that meet
+                # the most of them first; time order within a tie. Only Ledger attributes go out.
+                chosen = _by_constraints(pool, fields)[:3]
         if chosen:
             lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
             beyond = (
@@ -1751,7 +1758,7 @@ async def _cross_asst(
                     # A partner's confirm without the prescription is refused (POLICY_VIOLATION).
                     " Nel confirm indicate offer_id, slot_id, citizen, prescription_number e "
                     "consent_ref, più cross_asst_consent_ref se la regola lo richiede."
-                    if hospital
+                    if rich
                     else ""
                 ),
             ])
@@ -1764,6 +1771,32 @@ async def _cross_asst(
         # Marked even if the say fails: a redelivery is not a retry after a 4xx.
         sent.offers.add(key)
         await _say(city, sender, text)
+
+
+_GENDERS = {"f": "f", "female": "f", "donna": "f", "femmina": "f", "woman": "f",
+            "m": "m", "male": "m", "uomo": "m", "maschio": "m", "man": "m"}
+
+
+def _by_constraints(slots: list[dict[str, str]], fields: dict[str, str]) -> list[dict[str, str]]:
+    """``slots`` with those meeting most of the request's ``lang``/``gender``/``days`` first.
+    A doctor missing from _DOCTORS meets no gender or language constraint: never claimed."""
+
+    lang = (fields.get("lang") or "").strip().lower()
+    gender = _GENDERS.get((fields.get("gender") or "").strip().lower(), "")
+    days = {d for d in re.split(r"[\s,/;|]+", (fields.get("days") or "").lower()) if d}
+    if not (lang or gender or days):
+        return slots
+
+    def met(slot: dict[str, str]) -> int:
+        doctor = slot.get("doctor_id", "")
+        spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
+        return (
+            bool(lang and _speaks(doctor, lang))
+            + bool(gender and spec is not None and spec[1] == gender)
+            + bool(days and slot.get("day", "").lower() in days)
+        )
+
+    return sorted(slots, key=lambda slot: -met(slot))
 
 
 async def _agenda_now(
