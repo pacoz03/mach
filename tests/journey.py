@@ -889,9 +889,10 @@ def requested_translation(lang: str):
     target = re.compile(rf"\b{re.escape(lang)}\b", re.IGNORECASE)
 
     def check(b: Bus) -> str | None:
-        # Il modello finto non traduce: la prosa che riceve deve essere quella consegnata al cittadino.
-        replies = [m.text for m in b.log if m.sender == b.ids["gp"] and m.recipient == CIT and act(m) == "prescription"]
-        if not any(user and target.search(system) and any(reply.endswith(f" {user}") for reply in replies)
+        # Il modello finto non traduce: la prosa che riceve deve essere quella consegnata al cittadino,
+        # a meno delle maiuscole che _say dà alle parole d'atto nella prosa (il giudice legge l'ultima).
+        replies = [m.text.casefold() for m in b.log if m.sender == b.ids["gp"] and m.recipient == CIT and act(m) == "prescription"]
+        if not any(user and target.search(system) and any(reply.endswith(f" {user}".casefold()) for reply in replies)
                    for system, user in b.llm_calls):
             return f"nessuna traduzione richiesta al modello per la lingua {lang}"
     return check
@@ -1489,6 +1490,55 @@ def silent_after_refused_hold(b: Bus) -> str | None:
         return f"hospital ha scritto al centro dopo un hold rifiutato DUPLICATE: «{got[0].text[:80]}»"
 
 
+def silent_after_duplicate(folder: str):
+    """Hold rifiutato DUPLICATE (la ricetta è già prenotata): niente è perso, quindi nessun messaggio
+    al centro dell'altra ASST, nemmeno un cancel reason=DUPLICATE."""
+    def check(b: Bus) -> str | None:
+        hold = next((w for w in b.ledger.writes if w["op"] == "hold" and w["code"] == "DUPLICATE"), None)
+        if hold is None:
+            return "nessun hold rifiutato DUPLICATE"
+        got = [m for m in b.log[hold["i"]:] if m.sender == b.ids[folder] and m.recipient == FOREIGN]
+        if got:
+            return f"{folder} ha scritto al centro dopo un hold rifiutato DUPLICATE: «{got[0].text[:80]}»"
+    return check
+
+
+def late_confirm(hours: int):
+    """Da quando il centro dell'altra ASST conferma, l'orologio di agenda dell'ospedale è ``hours`` ore avanti."""
+    def setup(b: Bus) -> None:
+        fac = b.agents[b.ids["hospital"]].mods["facility"]
+        now = fac._city_now
+
+        def later():
+            at = now()
+            confirmed = any(m.sender == FOREIGN and m.text.startswith("confirm") for m in b.log)
+            return at + timedelta(hours=hours) if at is not None and confirmed else at
+
+        fac._city_now = later
+    return setup
+
+
+def expired_before_hold(rid: str, hours: int):
+    """Nel turno del confirm: cancel reason=EXPIRED al centro dell'altra ASST, poi 1-3 date nuove con
+    il suo request_id, che iniziano oltre 6 ore di agenda e non sono lo slot perso."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        conf = next((m for m in b.log if m.sender == FOREIGN and m.text.startswith("confirm")), None)
+        if conf is None:
+            return "il centro dell'altra ASST non ha confermato"
+        lost, turn = fields(conf.text).get("slot_id"), next(t for t, m in b.opened.items() if m is conf)
+        sent = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN and b.turn_of[m.msg_id] == turn]
+        if not sent or act(sent[0]) != "cancel" or "reason=EXPIRED" not in sent[0].text.split():
+            return f"nel turno del confirm nessun cancel reason=EXPIRED per {lost}: {[m.text[:50] for m in sent]}"
+        offers = [o for m in sent[1:] if f"request_id={rid}" in m.text.split() for o in parse_offers(m.text)]
+        soon = b.ledger.now + timedelta(hours=hours + 6)
+        if not 1 <= len(offers) <= 3 or any(o.get("slot_id") == lost for o in offers):
+            return f"nel turno del confirm {len(offers)} date nuove (attese 1-3, mai {lost})"
+        if any(datetime.fromisoformat(b.ledger.slots[o["slot_id"]]["at"]) <= soon for o in offers):
+            return "data nuova entro 6 ore di agenda"
+    return check
+
+
 def late_refusal_no_cancel(b: Bus) -> str | None:
     """Il Ledger rifiuta un secondo hold sullo stesso slot dopo il held del primo (secondo pod,
     Ledger lento): la prenotazione resta, nessun cancel a nessuno."""
@@ -1512,6 +1562,20 @@ SCENARIOS.update({
     "ospedale_alternative_duplicate": dict(
         start=("hospital", XFIS.format(rid="R-21", extra="")), foreign=True, refuse_holds=1,
         refuse_code="DUPLICATE", expect=[silent_after_refused_hold]),
+    # Lo stesso per specialista e consultorio (wave W01QQQ, 1g: dopo un DUPLICATE il centro rioffre
+    # a prenotazione fatta, un hold dopo l'altro).
+    "specialista_hold_duplicate": dict(
+        start=("specialist_care", XREQ.format(svc="specialist_care.cardiology", proc="VIS-CARD", rid="R-26")),
+        foreign=True, refuse_holds=1, refuse_code="DUPLICATE", expect=[silent_after_duplicate("specialist_care")]),
+    "consultorio_hold_duplicate": dict(
+        start=("family_counseling", XREQ.format(svc="family_counseling.gynecology", proc="CONS-GIN", rid="R-27")),
+        foreign=True, refuse_holds=1, refuse_code="DUPLICATE", expect=[silent_after_duplicate("family_counseling")]),
+    # Il confirm del partner arriva 22 ore di agenda dopo l'offerta (città, wave W01QQQ 1f: 16 minuti
+    # reali = 16 ore a rate 60): lo slot inizia entro 6 ore, l'hold tornerebbe EXPIRED dopo un giro
+    # del Ledger (un hold su tre in città).
+    "ospedale_slot_quasi_passato": dict(
+        start=("hospital", XFIS.format(rid="R-28", extra="")), foreign=True, setup=late_confirm(22),
+        expect=[no_write("hold", "EXPIRED: un hold su tre in città"), expired_before_hold("R-28", 22)]),
     # Proattività: il benvenuto dice la via dell'ospedale (city.address).
     "welcome_indirizzo": dict(start=BACK, address="Via Esempio 1", expect=[
         told_text("hospital", "in Via Esempio 1", cite="proattività: indirizzo"), *CHECKED_IN]),

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -41,6 +42,8 @@ _LEDGER_WORDS = frozenset(
 # Ids that tie a Ledger answer to its request when both name them.
 _IDS = ("prescription_number", "hold_id", "booking_id", "slot_id")
 _BOUNCE_TTL = 60.0
+# say: after a network error, one read of the case to see whether the message went anyway.
+_WENT_TIMEOUT = 2.0
 
 
 # --- reading a message -------------------------------------------------------------------------
@@ -172,8 +175,9 @@ def we(chat: list[Message], agent: str, token: str, *, to: str, word: str) -> bo
 
 
 def exact(chat: list[Message], agent: str, text: str) -> bool:
-    """True when we already said exactly ``text``, to anyone."""
+    """True when we already said exactly ``text``, to anyone (as say sent it: ``plain``)."""
 
+    text = plain(text)
     return any(row.sender == agent and row.text.strip() == text for row in chat)
 
 
@@ -261,6 +265,40 @@ async def until(
 # --- speaking ----------------------------------------------------------------------------------
 
 
+def plain(text: str) -> str:
+    """``text`` with one act for the judge. It reads the act as ``understood`` does (e19-rules.md
+    :212): the LAST act word, after commas become spaces. So an act word in the prose ("bring
+    this receipt or cancel it") made a ``booking.receipt`` a ``cancel``. Every act word other
+    than the message's own (its first) gets a capital letter, which ``understood`` does not
+    read; ``key=value`` tokens and every other byte stay as they are."""
+
+    acts = [token for token in text.replace(",", " ").split() if token in _ACTS]
+    if len(set(acts)) < 2:
+        return text
+    own = acts[0]
+
+    def capital(token: re.Match[str]) -> str:
+        if "=" in token[0]:
+            return token[0]
+        return re.sub(r"[^,]+", lambda p: p[0].capitalize() if p[0] in _ACTS and p[0] != own else p[0], token[0])
+
+    return re.sub(r"\S+", capital, text)
+
+
+async def _went(city: City, to: str, text: str) -> str | None:
+    """After a network error: the msg_id of ``text`` from us to ``to`` in the case history, ""
+    when it is not there, None when the read fails (nobody knows, so nobody sends it again)."""
+
+    try:
+        chat = await asyncio.wait_for(
+            city.history(need_id=getattr(city.inbound, "need_id", None)), timeout=_WENT_TIMEOUT
+        )
+    except Exception:  # noqa: BLE001 - CapError, timeout: unknown
+        return None
+    return next((row.msg_id or "sent" for row in reversed(chat)
+                 if row.sender == city.agent_id and row.recipient == to and row.text == text), "")
+
+
 async def say(
     city: City,
     to: str,
@@ -276,17 +314,20 @@ async def say(
 
     - A CapError is final, never sent again: the SDK turns every HTTP error into one (http.py
       ``_cap_http``), TARGET_NOT_VISIBLE and the 4xx included.
-    - A network error (the Relay's httpx timeouts) is sent once more only with ``retry``. city.say
-      is not idempotent: each call signs a new envelope with a fresh msg_id (http.py
-      ``HttpRelay.post``, uuid4) and the SDK re-sends only history reads, which "write nothing"
-      (http.py:221). A ReadTimeout can come after the Relay took the message, so a retry can say
-      it twice. Only the hospital asks for it (1.0.9; tests/journey.py ``ospedale_relay_timeout``).
+    - A network error (the Relay's httpx timeouts) is sent once more only with ``retry``, and only
+      when one read of the case shows it did not go (``_went``). city.say is not idempotent: each
+      call signs a new envelope with a fresh msg_id (http.py ``HttpRelay.post``, uuid4), and a
+      ReadTimeout can come after the Relay took the message (a blind retry held and committed
+      twice). A failed read means no retry: a lost message costs less than a double one. Only the
+      hospital asks for it (1.0.9; tests/journey.py ``ospedale_relay_timeout``).
+    - ``text`` goes out as ``plain(text)``: one act word for the judge.
     - ``bounced``: (need_id, to, text) -> time.monotonic() of a TARGET_NOT_VISIBLE to a citizen.
       The same text to the same citizen in the same case is not tried again for _BOUNCE_TTL s
       (the hospital's push turns, R:701). Only a citizen can stay invisible (another ASST's): the
       Ledger and agents bounce only while we are down, so a later turn means they are back.
     """
 
+    text = plain(text)
     key = (getattr(city.inbound, "need_id", None) or "", to, text)
     watch = bounced is not None and is_citizen(to)
     if watch and time.monotonic() - bounced.get(key, float("-inf")) < _BOUNCE_TTL:
@@ -303,8 +344,12 @@ async def say(
             tools.said(to, text, error=exc.code)
             return ""
         except Exception as exc:  # noqa: BLE001 - the Relay's httpx timeouts must not end the turn
-            if attempt == 0 and retry:
+            went = await _went(city, to, text) if attempt == 0 and retry else None
+            if went == "":
                 continue
+            if went:
+                tools.said(to, text, went)
+                return went
             _LOG.info("care.say.failed", extra={"error": type(exc).__name__})
             tools.said(to, text, error=type(exc).__name__)
             return ""

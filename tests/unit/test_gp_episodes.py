@@ -10,7 +10,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from city_sdk.city import City, CapError, Message, Need, Peer
+import httpx
+import pytest
+from city_sdk.city import City, CapError, Message, Need, OutOfScope, Peer, understood
 
 ROOT = Path(__file__).resolve().parents[2]
 GP, BOOKING, LEDGER, CITIZEN = "agent:gp", "agent:sbdpbpqz5sxe", "city:ledger", "citizen:t01/anna"
@@ -74,3 +76,46 @@ def test_ledger_turn_and_refused_say_are_traced():
     rows = [a for _, a in _turn(gp, Fake(fail_ledger=True), CITIZEN, "Ho mal di schiena")]
     assert (rows[1]["p_peer"], rows[1]["p_error"], rows[1]["p_msg_id"]) == (LEDGER, "TARGET_NOT_VISIBLE", None)
     assert rows[2]["p_peer"] == CITIZEN and rows[2]["p_body"].startswith("Non sono riuscito")
+
+
+# --- nothing but OutOfScope leaves the brain (an httpx timeout out of it = the turn redelivered) --
+
+
+class Timeout(Fake):
+    """The Relay takes the prescribe, then its answer times out (httpx.ReadTimeout)."""
+
+    async def post(self, **kw) -> str:
+        msg_id = await super().post(**kw)
+        if kw["to"] == LEDGER:
+            raise httpx.ReadTimeout("relay send")
+        return msg_id
+
+
+class NoHistory(Fake):
+    async def history(self, *, peer, need_id) -> list[Message]:
+        raise httpx.ReadTimeout("relay history")
+
+
+def test_a_relay_timeout_never_ends_the_turn():
+    gp, fake = _load(), Timeout()
+    rows = [a for fn, a in _turn(gp, fake, CITIZEN, "Mal di schiena da tre giorni") if fn == "observe"]
+    assert [(r["p_peer"], r["p_act"], r["p_error"]) for r in rows[1:]] == [
+        (LEDGER, "prescribe", "ReadTimeout"), (BOOKING, "need.request", None), (CITIZEN, "prescription", None)]
+    assert sum(row.text.startswith("prescribe ") for row in fake.chat) == 1  # never sent again
+
+
+def test_no_exception_but_out_of_scope_leaves_main():
+    gp = _load()
+    _turn(gp, NoHistory(), CITIZEN, "Mal di schiena da tre giorni")  # raised ReadTimeout before
+    with pytest.raises(OutOfScope):
+        _turn(gp, Fake(), CITIZEN, "Che dose di ibuprofene devo prendere? 400 mg vanno bene?")
+
+
+def test_the_judge_reads_the_act_we_meant():
+    gp, fake = _load(), Fake()
+    city = City(index=fake, messages=fake, history=fake, agent_id=GP,
+                inbound=Message("chat", CITIZEN, "in-0", "N-1", body={"text": "ciao"}, recipient=GP))
+    text = "prescription prescription_number=RX-1 Show it when you confirm or cancel, then consent,"
+    asyncio.run(gp._say(city, CITIZEN, text))
+    assert fake.chat[0].text == "prescription prescription_number=RX-1 Show it when you Confirm or Cancel, then Consent,"
+    assert understood(fake.chat[0]).type == "prescription" and gp._sent(fake.chat, GP, CITIZEN, text)

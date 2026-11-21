@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import tools
-from city_sdk.city import LEDGER, CapError, City, Message, Need
+from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope
 from mach import protocol
 from mach.protocol import fields_of, first_word, words
 
@@ -35,6 +35,9 @@ _MAX_PAGE = 8
 # Four agenda hours is about half a minute of real time at 480x, so a slot is still
 # ahead when the citizen decides. One hour was already past by then.
 _LEAD = timedelta(hours=4)
+# A hold is answered after a Ledger round trip: 5-7 real minutes, ~6 agenda hours at rate 60
+# (audit 21/11). A slot that starts sooner comes back EXPIRED (live: one hold in three): no hold.
+_HOLD_LEAD = max(_LEAD, timedelta(hours=6))
 # Doctor key (the last segment of doctor_id) -> languages, gender, days, from the registry
 # (console team/world). The Ledger's slot line names the doctor; it does not repeat this table.
 _DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
@@ -244,9 +247,20 @@ def _own_street(city: City) -> str:
 async def handle(role: str, need: Need, city: City) -> None:
     """One turn of ``role``: ``hospital``, ``specialist_care`` or ``family_counseling``.
 
-    The caller already refused clinical text and called ``tools.start_turn``.
+    The caller already refused clinical text and called ``tools.start_turn``. Only OutOfScope
+    leaves the turn: any other exception out of the brain is a crash or, an httpx timeout, a
+    redelivery that says every message of the turn twice (city_sdk harness.py ``_think``).
     """
 
+    try:
+        await _turn(role, need, city)
+    except OutOfScope:
+        raise
+    except Exception:  # noqa: BLE001 - logged; the turn ends here, never redelivered
+        _LOG.exception("care.turn.failed")
+
+
+async def _turn(role: str, need: Need, city: City) -> None:
     started = time.monotonic()
     message = city.inbound
     if message is None:
@@ -275,7 +289,7 @@ async def handle(role: str, need: Need, city: City) -> None:
         chat = await city.history(need_id=message.need_id)
     street = _own_street(city)
     if street and _asks_address(message):
-        await city.say(message.sender, f"address={street}")
+        await _say(city, message.sender, f"address={street}")
         return
     if role == "hospital":
         flag = _HOSPITAL.set(True)
@@ -999,6 +1013,11 @@ async def _confirm_alone(
         held = since is not None and not any(_drops_hold(row) for row in since)
     else:
         held = slot in sent.holds or protocol.we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
+    if not held and _starts_soon(slot, offer, chat):
+        # The Ledger would refuse it EXPIRED minutes from now: its refusal path at once, in this
+        # turn (the cancel, and other dates where that path gives them).
+        await _on_refused(city, message, chat, hold_self=hold_self, slot=slot, code="EXPIRED")
+        return
     if not held:
         parts = ["hold", f"slot_id={slot}"]
         if citizen:
@@ -1016,6 +1035,21 @@ async def _confirm_alone(
     await _finish_booking(
         city, message, chat, slot, hold_self=hold_self, new=_HOSPITAL.get() and not held
     )
+
+
+def _starts_soon(slot: str, offer: dict[str, str], chat: list[Message]) -> bool:
+    """``slot`` starts within _HOLD_LEAD of the agenda clock (_city_now). Its start: our offer's
+    agenda_date, else its line in a world page we read (this case, or _WORLD). Clock or start
+    unknown: False, the hold goes as before."""
+
+    now = _city_now()
+    at = protocol.when(offer.get("agenda_date", ""))
+    if at is None:
+        pages = [row.text for row in chat if row.sender == LEDGER] + [page for _, page in _WORLD.values()]
+        found = (_slot(line).get("at", "") for page in pages for line in page.splitlines()
+                 if f"slot_id={slot}" in line.split())
+        at = protocol.when(next((start for start in found if start), ""))
+    return now is not None and at is not None and at <= now + _HOLD_LEAD
 
 
 # --- facility ----------------------------------------------------------------------------------
@@ -2856,13 +2890,17 @@ async def _on_committed(
 
 
 async def _on_refused(
-    city: City, message: Message, chat: list[Message], *, hold_self: bool
+    city: City, message: Message, chat: list[Message], *, hold_self: bool, slot: str = "",
+    code: str = "",
 ) -> None:
+    """A Ledger refusal (or expiry, cancellation) of our hold or commit; ``slot`` and ``code``
+    given: a confirm we refuse ourselves before the hold (_starts_soon), ``message`` the confirm."""
+
     agent = city.agent_id
-    slot = _slot_of(chat, agent, message)
+    slot = slot or _slot_of(chat, agent, message)
     if not slot:
         return
-    target, _, _ = _booking_of(chat, agent, slot)
+    target = _booking_of(chat, agent, slot)[0] or ("" if message.sender == LEDGER else message.sender)
     offer_id = ""
     for row in chat:
         for line in row.text.splitlines():
@@ -2871,11 +2909,12 @@ async def _on_refused(
     fields = fields_of(message.text)
     # The Ledger's code goes on, so the booking centre can react: PRESCRIPTION_EXPIRED →
     # renewal (P1), CONSENT_MISSING → consent (P2), NO_CAPACITY → another slot (P3).
-    code = fields.get("code") or fields.get("reason") or "facility_cancelled"
+    code = code or fields.get("code") or fields.get("reason") or "facility_cancelled"
     hospital = _HOSPITAL.get()
-    if hospital and code == "DUPLICATE":
+    if code == "DUPLICATE":
         # A second commit of a hold already committed (its committed line brings the receipt)
-        # or a prescription already booked: nothing was lost, so no cancel to anyone.
+        # or a prescription already booked: nothing was lost, so no cancel to anyone (every
+        # facility: the booking centre re-offered after a booking, wave W01QQQ 1g).
         return
     if hospital and code == "NO_CAPACITY":
         # The slot is gone: neither a cross-ASST answer nor _alternatives offers it again.
@@ -2891,7 +2930,8 @@ async def _on_refused(
         # 20-33 s): our hold or booking of the slot stands, so no cancel to anyone.
         return
     # Hospital: once per hold, so a re-hold of the same offer can be cancelled again.
-    seen = (_since_hold(chat, agent, slot) or []) if hospital else chat
+    since = _since_hold(chat, agent, slot) if hospital else None
+    seen = chat if since is None else since
     if (
         target
         and offer_id

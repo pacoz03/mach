@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 import unicodedata
@@ -299,6 +300,19 @@ def _code_of(rx: Prescription) -> str | None:
 
 
 async def main(need: Need, city: City) -> None:
+    """One turn. Only OutOfScope (the clinical refusal) leaves it: any other exception out of the
+    brain is a crash or, an httpx timeout, a redelivery that says every message of the turn twice
+    (city_sdk harness.py ``_think``/``_deferred_turn``)."""
+
+    try:
+        await _turn(need, city)
+    except OutOfScope:
+        raise
+    except Exception:  # noqa: BLE001 - logged; the turn ends here, never redelivered
+        logging.getLogger("care").exception("care.turn.failed")
+
+
+async def _turn(need: Need, city: City) -> None:
     inbound = city.inbound
     if inbound is None:
         return
@@ -1026,7 +1040,7 @@ async def _handoff(
         peers = [peer for peer in await city.find("booking_centre") if peer.agent_id == BOOKING_CENTRE]
         if len(peers) != 1:
             return False
-        await _say(
+        return bool(await _say(  # "": a network error, as when it raised
             city,
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
@@ -1041,26 +1055,59 @@ async def _handoff(
             )
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
             + "Se non trovate un posto, avvisatemi così posso aiutare la persona a proseguire. Grazie!",
-        )
-        return True
+        ))
     except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us
         return False
 
 
 async def _say(city: City, to: Peer | str, text: str) -> str:
-    """city.say, recorded in the team's trace (tools.said, never blocks). Raises what it raises."""
+    """city.say of ``_plain(text)``, recorded in the team's trace (tools.said, never blocks).
+    A CapError is raised (the Ledger's refusal has its own answer); a network error is recorded
+    and gives "": no retry (city.say is not idempotent, a ReadTimeout can come after the Relay took
+    the message) and the turn goes on."""
 
     recipient = to.agent_id if isinstance(to, Peer) else to
+    text = _plain(text)
     try:
         msg_id = await city.say(to, text)
-    except Exception as exc:
-        tools.said(recipient, text, error=getattr(exc, "code", None) or type(exc).__name__)
+    except CapError as exc:
+        tools.said(recipient, text, error=exc.code)
         raise
+    except Exception as exc:  # noqa: BLE001 - the Relay's httpx timeouts must not end the turn
+        tools.said(recipient, text, error=type(exc).__name__)
+        return ""
     tools.said(recipient, text, msg_id)
     return msg_id
 
 
+# The act words understood() (and the judge) reads: city_sdk.city._ACTS, private, so copied.
+ACT_WORDS = frozenset({
+    "need.request", "offer", "confirm", "cancel", "prescription", "consent", "data.request",
+    "data.response", "checkin", "report", "booking.receipt", "escalate.emergency", "hold",
+    "case.closed",
+})
+
+
+def _plain(text: str) -> str:
+    """As shared/mach/protocol.py ``plain`` (the gp has no mach/ yet): the judge reads the LAST act
+    word, commas as spaces (understood, e19-rules.md:212). Every act word other than the
+    message's first gets a capital letter; ``key=value`` tokens and other bytes stay."""
+
+    acts = [token for token in text.replace(",", " ").split() if token in ACT_WORDS]
+    if len(set(acts)) < 2:
+        return text
+    own = acts[0]
+
+    def capital(token: re.Match[str]) -> str:
+        if "=" in token[0]:
+            return token[0]
+        return re.sub(r"[^,]+", lambda p: p[0].capitalize() if p[0] in ACT_WORDS and p[0] != own else p[0], token[0])
+
+    return re.sub(r"\S+", capital, text)
+
+
 def _sent(history: list[Message], agent_id: str, recipient: str, text: str) -> bool:
+    text = _plain(text)
     return any(
         row.sender == agent_id and row.recipient == recipient and row.text == text
         for row in history

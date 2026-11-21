@@ -275,7 +275,7 @@ def test_say_timeout_never_escapes(said, error):
 
 
 def test_say_retries_a_timeout_once_when_asked(said):
-    relay = Relay(httpx.ReadTimeout("relay send"))
+    relay = Relay(httpx.ReadTimeout("relay send"))  # no history port: the case shows it did not go
     assert say(relay, retry=True) == "id-2" and relay.posts == 2 and said == [(LEDGER, "agenda", "id-2", None)]
     relay = Relay(httpx.ReadTimeout("a"), httpx.ReadTimeout("b"))
     assert say(relay, retry=True) == "" and relay.posts == 2
@@ -288,3 +288,92 @@ def test_say_bounced_citizen_is_not_tried_again(said):
     assert say(relay, to=CITIZEN, bounced=bounced) == "" and relay.posts == 1  # within _BOUNCE_TTL
     relay = Relay(CapError("TARGET_NOT_VISIBLE", LEDGER))
     assert say(relay, bounced=bounced) == "" and len(bounced) == 1  # only citizens are remembered
+
+
+class Taken(Relay):
+    """The Relay took the message and then timed out: the case history shows it."""
+
+    def __init__(self, *errors: BaseException | None, read_fails: bool = False) -> None:
+        super().__init__(*errors)
+        self.rows: list[Message] = []
+        self.read_fails, self.reads = read_fails, 0
+
+    async def post(self, **kw) -> str:
+        self.rows.append(Message(type="chat", sender=ME, recipient=kw["to"], msg_id=f"id-{self.posts + 1}",
+                                 body=kw["body"]))
+        return await super().post(**kw)
+
+    async def history(self, *, peer, need_id) -> list[Message]:
+        self.reads += 1
+        if self.read_fails:
+            raise httpx.ReadTimeout("relay history")
+        return self.rows
+
+
+def say_on(relay: Taken, **kw) -> str:
+    city = City(index=None, messages=relay, history=relay, agent_id=ME, inbound=msg(CITIZEN, "ciao", mid="in"))
+    return asyncio.run(protocol.say(city, LEDGER, "hold slot_id=S-1", **kw))
+
+
+def test_say_does_not_retry_what_went(said):
+    # A ReadTimeout after the Relay took the hold: a blind retry held twice (debolezza 4).
+    relay = Taken(httpx.ReadTimeout("relay send"))
+    assert say_on(relay, retry=True) == "id-1" and relay.posts == 1 and relay.reads == 1
+    assert said == [(LEDGER, "hold slot_id=S-1", "id-1", None)]
+
+
+def test_say_does_not_retry_when_the_case_cannot_be_read(said):
+    relay = Taken(httpx.ReadTimeout("relay send"), read_fails=True)
+    assert say_on(relay, retry=True) == "" and relay.posts == 1 and relay.reads == 1
+    assert said == [(LEDGER, "hold slot_id=S-1", None, "ReadTimeout")]
+
+
+# --- plain: one act word for the judge (understood reads the LAST one) ------------------------
+
+
+def judged(text: str) -> str:
+    return sdk.understood(msg(ME, text, to=CITIZEN)).type
+
+
+def test_plain_keeps_the_messages_own_act():
+    text = ("booking.receipt booking_id=B-1 ledger_ref=L-1 Please bring this receipt; to cancel, write "
+            "cancel,offer_id or confirm. hold on")
+    out = protocol.plain(text)
+    assert judged(text) == "hold" and judged(out) == "booking.receipt"
+    assert out == ("booking.receipt booking_id=B-1 ledger_ref=L-1 Please bring this receipt; to Cancel, write "
+                   "Cancel,offer_id or confirm. Hold on")  # "confirm." is no act word for understood
+    kv = "data.request purpose=booking fields=prescription_number,consent offer please"
+    assert protocol.plain(kv) == "data.request purpose=booking fields=prescription_number,consent Offer please"
+    for same in ("cancel offer_id=o-1 reason=lang cancel", "Mi dispiace, nessun posto.", "agenda", ""):
+        assert protocol.plain(same) == same
+
+
+def test_say_sends_plain_text_and_exact_matches_it(said):
+    relay = Taken()
+    city = City(index=None, messages=relay, history=relay, agent_id=ME, inbound=msg(CITIZEN, "ciao", mid="in"))
+    text = "offer offer_id=o-1 slot_id=S-1 Give your consent and confirm now."
+    assert asyncio.run(protocol.say(city, CITIZEN, text)) == "id-1"
+    assert relay.rows[0].text == "offer offer_id=o-1 slot_id=S-1 Give your Consent and Confirm now."
+    assert protocol.exact(relay.rows, ME, text)
+
+
+def _strings(path: Path) -> list[str]:
+    """Every string literal of a brain (f-string pieces too): the prose its messages carry."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return sorted({node.value for node in ast.walk(tree)
+                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and " " in node.value.strip()})
+
+
+BRAINS = ("booking_centre/agent/agent.py", "shared/facility.py", "gp/agent/agent.py")
+
+
+@pytest.mark.parametrize("brain", BRAINS)
+def test_every_phrase_keeps_the_act_it_follows(brain):
+    # Booking _PHRASES (every language), the facilities' and the gp's prose: after any act head,
+    # the judge reads that act. A key=value token is never changed, so a phrase whose own tokens
+    # name an act (none today) would show here.
+    wrong = [(act, phrase[:60]) for phrase in _strings(ROOT / brain) for act in sorted(protocol._ACTS)
+             if judged(protocol.plain(f"{act} x=1 {phrase}")) != act]
+    assert not wrong
