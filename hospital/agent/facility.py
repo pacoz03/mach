@@ -1592,11 +1592,19 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         await _arrive(city, message)
     elif from_citizen and not confirm:
         await _answer(city, message, chat)
-    elif message.sender == LEDGER and head == "refused" and "checkin" in kind:
-        # A refusal that came after the arrival turn stopped waiting for it.
-        await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
-    elif message.sender == LEDGER and head == "checked_in":
-        await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
+    elif message.sender == LEDGER and (head == "checked_in" or head == "refused" and "checkin" in kind):
+        # The Ledger's answer after the arrival turn stopped waiting for it (live: always): this
+        # turn answers the citizen. After any arrival turn still waiting, on the case re-read, so
+        # one answer only.
+        async with _gated(f"arrive:{message.need_id or message.msg_id}"):
+            try:
+                chat = await city.history(need_id=message.need_id)
+            except CapError:
+                pass
+            if head == "checked_in":
+                await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
+            else:
+                await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
     elif message.sender == LEDGER and head == "agenda":
         # A late agenda reply as its own turn (live 1.0.9: all of them, 2-4 min after the ask): it
         # sets the city clock that _cross_asst needs to answer from _WORLD. Ignored, every request
@@ -2559,19 +2567,11 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
             return
     found = await _await_line(city, message.need_id, chat, "checked_in", token, op="checkin")
     if found is None:
+        # No word before the Ledger answers: the push turn of its checked_in (or refusal) does
+        # (_hospital). The check-in ends a VIS-FIS journey: an interim reply closed it and the judge
+        # ruled before the Ledger's checked_in, 1.5-2 real minutes after our checkin (live 1.0.17-
+        # 1.0.18: 22 of 22 interims; in 75 min 8 receipt_refused -2 against 7 checkin_honored +2).
         _LOG.info("care.checkin.missing", extra={"need_id": (message.need_id or "")[:48]})
-        await _say(
-            city,
-            citizen,
-            f"{token} "
-            + (
-                "Thank you, I am registering your arrival now: I will confirm as soon as the "
-                "register answers."
-                if en
-                else "Grazie, sto registrando il suo arrivo: le confermo appena il registro "
-                "risponde."
-            ),
-        )
         return
     reply, fresh = found
     if first_word(reply.text) == "checked_in":

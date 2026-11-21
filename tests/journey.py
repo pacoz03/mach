@@ -2986,6 +2986,62 @@ SCENARIOS.update({
 })
 
 
+def slow_checkin(seconds: float, resend: bool = False):
+    """Il Ledger risponde al checkin dopo ``seconds``, oltre l'attesa del turno (città 21/11:
+    1,5-2 minuti reali): il checked_in arriva come push, in un turno suo. ``resend``: il cittadino
+    riscrive l'arrivo prima della risposta (R:93), una volta."""
+    def setup(b: Bus) -> None:
+        late, again = b.ledger.late, [resend]
+
+        def slow(text: str) -> float:
+            if (text.split() or [""])[0] != "checkin":
+                return late(text)
+            if again[0]:
+                again[0] = False
+                m = next(m for m in reversed(b.log) if m.sender == CIT)
+                b.citizen.say(m.recipient, m.text)
+            return seconds
+        b.ledger.late = slow
+    return setup
+
+
+def checkin_first(folder: str):
+    """Dopo l'arrivo il primo messaggio di ``folder`` al cittadino è il checkin con il booking_id,
+    e uno solo. Il check-in chiude il percorso VIS-FIS: un messaggio d'attesa prima lo chiudeva e
+    il giudice, un minuto dopo e prima del checked_in, dava receipt_refused −2 (R:214-220, R:234).
+    Contano i messaggi dei turni aperti dall'arrivo o dal Ledger, non le risposte ad altre domande."""
+    def check(b: Bus) -> str | None:
+        fac = b.ids[folder]
+        arrivals = [i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == fac and act(m) == "checkin"]
+        if not arrivals:
+            return f"il cittadino non si è mai presentato a {folder}"
+        to_cit = [m for m in b.log[arrivals[0] + 1:] if m.sender == fac and m.recipient == CIT]
+        opened = {b.log[i].msg_id for i in arrivals}
+        said = [m for m in to_cit if (b.opened[b.turn_of[m.msg_id]].msg_id in opened
+                                      or b.opened[b.turn_of[m.msg_id]].sender == LEDGER)]
+        if not said or act(said[0]) != "checkin" or not has(said[0].text, ("booking_id=",)):
+            first = said[0].text[:80] if said else "(niente)"
+            return f"{folder}: dopo l'arrivo prima «{first}», non il checkin del registro"
+        if (n := sum(act(m) == "checkin" for m in to_cit)) != 1:
+            return f"{folder}: {n} checkin al cittadino, ne serve uno"
+    return check
+
+
+SCENARIOS.update({
+    # Il checked_in arriva dopo che il turno dell'arrivo ha smesso di aspettarlo (ospedale 1.0.17-
+    # 1.0.18: 22 check-in su 22 con il messaggio d'attesa): risponde il turno del push, una volta.
+    "ospedale_checkin_lento": dict(start=BACK, ledger_turns=True, setup=slow_checkin(0.5),
+                                   expect=[*CHECKED_IN, checkin_first("hospital")]),
+    # Il cittadino riscrive l'arrivo mentre il checkin è in sospeso: nessun secondo checkin sul
+    # Ledger (general), nessun messaggio d'attesa, un solo checkin al cittadino.
+    "ospedale_checkin_lento_ripetuto": dict(start=BACK, ledger_turns=True, setup=slow_checkin(0.5, resend=True),
+                                            expect=[*CHECKED_IN, checkin_first("hospital")]),
+    # Il consultorio, stessa attesa (_on_checkin, senza messaggio d'attesa già su HEAD).
+    "consultorio_checkin_lento": dict(start=GINECOLOGIA, ledger_turns=True, setup=slow_checkin(0.5),
+                                      expect=[wrote("checkin", "R:234"), checkin_first("family_counseling")]),
+})
+
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"
