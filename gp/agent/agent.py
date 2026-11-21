@@ -149,80 +149,107 @@ class Prescription:
             f"priority={self.priority}"
         )
 
+    def opening(self, lang: str) -> str:
+        """To the person: the reason they gave (their words, no diagnosis) and what is ready."""
+
+        reason = _REASON[lang].get(_code_of(self))
+        visit = _VISIT[lang].get(self.procedure, self.procedure)
+        number = self.number
+        if lang == "en":
+            return (
+                (f"Thank you for telling me about {reason}. " if reason else "Thank you for writing. ")
+                + f"I have prepared your prescription for a {visit}, number {number}, "
+                f"priority {self.priority}"
+            )
+        return (
+            (f"Grazie per avermi descritto {reason}. " if reason else "Grazie per avermi scritto. ")
+            + f"Le ho preparato la ricetta per una {visit}, numero {number}, priorità {self.priority}"
+        )
+
     def reply(self, lang: str, handed: bool, prefs: dict[str, object] | None = None) -> str:
-        """Beyond the prescription, unasked: the preferences still missing and the renewal (P1)."""
+        """To the person: their reason, the prescription, one concrete next step, and unasked the
+        handoff with their preferences, the preferences still missing and the renewal (P1)."""
 
         timing = TIMING[lang].get(self.priority)
         noted = _describe(prefs or {}, lang)
         missing = _missing(prefs or {}, lang)
+        text = self.opening(lang) + (f": {timing}. " if timing else ". ")
         if lang == "en":
-            text = (
-                "I understand your concern and I have taken care of it right away. "
-                f"Your prescription is registered with priority {self.priority}"
-                + (f": {timing}. " if timing else ". ")
-            )
             if handed:
-                text += "I have already passed it to our booking centre. "
-                if noted:
-                    text += (
-                        f"I have noted your preferences ({noted}) and passed them on too, so they "
-                        "can look for a slot that matches them. "
-                    )
+                text += (
+                    "Next step: you do not need to repeat anything. I have already sent the "
+                    "prescription to our booking centre"
+                    + (f", together with your preferences ({noted})" if noted else "")
+                    + ": it will write to you with the available slots, and you only need to "
+                    "reply to confirm the one that suits you. "
+                )
                 if missing:
-                    text += (
-                        f"If you also have a preference for {missing}, tell the booking centre: "
-                        if noted
-                        else f"If you have a preference for {missing}, tell the booking centre: "
-                    ) + "it will find the slot that suits you best. "
+                    text += f"If you have a preference for {missing}, just tell the booking centre. "
             else:
-                text += "To book, write to your ASST's booking centre with the prescription number. "
-                if noted:
-                    text += (
-                        f"Remember to tell them your preferences ({noted}): they will look for a "
-                        "slot that matches them. "
-                    )
+                text += (
+                    f"Next step: write to your ASST's booking centre with the number {self.number}"
+                    + (f" and your preferences ({noted})" if noted else "")
+                    + ": it will offer you the available slots. "
+                )
                 if missing:
                     text += f"If you have a preference for {missing}, tell them too. "
             text += (
                 "Keep the prescription number: if it expires before you manage to book, write to "
-                "me and I will renew it."
+                "me and I will renew it. If you feel worse or something new comes up, write to me."
             )
         else:
-            text = (
-                "Capisco la sua preoccupazione e me ne sono occupato subito. "
-                f"La ricetta è registrata con priorità {self.priority}"
-                + (f": {timing}. " if timing else ". ")
-            )
             if handed:
-                text += "Ho già passato la ricetta al nostro centro prenotazioni. "
-                if noted:
-                    text += (
-                        f"Ho preso nota delle sue preferenze ({noted}) e le ho passate anche "
-                        "quelle, così cercherà uno slot che le rispetti. "
-                    )
+                text += (
+                    "Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro "
+                    "centro prenotazioni"
+                    + (f", insieme alle sue preferenze ({noted})" if noted else "")
+                    + ": le scriverà con gli orari disponibili e a lei basterà rispondere per "
+                    "confermare quello che le va meglio. "
+                )
                 if missing:
-                    text += (
-                        f"Se ha anche preferenze {missing}, "
-                        if noted
-                        else f"Se ha preferenze {missing}, "
-                    ) + "le indichi al centro prenotazioni: così troverà lo slot più adatto a lei. "
+                    text += f"Se ha preferenze {missing}, le dica pure al centro prenotazioni. "
             else:
                 text += (
-                    "Per prenotare scriva al centro prenotazioni della sua ASST con il numero "
-                    "della ricetta. "
+                    "Passo successivo: scriva al centro prenotazioni della sua ASST indicando il "
+                    f"numero {self.number}"
+                    + (f" e le sue preferenze ({noted})" if noted else "")
+                    + ": le proporrà gli orari disponibili. "
                 )
-                if noted:
-                    text += (
-                        f"Ricordi di indicare le sue preferenze ({noted}): cercheranno uno slot "
-                        "che le rispetti. "
-                    )
                 if missing:
                     text += f"Se ha preferenze {missing}, le indichi anche quelle. "
             text += (
                 "Conservi il numero della ricetta: se scade prima che riesca a prenotare, mi "
-                "scriva e gliela rinnovo io."
+                "scriva e gliela rinnovo io. Se si sente peggio o compare un disturbo nuovo, mi "
+                "scriva."
             )
         return f"{self.head} {text}"
+
+
+# The reason in the citizen's own words (the protocol's symptom, never a diagnosis) and the visit.
+_REASON = {
+    "it": {
+        "SYM-BACK": "il suo mal di schiena",
+        "SYM-KNEE": "il dolore al ginocchio",
+        "SYM-PALPITATIONS": "le palpitazioni",
+        "SYM-FOLLOWUP": "il controllo periodico del cuore",
+    },
+    "en": {
+        "SYM-BACK": "your back pain",
+        "SYM-KNEE": "your knee pain",
+        "SYM-PALPITATIONS": "your palpitations",
+        "SYM-FOLLOWUP": "your routine heart check",
+    },
+}
+_VISIT = {
+    "it": {"VIS-FIS": "visita fisiatrica", "VIS-CARD": "visita cardiologica"},
+    "en": {"VIS-FIS": "physiatry visit", "VIS-CARD": "cardiology visit"},
+}
+
+
+def _code_of(rx: Prescription) -> str | None:
+    """PROTOCOL is one-to-one: procedure and priority name the reason."""
+
+    return next((code for code, pair in PROTOCOL.items() if pair == (rx.procedure, rx.priority)), None)
 
 
 async def main(need: Need, city: City) -> None:
@@ -620,15 +647,15 @@ def _reminder(
         for row in history
     )
     timing = TIMING[lang].get(issued.priority)
+    text = issued.opening(lang).replace("I have prepared", "I have already prepared").replace(
+        "Le ho preparato", "Le ho già preparato"
+    ) + (f": {timing}. " if timing else ". ")
     if lang == "en":
-        text = (
-            "Thank you for writing. Your prescription is ready, with priority "
-            f"{issued.priority}" + (f": {timing}. " if timing else ". ")
-        )
         text += (
-            "Our booking centre already has it and will contact you with the available times. "
+            "Next step: our booking centre already has it and will write to you with the "
+            "available slots; you only need to reply to confirm one. "
             if handed
-            else "To book, write to your ASST's booking centre with the prescription number. "
+            else f"Next step: write to your ASST's booking centre with the number {issued.number}. "
         )
         text += (
             f"I have noted your preferences ({noted}): confirm them to the booking centre when it "
@@ -639,16 +666,12 @@ def _reminder(
         )
         text += "If you feel worse or something new comes up, write to me."
     else:
-        text = (
-            "Grazie per avermi scritto. La sua ricetta è già pronta, con priorità "
-            f"{issued.priority}" + (f": {timing}. " if timing else ". ")
-        )
         text += (
-            "Il nostro centro prenotazioni l'ha già ricevuta e la contatterà con gli orari "
-            "disponibili. "
+            "Passo successivo: il nostro centro prenotazioni l'ha già ricevuta e le scriverà con "
+            "gli orari disponibili; a lei basterà rispondere per confermarne uno. "
             if handed
-            else "Per prenotare scriva al centro prenotazioni della sua ASST indicando il numero "
-            "della ricetta. "
+            else "Passo successivo: scriva al centro prenotazioni della sua ASST indicando il "
+            f"numero {issued.number}. "
         )
         text += (
             f"Ho preso nota delle sue preferenze ({noted}): le confermi al centro prenotazioni "
