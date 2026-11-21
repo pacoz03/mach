@@ -2,6 +2,8 @@
 medico e giorni. Lo specialista mette prima gli slot che li rispettano, legge anche la seconda
 pagina di world e, se nella finestra di priorità non c'è nulla, offre le prime date dopo."""
 
+from datetime import datetime, timezone
+
 from conftest import AGENT, LEDGER, FakeCity, msg, run
 
 PARTNER = "agent:partnerbook01"
@@ -28,7 +30,10 @@ def _ledger(pages: list[list[str]]):
         fields = dict(t.split("=", 1) for t in text.split() if "=" in t)
         head = text.split()[0]
         if head == "agenda":
-            answer = f"agenda agenda_now={NOW} agenda_day=mon"
+            # As the live Ledger: the city clock fields too (epoch_real/epoch_agenda/rate).
+            real = datetime.now(timezone.utc).isoformat()
+            answer = (f"agenda agenda_now={NOW} agenda_day=mon epoch_real={real} "
+                      f"epoch_agenda={NOW} rate=60")
         elif head == "world":
             n = int(fields.get("page", "1"))
             rows = pages[n - 1] if n <= len(pages) else []

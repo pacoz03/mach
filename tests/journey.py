@@ -225,6 +225,8 @@ class Ledger:
             return None, REPLY["held"].format(**self.holds[hid]), False
         h = self.holds.get(f.get("hold_id") or f.get("booking_id", ""))
         if op == "commit":
+            if h is not None and h["state"] == "committed":  # come il Ledger vero (episodes)
+                return "DUPLICATE", "", False
             if h is None or h["state"] != "held":
                 return "UNKNOWN_HOLD", "", False
             if not f.get("consent_ref"):
@@ -339,7 +341,9 @@ class Port:
 
     async def post(self, *, to, message_type, body, need_id, conversation_id, traceparent):
         b = self.bus
-        if to in b.down or self.me in b.down:
+        if b.race:  # sc["race"]: la rete cede il loop, gli altri turni vanno avanti intanto
+            await asyncio.sleep(0)
+        if to in b.down or self.me in b.down or (self.me, to) in b.hidden:
             b.bounced.append((self.me, to, body.get("text", "")))
             raise CapError("TARGET_NOT_VISIBLE", to)
         m = b.add(self.me, to, body, need_id, conversation_id)
@@ -348,15 +352,20 @@ class Port:
             if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città
                 asyncio.get_running_loop().call_later(delay, b.reply, self.me, text, need_id, conversation_id)
             else:
-                b.reply(self.me, text, need_id, conversation_id)
+                r = b.reply(self.me, text, need_id, conversation_id)
+                if b.race and text.startswith("held "):  # il push di held apre subito un turno suo
+                    b.tasks.append(asyncio.create_task(b.deliver(r)))
         else:
             b.queue.append(m)
         return m.msg_id
 
     async def history(self, *, peer, need_id):
-        return [m for m in self.bus.log if self.me in (m.sender, m.recipient)
+        rows = [m for m in self.bus.log if self.me in (m.sender, m.recipient)
                 and (peer is None or peer in (m.sender, m.recipient))
                 and (need_id is None or m.need_id == need_id)]
+        if self.bus.race:  # la lettura restituisce il caso com'era quando è partita
+            await asyncio.sleep(0)
+        return rows
 
     async def search(self, query):
         return [Peer(a.id, role=a.role, capabilities=a.caps)
@@ -392,6 +401,8 @@ class Citizen:
 
     def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
         """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
+        if self.sc.get("ledger_cancel"):  # la città annulla prima della visita (Bus.run)
+            return
         text = f"checkin booking_id={booking_id} ledger_ref={ledger_ref}"
         mode = self.sc.get("checkin", "testo")
         if mode == "body":  # /checkin di city run: messaggio tipato, testo vuoto (local.py:349-356)
@@ -477,6 +488,10 @@ class Bus:
         self.llm_calls: list[str] = []
         self.confirmed = False  # il centro dell'altra ASST ha già confermato
         self.stamp: dict[str, float] = {}  # msg_id -> time.monotonic() dell'invio
+        self.race, self.tasks = sc.get("race", False), []  # turni concorrenti (push di held)
+        self.dup = sc.get("dup_confirm", 0)
+        # sc["hidden"]: il cittadino non è visibile all'ospedale (altra ASST, TARGET_NOT_VISIBLE)
+        self.hidden = {(self.ids["hospital"], CIT)} if sc.get("hidden") else set()
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -493,10 +508,11 @@ class Bus:
         self.stamp[m.msg_id] = time.monotonic()
         return m
 
-    def reply(self, to: str, text: str, need: str | None, conv: str | None) -> None:
+    def reply(self, to: str, text: str, need: str | None, conv: str | None) -> Message:
         r = self.add(LEDGER, to, {"text": text}, need, conv)
         if self.ledger_turns:
             self.queue.append(r)
+        return r
 
     async def deliver(self, m: Message) -> None:
         a = self.agents[m.recipient]
@@ -512,18 +528,31 @@ class Bus:
                 self.oos.add(m.msg_id)
             except Exception:
                 self.crashes.append(f"crash {a.folder}: {traceback.format_exc().strip().splitlines()[-1]}")
+        if self.dup and m.sender == self.ids["booking_centre"] and a.folder == "hospital" and m.text.startswith("confirm"):
+            self.dup -= 1  # sc["dup_confirm"]: lo stesso confirm arriva di nuovo dopo il turno, msg_id nuovo
+            self.queue.append(self.add(m.sender, m.recipient, m.body, m.need_id, m.conversation_id))
 
     async def run(self, start: tuple[str, str]) -> None:
         # sc["after"]: messaggi che il cittadino scrive al gp a percorso fermo (livello 3: grazie,
         # domande, un secondo disturbo, un rinnovo chiesto a parole).
         # sc["foreign_after"]: altre richieste del centro dell'altra ASST all'ospedale.
+        # sc["ledger_cancel"]: a prenotazione fatta il Ledger la annulla, poi il cittadino chiede l'orario.
+        cancel = (("ledger", self.citizen.sc["ledger_cancel"]), ("hospital", ORARIO)) if "ledger_cancel" in self.citizen.sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
-                         *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ()))):
-            if self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
+                         *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ())), *cancel):
+            if to == "ledger":
+                h = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
+                h["state"] = "cancelled"
+                self.queue.append(self.add(LEDGER, self.ids["hospital"], {"text": REPLY["cancelled"].format(**h)
+                                           + f" booking_id={h['hold_id']} reason={text}"}))
+            elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
                 self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
             else:
                 self.citizen.say(self.ids[to], text)
-            while self.queue and self.turn < MAX_TURNS:
+            while (self.queue or self.tasks) and self.turn < MAX_TURNS:
+                if not self.queue:  # sc["race"]: aspetta i turni concorrenti ancora aperti
+                    await self.tasks.pop()
+                    continue
                 m = self.queue.popleft()
                 self.turn += 1
                 if m.recipient == CIT:
@@ -1016,6 +1045,81 @@ SCENARIOS: dict[str, dict] = {
         start=("hospital", XFIS.format(rid="R-10", extra="")), foreign=True, xconsent=True,
         expect=[wrote("hold", "P2", consent_ref="xc-X-1"), wrote("commit", "R:194", consent_ref="cons-X-1")]),
 }
+
+
+# --- Ciclo di vita della prenotazione in ospedale (commit unico, re-hold, confirm doppio, annullo)
+
+
+def hospital_commits(n: int):
+    """Commit dell'ospedale, anche rifiutati: il push di held e il turno del confirm non
+    committano lo stesso hold due volte (in città: DUPLICATE, poi cancel sbagliati)."""
+    def check(b: Bus) -> str | None:
+        got = sum(w["op"] == "commit" and w["by"] == "hospital" for w in b.ledger.writes)
+        if got != n:
+            return f"hospital ha mandato {got} commit invece di {n}"
+    return check
+
+
+def hospital_receipts(n: int):
+    """booking.receipt dall'ospedale al centro prenotazioni, tutte con lo stesso booking_id."""
+    def check(b: Bus) -> str | None:
+        got = [fields(m.text).get("booking_id") for m in b.log if m.sender == b.ids["hospital"]
+               and m.recipient == b.ids["booking_centre"] and act(m) == "booking.receipt"]
+        if len(got) != n or len(set(got)) != 1:
+            return f"hospital ha mandato {len(got)} booking.receipt al centro {got} invece di {n} (confirm doppio)"
+    return check
+
+
+def rehold(b: Bus) -> str | None:
+    """Hold rifiutato, poi un confirm nuovo sullo stesso slot: un hold nuovo, uno solo (R:682)."""
+    holds = [w for w in b.ledger.writes if w["op"] == "hold" and w["by"] == "hospital"]
+    if not holds or not holds[0]["code"]:
+        return "il primo hold dell'ospedale non è stato rifiutato"
+    slot = holds[0]["f"].get("slot_id")
+    again = [w for w in holds[1:] if w["f"].get("slot_id") == slot]
+    if len(again) != 1 or again[0]["code"]:
+        return f"dopo il rifiuto {len(again)} hold su {slot} invece di uno accettato (re-hold)"
+
+
+def cancel_told(peer: str, reason: str, n: int):
+    def check(b: Bus) -> str | None:
+        to = CIT if peer == "citizen" else b.ids[peer]
+        got = [m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == to and act(m) == "cancel"
+               and f"reason={reason}" in m.text.split()]
+        if len(got) != n:
+            return f"hospital ha mandato {len(got)} cancel reason={reason} a {peer} invece di {n}"
+    return check
+
+
+def cancelled_not_confirmed(b: Bus) -> str | None:
+    """Dopo il cancelled del Ledger l'ospedale non presenta più quella prenotazione come valida."""
+    i = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.text.startswith("cancelled ")), None)
+    if i is None:
+        return "nessun cancelled dal Ledger"
+    bid = fields(b.log[i].text).get("booking_id", "")
+    for m in b.log[i + 1:]:
+        if m.sender == b.ids["hospital"] and m.recipient == CIT and act(m) != "cancel" and bid in m.text:
+            return f"hospital presenta come valida la prenotazione annullata {bid}: «{m.text[:80]}»"
+
+
+SCENARIOS.update({
+    # Il push di held apre un turno mentre il turno del confirm aspetta la stessa riga.
+    "ospedale_commit_unico": dict(start=BACK, race=True, expect=[hospital_commits(1), wrote("checkin", "R:234")]),
+    # Il centro rimanda lo stesso confirm: la stessa ricevuta di nuovo, niente hold o commit in più.
+    "ospedale_confirm_doppio": dict(start=BACK, dup_confirm=1, expect=[
+        writes("hold", 1, "confirm doppio"), hospital_commits(1), hospital_receipts(2)]),
+    # Hold rifiutato, poi di nuovo lo stesso confirm: un hold nuovo sullo stesso slot.
+    "ospedale_rehold": dict(start=BACK, refuse_holds=1, dup_confirm=1, expect=[rehold, wrote("commit", "R:682")]),
+    # Il Ledger annulla la prenotazione: cancel col motivo al centro e al cittadino, una volta;
+    # alla domanda d'orario mai più quella prenotazione come confermata.
+    "ospedale_annullata": dict(start=BACK, ledger_cancel="facility_closed", expect=[
+        cancel_told("booking_centre", "facility_closed", 1), cancel_told("citizen", "facility_closed", 1),
+        cancelled_not_confirmed]),
+    # Cittadino di un'altra ASST invisibile all'ospedale: il benvenuto non si rimanda (R:701).
+    "cross_asst_cittadino_invisibile": dict(
+        start=("hospital", XFIS.format(rid="R-11", extra="")), foreign=True, hidden=True,
+        expect=[wrote("commit", "R:194"), receipt_to_foreign]),
+})
 
 
 def transcript(b: Bus) -> None:
