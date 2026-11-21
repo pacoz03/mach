@@ -4,6 +4,7 @@
 # 2026-11-21 gp (red flag prima delle letture, safety, msg_id già fatto): 269 (34 risolte; 2 nuove in gp_grazie_prima_del_ledger: il booking tace con ledger_lost, R2)
 # 2026-11-21 ospedale R3 (niente pagina, niente no_availability; _recover; pagine per contenuto): 224 (51 risolte; 6 nuove negli scenari aggiunti, gemelle di righe già qui: redeliver come ospedale_alternative, say_tnv come cross_asst_distribuite, booking muto con clock_lost (R2) e crash del booking su say_timeout)
 # 2026-11-21 booking col calendario e R1: 232 (14 risolte, tutti i say_timeout; 22 nuove solo nei 3 scenari aggiunti e nei 2 P1 prima saltati, gemelle di booking_rifiuto_subito: hostile, ledger_lost, say_tnv, redeliver)
+# 2026-11-21 strutture (cancelled inoltrato da specialista e consultorio, slot_id nella ricevuta, specialista senza no_availability) e rinfresco raro: 248 (2 risolte, specialista_hold_duplicate; 18 nuove solo negli scenari aggiunti: 14 gemelle di righe già qui (booking muto con clock_lost/ledger_lost, R2; say_tnv come cardiologia_referto; ledger_late come consultorio_senza_ricetta), 4 di cross_asst_rinfresco_raro sotto restart e two_pods: il limite è per processo, un rinfresco in più per pod)
 clock_lost plain booking_letture_rare
 clock_lost plain booking_margine_ledger_lento
 clock_lost plain booking_orologio_vecchio
@@ -18,6 +19,7 @@ clock_lost plain checkin_conferma_prosa
 clock_lost plain checkin_libero
 clock_lost plain checkin_rifiutato
 clock_lost plain consultorio_alternativa_offerta
+clock_lost plain consultorio_annullata
 clock_lost plain consultorio_senza_ricetta
 clock_lost plain domanda_orario
 clock_lost plain facility_cancel
@@ -43,6 +45,9 @@ clock_lost plain ospedale_rifiuto_tardivo
 clock_lost plain ospedale_say_timeout
 clock_lost plain p1_ricetta_scaduta
 clock_lost plain p3_riserva_urgente
+clock_lost plain ricevuta_slot_ospedale
+clock_lost plain ricevuta_slot_specialista
+clock_lost plain specialista_annullata
 clock_lost plain welcome_indirizzo
 clock_lost plain welcome_lang_en
 clock_lost turns booking_letture_rare
@@ -59,6 +64,7 @@ clock_lost turns checkin_conferma_prosa
 clock_lost turns checkin_libero
 clock_lost turns checkin_rifiutato
 clock_lost turns consultorio_alternativa_offerta
+clock_lost turns consultorio_annullata
 clock_lost turns consultorio_senza_ricetta
 clock_lost turns domanda_orario
 clock_lost turns facility_cancel
@@ -87,6 +93,9 @@ clock_lost turns ospedale_say_timeout
 clock_lost turns ospedale_scritture_lente
 clock_lost turns p1_ricetta_scaduta
 clock_lost turns p3_riserva_urgente
+clock_lost turns ricevuta_slot_ospedale
+clock_lost turns ricevuta_slot_specialista
+clock_lost turns specialista_annullata
 clock_lost turns welcome_indirizzo
 clock_lost turns welcome_lang_en
 hostile plain booking_rifiuto_giorno
@@ -106,6 +115,7 @@ ledger_late turns booking_passaggio_subito
 ledger_late turns booking_rifiuto_giorno
 ledger_late turns booking_world_in_cache
 ledger_late turns consultorio_alternativa_offerta
+ledger_late turns consultorio_annullata
 ledger_late turns consultorio_hold_duplicate
 ledger_late turns consultorio_senza_ricetta
 ledger_late turns gp_rinnovo_p1_lento
@@ -115,7 +125,6 @@ ledger_late turns ospedale_rehold
 ledger_late turns p1_ricetta_scaduta
 ledger_late turns p1_rinnovo_prenota
 ledger_late turns p1_rinnovo_prenota_cittadino
-ledger_late turns specialista_hold_duplicate
 ledger_lost plain booking_ricetta_altrui
 ledger_lost plain booking_ricetta_inesistente
 ledger_lost plain booking_rifiuto_giorno
@@ -134,6 +143,7 @@ ledger_lost plain ospedale_hold_scaduto
 ledger_lost plain ospedale_say_timeout
 ledger_lost plain p1_ricetta_scaduta
 ledger_lost plain p3_riserva_urgente
+ledger_lost plain specialista_annullata
 ledger_lost turns booking_ricetta_altrui
 ledger_lost turns booking_ricetta_inesistente
 ledger_lost turns booking_rifiuto_giorno
@@ -153,6 +163,7 @@ ledger_lost turns ospedale_say_timeout
 ledger_lost turns ospedale_scritture_lente
 ledger_lost turns p1_ricetta_scaduta
 ledger_lost turns p3_riserva_urgente
+ledger_lost turns specialista_annullata
 ledger_reorder turns booking_nostro_consultorio
 ledger_reorder turns booking_nostro_ospedale
 ledger_reorder turns booking_nostro_specialista
@@ -166,7 +177,6 @@ ledger_reorder turns ospedale_confirm_doppio
 ledger_reorder turns ospedale_giu_poi_su
 ledger_reorder turns p1_rinnovo_prenota
 ledger_reorder turns p1_rinnovo_prenota_cittadino
-ledger_reorder turns specialista_hold_duplicate
 redeliver plain checkin_rifiutato
 redeliver plain facility_cancel
 redeliver plain gp_rinnovo_p1_lento
@@ -192,8 +202,10 @@ redeliver turns ospedale_slot_rubato
 redeliver turns p1_rinnovo_prenota
 redeliver turns p1_rinnovo_prenota_cittadino
 restart plain booking_letture_rare
+restart plain cross_asst_rinfresco_raro
 restart plain ospedale_commit_unico
 restart turns booking_world_in_cache
+restart turns cross_asst_rinfresco_raro
 say_timeout plain booking_ricetta_riscritta
 say_timeout turns booking_ricetta_riscritta
 say_tnv plain booking_redirect_pagina_due
@@ -209,6 +221,7 @@ say_tnv turns booking_world_in_cache
 say_tnv turns cardiologia_referto
 say_tnv turns checkin_conferma_prosa
 say_tnv turns consultorio_alternativa_offerta
+say_tnv turns consultorio_annullata
 say_tnv turns consultorio_senza_ricetta
 say_tnv turns cross_asst_distribuite
 say_tnv turns cross_asst_orologio_nota
@@ -226,10 +239,13 @@ say_tnv turns ospedale_rehold
 say_tnv turns ospedale_scritture_lente
 say_tnv turns ospedale_slot_rubato
 say_tnv turns p1_rinnovo_prenota_cittadino
+say_tnv turns ricevuta_slot_specialista
+say_tnv turns specialista_annullata
 two_pods plain booking_letture_rare
 two_pods plain booking_slot_condivisi
 two_pods plain booking_slot_raffica
 two_pods plain cross_asst_orologio_memoria
+two_pods plain cross_asst_rinfresco_raro
 two_pods plain ospedale_alternative
 two_pods plain ospedale_commit_unico
 two_pods turns booking_letture_rare
@@ -237,4 +253,5 @@ two_pods turns booking_slot_raffica
 two_pods turns cross_asst_cittadino_invisibile
 two_pods turns cross_asst_orologio_memoria
 two_pods turns cross_asst_orologio_nota
+two_pods turns cross_asst_rinfresco_raro
 two_pods turns ospedale_commit_unico
