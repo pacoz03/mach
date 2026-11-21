@@ -13,6 +13,7 @@
 # 2026-11-21 riofferta nello stesso turno, margine di 16 h come preferenza, scadenze in ore di calendario, partner Isola/EPICA: 208 (10 risolte lasciate finché una seconda corsa non le conferma; 12 nuove: 8 gemelle di righe già qui: redeliver booking_riofferta_dopo_annullo come ospedale_slot_rubato (l'ospedale ripete l'hold); say_tnv booking_margine_16h e booking_slot_scarsi_ring come booking_ricetta_muta (l'ospedale rimanda la ricevuta); say_tnv booking_riofferta_dopo_annullo e hostile booking_margine_u come booking_rifiuto_subito (offerta rimandata, uguale su master); ledger_lost gp_preferenze «hospital muto dopo checkin» come le 20 della finestra del richiedente (con days=mon e 16 h il booking legge 4 pagine e la risposta persa cade sul checkin); 3 say_tnv turns già rosse su master 6b98bb0 (ospedale_hold_scaduto, gp_rinnovo_a_parole_lento, ospedale_annullo_dal_centro: commit di Giuseppe dopo 7eaff04)
 # 2026-11-21 MACH-2.1 lato booking (token del need.request, ondate R3, R17/R18, taken): 213 (10 risolte lasciate; 5 nuove: ledger_late/ledger_reorder booking_mach21_richiesta: senza la risposta agenda il pod non ha orologio e non manda after/deadline invece di inventarli (voluto); ledger_lost booking_mach21_ondate «booking muto dopo confirm» come le altre ledger_lost «muto» qui; say_tnv plain booking_slot_scarsi_ring: offerta rimandata dopo TNV come booking_rifiuto_subito)
 # 2026-11-21 strutture W1+W2 (16 h, scadenze da calendar.deadline, guardia sui confirm, P2 nel consultorio, fuga di dati, referto prima del check-in): 247 (10 risolte lasciate, la famiglia instabile sotto carico come in 0ef1032; 34 nuove, tutte nei 13 scenari aggiunti delle strutture: restart/two_pods per lo stato nel pod, redeliver/ledger_late/ledger_reorder/clock_lost come le gemelle consultorio_* già qui, ledger_lost sui check-in rifiutati come «muto dopo checkin», say_tnv come cross_asst_*)
+# 2026-11-21 booking: i giorni della finestra chiesti insieme (world day=), pagine insieme se day= è rifiutato: 266 (34 risolte lasciate; 19 nuove: 16 ledger_lost «muto dopo confirm/checkin» come le altre ledger_lost «muto» qui: con più letture del Ledger nello stesso turno la risposta persa dal guasto cade più avanti, sul confirm o sul checkin; restart turns booking_letture_rare: dopo il riavvio 1 rules e 1 agenda in più; 2 say_timeout plain negli scenari dello specialista, gemelle delle say_timeout già qui)
 clock_lost plain consultorio_alternativa_offerta
 clock_lost plain consultorio_annullata
 clock_lost plain consultorio_non_mi_va_bene
@@ -71,10 +72,15 @@ ledger_late turns p1_ricetta_scaduta
 ledger_late turns p1_rinnovo_prenota
 ledger_late turns p1_rinnovo_prenota_cittadino
 ledger_lost plain booking_agenda_muta
+ledger_lost plain booking_giorni_insieme
+ledger_lost plain booking_giorno_rifiutato
 ledger_lost plain booking_mach21_ondate
+ledger_lost plain booking_relay_timeout
 ledger_lost plain booking_rifiuto_giorno
 ledger_lost plain booking_rifiuto_subito
+ledger_lost plain booking_scelta_tardiva
 ledger_lost plain booking_world_in_cache
+ledger_lost plain checkin_conferma_prosa
 ledger_lost plain consultorio_alternativa_offerta
 ledger_lost plain cross_asst_push_reale
 ledger_lost plain cross_asst_riavvio
@@ -88,16 +94,24 @@ ledger_lost plain gp_preferenze
 ledger_lost plain gp_preferenze_falsi
 ledger_lost plain gp_secondo_sintomo
 ledger_lost plain gp_stesso_sintomo
+ledger_lost plain ospedale_annullo_dal_centro
 ledger_lost plain ospedale_benvenuto_proattivo
 ledger_lost plain ospedale_hold_scaduto
 ledger_lost plain p1_ricetta_scaduta
+ledger_lost plain p1_rinnovo_prenota
+ledger_lost plain p1_rinnovo_prenota_cittadino
 ledger_lost plain welcome_lang_en_partner
 ledger_lost turns booking_agenda_muta
+ledger_lost turns booking_giorni_insieme
+ledger_lost turns booking_giorno_rifiutato
 ledger_lost turns booking_lingua_rara_riavvio
 ledger_lost turns booking_mach21_ondate
+ledger_lost turns booking_relay_timeout
 ledger_lost turns booking_rifiuto_giorno
 ledger_lost turns booking_rifiuto_subito
+ledger_lost turns booking_scelta_tardiva
 ledger_lost turns booking_world_in_cache
+ledger_lost turns checkin_conferma_prosa
 ledger_lost turns consultorio_alternativa_offerta
 ledger_lost turns consultorio_checkin_rifiutato_push
 ledger_lost turns cross_asst_push_reale
@@ -114,9 +128,12 @@ ledger_lost turns gp_preferenze
 ledger_lost turns gp_preferenze_falsi
 ledger_lost turns gp_secondo_sintomo
 ledger_lost turns gp_stesso_sintomo
+ledger_lost turns ospedale_annullo_dal_centro
 ledger_lost turns ospedale_benvenuto_proattivo
 ledger_lost turns ospedale_hold_scaduto
 ledger_lost turns p1_ricetta_scaduta
+ledger_lost turns p1_rinnovo_prenota
+ledger_lost turns p1_rinnovo_prenota_cittadino
 ledger_lost turns specialista_checkin_rifiutato_push
 ledger_lost turns welcome_lang_en_partner
 ledger_reorder turns booking_lingua_rara
@@ -184,11 +201,14 @@ restart plain booking_slot_scarsi_ring
 restart plain cross_asst_rinfresco_raro
 restart plain ospedale_commit_unico
 restart plain specialista_slot_conteso
+restart turns booking_letture_rare
 restart turns booking_world_in_cache
 restart turns cross_asst_rinfresco_raro
 restart turns specialista_slot_conteso
 say_timeout plain booking_ricetta_riscritta
 say_timeout plain consultorio_non_mi_va_bene
+say_timeout plain gp_rinnovo_riscritto
+say_timeout plain ricevuta_slot_specialista
 say_timeout turns booking_ricetta_riscritta
 say_tnv plain booking_redirect_pagina_due
 say_tnv plain booking_ricetta_muta
