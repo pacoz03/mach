@@ -920,6 +920,7 @@ async def _advance_alone(
     days = preferences.get("days", set())
     en = preferences.get("lang", _lang(chat)) == "en"
     alternative_days: set[str] = set()
+    family_alternative = None
     while True:
         available = fitting(
             [line for line in world.splitlines() if "slot_id=" in line],
@@ -929,7 +930,13 @@ async def _advance_alone(
             gender=preferences.get("gender", _gender(chat)),
             procedure=procedure,
         )
-        available = [slot for slot in available if slot.get("slot_id") not in taken]
+        if fixed == "CONS-GIN" and family_alternative is None:
+            candidates = fitting([line for line in world.splitlines() if "slot_id=" in line],
+                                 now=now, priority=priority, lang="it", procedure=procedure)
+            family_alternative = next((slot for slot in candidates if slot.get("slot_id") not in taken
+                                       and slot.get("doctor_id", "").rsplit("-", 1)[-1] in _DOCTORS), None)
+        available = [slot for slot in available if slot.get("slot_id") not in taken
+                     and (fixed != "CONS-GIN" or slot.get("doctor_id", "").rsplit("-", 1)[-1] in _DOCTORS)]
         chosen = [slot for slot in available if not days or slot.get("day") in days][:3]
         if days:
             alternative_days.update(slot["day"] for slot in available
@@ -987,6 +994,16 @@ async def _advance_alone(
                 f"{options}. Uno di questi giorni potrebbe andar bene?"
             )
             await _say(city, citizen, "data.request purpose=booking fields=days " + note)
+        elif fixed == "CONS-GIN" and family_alternative:
+            spec = _DOCTORS[family_alternative["doctor_id"].rsplit("-", 1)[-1]]
+            lang = preferences.get("lang", "it")
+            lang = lang if lang in spec[0] else "it"
+            day = family_alternative.get("day", "")
+            note = (f"No slot meets all your requirements. An alternative is available: language {lang}, "
+                    f"doctor gender {spec[1]}, day {day}. May I search with these criteria? I have not booked anything."
+                    if en else f"Nessun posto rispetta tutti i vincoli. Posso cercare con lingua {lang}, "
+                    f"medico {'donna' if spec[1] == 'f' else 'uomo'}, giorno {day}? Non ho prenotato nulla.")
+            await _say(city, citizen, f"data.request purpose=alternative fields=accept lang={lang} gender={spec[1]} days={day} {note}")
         else:
             await _say(city, citizen, _NO_SLOTS_EN if en else _NO_SLOTS)
 
@@ -1156,16 +1173,33 @@ def _family_days(text: str) -> set[str]:
 
 def _family_preferences(chat: list[Message], citizen: str) -> dict:
     preferences = {}
+    alternative = {}
     for row in chat:
+        if row.recipient == citizen and first_word(row.text) == "data.request" and fields_of(row.text).get("purpose") == "alternative":
+            alternative = fields_of(row.text)
+            continue
         if row.sender != citizen:
             continue
         data = _fields(row)
         provided = row.body.get("provided")
         if isinstance(provided, dict):
             for field in ("days", "day", "lang", "gender", "gender_preference"):
-                if isinstance(value := provided.get(field), str):
+                value = provided.get(field)
+                if isinstance(value, list) and field == "days":
+                    value = "/".join(str(v) for v in value)
+                if isinstance(value, str):
                     data.setdefault(field, value)
         plain = _family_plain(row.text)
+        if alternative:
+            if _FAMILY_YES.search(plain) and not _FAMILY_NO.search(plain):
+                for key in ("lang", "gender", "days"):
+                    if key in alternative:
+                        preferences[key] = set(alternative[key].split("/")) if key == "days" else alternative[key]
+            alternative = {}
+        if re.search(r"qualsiasi giorno|tutti i giorni|any day|no day preference", plain):
+            preferences.pop("days", None)
+        if re.search(r"nessuna preferenza.*(?:genere|medico)|any gender|no gender preference", plain):
+            preferences.pop("gender", None)
         wanted, excluded = set(), set()
         for day, names in _FAMILY_DAYS.items():
             for match in re.finditer(rf"\b(?:{names})\b", plain):
@@ -1331,6 +1365,14 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     if waiting_for_days or last_act in {"cancel", "booking.receipt", "checkin"}:
         offers = []
     en = _family_preferences(chat, citizen).get("lang") == "en"
+
+    if own and first_word(own[-1].text) == "data.request" and fields_of(own[-1].text).get("purpose") == "alternative":
+        if _FAMILY_YES.search(plain) and not _FAMILY_NO.search(plain):
+            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+        else:
+            await _say(city, citizen, "I have not booked anything. Tell me which criteria you would change."
+                       if en else "Non ho prenotato nulla. Mi dica quali vincoli sarebbe disponibile a cambiare.")
+        return
 
     waiting_for_code = bool(own and first_word(own[-1].text) == "data.request"
                             and fields_of(own[-1].text).get("purpose") == "checkin")
@@ -1717,6 +1759,16 @@ async def _cross_asst(
                     break
                 lines = [line for line in world.splitlines() if "slot_id=" in line]
                 found = fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
+                if procedures == ("CONS-GIN",):
+                    wanted_days = set(re.split(r"[/,]", fields.get("days", ""))) - {""}
+                    found = [slot for slot in found
+                             if (spec := _DOCTORS.get(slot.get("doctor_id", "").rsplit("-", 1)[-1]))
+                             and fields.get("lang", "it") in spec[0]
+                             and (not fields.get("gender_preference") or fields["gender_preference"] == spec[1])
+                             and (not wanted_days or slot.get("day") in wanted_days)]
+                    if not found and page < min(_page(world)[1], _MAX_PAGE) and time.monotonic() < deadline:
+                        page += 1
+                        continue
                 if not rich:
                     break
                 # ponytail: read as priority P, so a U request's relaxed slots skip the U reserve.
