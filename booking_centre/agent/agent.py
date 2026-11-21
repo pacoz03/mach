@@ -93,6 +93,11 @@ _PHRASES: dict[str, dict[str, str]] = {
         "verified": "Ho verificato la sua ricetta: {what}.",
         "booked": "Riepilogo: {what}.",
         "more": "Posso aiutarla in altro?",
+        "bring": (
+            "Per il giorno della visita: porti con sé la ricetta e la tessera sanitaria e arrivi "
+            "qualche minuto prima. Se deve spostarla o annullarla, mi scriva qui e la riorganizzo io."
+        ),
+        "wheelchair": "La struttura è accessibile in sedia a rotelle.",
         "pending": "Sto completando la sua prenotazione con la struttura: le mando la ricevuta tra un istante.",
         "welcome": "Prego, è stato un piacere. La prenotazione resta confermata: per qualsiasi altra cosa sono qui.",
         "dropped": "Va bene, tolgo quell'opzione: le altre restano valide. Quale preferisce?",
@@ -177,6 +182,11 @@ _PHRASES: dict[str, dict[str, str]] = {
         "verified": "I have checked your prescription: {what}.",
         "booked": "Summary: {what}.",
         "more": "Can I help you with anything else?",
+        "bring": (
+            "For the day of the visit: bring your prescription and your health card, and arrive a "
+            "few minutes early. If you need to move or cancel it, write to me here and I will rearrange it."
+        ),
+        "wheelchair": "The facility is wheelchair accessible.",
         "pending": "I am completing your booking with the facility: your receipt will follow in a moment.",
         "welcome": "You are welcome. Your booking stays confirmed: I am here if you need anything else.",
         "dropped": "All right, I am dropping that option: the others are still valid. Which one do you prefer?",
@@ -604,6 +614,7 @@ async def _advance_alone(
         return
     # After the citizen turned an offer down, the new ones come with a word about it.
     opening = "offers_again" if replacing and message.sender.startswith("citizen:") else "offers"
+    ring = False  # the partners were asked in this turn
     while True:
         lines = [line for line in world.splitlines() if "slot_id=" in line]
         fit = [
@@ -618,7 +629,7 @@ async def _advance_alone(
         if chosen:
             preferred = [slot for slot in chosen if _preferred(slot, _lang(chat), gender, days)]
             if preferred or not (days or gender):
-                picked = (preferred or chosen)[:_MAX_OFFERS]
+                picked = _spread(preferred or chosen, _MAX_OFFERS)
                 await _offer(city, citizen, picked, number, priority, sent, replacing, chat, opening)
                 return
             fallback.extend(chosen[:_MAX_OFFERS - len(fallback)])
@@ -630,6 +641,14 @@ async def _advance_alone(
         page, pages = _page(world)
         if page >= pages or page >= _MAX_PAGE:
             break
+        if not ring and not chosen and not fallback and _past_window(lines, now, priority):
+            # The agenda is in date order: this page already reaches past the deadline, so no
+            # later page holds a slot in time. The ring now, not after minutes of paging
+            # (journey 0164: 2'43" before the partners were asked). The pages that follow
+            # only serve the relaxed alternative.
+            ring = True
+            if await _try_partners(*cross):
+                return
         if not _asked(recent, agent, procedure, page + 1):
             if not await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}"):
                 return
@@ -650,7 +669,7 @@ async def _advance_alone(
         return
     # S is empty on every page: a partner ASST first (the ring), then a relaxed alternative
     # (past the priority deadline), else the waiting list. Never silence.
-    if await _try_partners(*cross):
+    if not ring and await _try_partners(*cross):
         return
     late = any(
         row.sender.startswith("citizen:") and "cancel" in words(row.text)
@@ -866,6 +885,9 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     if when:
         what = _PROCEDURES.get(booked.get("procedure", ""), {}).get(_lang(chat) if _lang(chat) == "en" else "it")
         tail.append(phrases["booked"].format(what=f"{what}, {when}" if what else when))
+    tail.append(phrases["bring"])
+    if message.sender in _WHEELCHAIR:
+        tail.append(phrases["wheelchair"])
     tail.append(phrases["more"])
     await _say(
         city,
@@ -914,6 +936,8 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
 # Our own facilities, from the registry (team/world). Anyone else that answers a search is a
 # partner ASST's facility.
 _OUR_FACILITIES = frozenset({"agent:m6py14a1ej77", "agent:h6krzxx6es83", "agent:yg8debxe3x0p"})
+# From the registry (team/world): our hospital is wheelchair accessible. Said only for it.
+_WHEELCHAIR = frozenset({"agent:m6py14a1ej77"})
 _SERVICES = {
     "VIS-FIS": "hospital.physiatry",
     "VIS-CARD": "specialist_care.cardiology",
@@ -1133,12 +1157,12 @@ async def _ask_partners(
         # The ASST whose doctor speaks the citizen's rare language first, then the Index's best,
         # then the published ones the Index did not return. The language itself is never sent.
         first = [agent_id for agent_id, rare in known.items() if rare and rare == lang]
-        limit = _MAX_PARTNERS
+        # Every published partner is asked: at level 4 the valid slots are in one or few ASSTs
+        # (journeys 0134, 0164: English speakers, three partners asked, none had room).
+        limit = max(_MAX_PARTNERS, len(known))
         if not first and lang not in ("it", "en"):
-            # Nobody published this language: the ASSTs that published none come first, and
-            # every published partner is asked, since any of them may have that doctor.
+            # Nobody published this language: the ASSTs that published none come first.
             first = [agent_id for agent_id, rare in known.items() if not rare]
-            limit = len(known)
         partners = list(dict.fromkeys([*first, *found, *known]))
         request = "x-" + hashlib.sha256(f"{agent}/{key}".encode()).hexdigest()[:12]
         text = f"need.request service_type={service} procedure={procedure}"
@@ -1202,7 +1226,7 @@ async def _try_partners(
     slots = _partner_fit(chat, city.agent_id, pick, taken, refused_doctors)
     if not slots:
         return False
-    await _offer(city, citizen, slots[:_MAX_OFFERS], number, priority, sent, replacing, chat, "partner_offers")
+    await _offer(city, citizen, _spread(slots, _MAX_OFFERS), number, priority, sent, replacing, chat, "partner_offers")
     return True
 
 
@@ -1392,6 +1416,35 @@ def _speaks(doctor_id: str, lang: str) -> bool:
     if lang in spec[0]:
         return True
     return "*" in spec[0] and lang == _RARE_LANG
+
+
+def _spread(slots: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+    """Up to ``limit`` slots, one per doctor first and then one per day, in the order given.
+    The citizen picks, among our offers, the one that meets what they did not tell us (gender,
+    days): three slots of one doctor on one morning leave them no choice (six journeys booked
+    in S but outside S_pref)."""
+
+    picked: list[dict[str, str]] = []
+    for key in ("doctor_id", "day", ""):
+        seen = {slot.get(key) for slot in picked} if key else set()
+        for slot in slots:
+            if len(picked) >= limit:
+                return picked
+            if slot in picked or (key and slot.get(key) in seen):
+                continue
+            picked.append(slot)
+            seen.add(slot.get(key))
+    return picked
+
+
+def _past_window(lines: list[str], now: datetime, priority: str | None) -> bool:
+    """Whether this agenda page reaches past the priority deadline (B and D only)."""
+
+    days = _DEADLINE_DAYS.get(priority or "")
+    if not days:
+        return False
+    horizon = now + timedelta(days=days)
+    return any((at := _when(_slot(line).get("at", ""))) is not None and at >= horizon for line in lines)
 
 
 def _preferred(slot: dict[str, str], lang: str, gender: str | None, days: frozenset[str]) -> bool:
