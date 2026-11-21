@@ -9,6 +9,7 @@
 # 2026-11-21 finestra del richiedente (MACH-1.3) e check-in dell'ospedale senza messaggio d'attesa: 170 (0 risolte; 24 nuove: 20 «hospital muto dopo checkin» sotto ledger_lost in scenari esistenti, costo voluto: col checked_in perso il cittadino non riceve niente, regola del kit «prima il Ledger»; 2 in consultorio_checkin_lento, gemelle di consultorio_senza_ricetta sotto ledger_late/clock_lost; 2 say_tnv in cross_asst_finestra e specialista_finestra, gemelle di cross_asst_distribuite e cardiologia_referto)
 # 2026-11-21 giro dei partner nel booking: 173 (1 risolta, say_tnv turns gp_nessun_posto, due giri su due; 4 nuove in booking_partner_dopo_intoppo: redeliver gemelle di ospedale_slot_rubato (l'ospedale ripete l'hold); two_pods: due pod leggono la history prima dell'offerta dell'altro e mandano due volte la stessa offerta del partner (_sent per pod), in città il booking ha un solo pod)
 # 2026-11-21 lingue rare (giro dei partner nello stesso turno anche a pod appena riavviato, risposte dei giri vecchi, niente offerta doppia): 188 (0 risolte; 15 nuove, tutte nei 2 scenari aggiunti booking_lingua_rara*: con redeliver, ledger_late, ledger_reorder e hostile il need.request ai partner parte lo stesso ma in un altro turno, e lo scenario controlla il turno esatto; two_pods: offerta doppia tra due pod (_sent per pod), in città un solo pod; ledger_lost: «hospital muto dopo checkin», gemella delle 20 della riga sopra; hostile plain riavvio: il testo ostile prende il posto del lang=sw)
+# 2026-11-21 scadenze feriali, slot condivisi dopo i partner, un confirm per slot: 194 (0 risolte; 6 nuove, tutte negli scenari aggiunti booking_slot_scarsi*, booking_confirm_doppio, solo con restart e two_pods: claim e _sent vivono nella memoria del pod, quindi un pod riavviato o un secondo pod non vede l'offerta o il confirm dell'altro caso; in città il booking ha un solo pod)
 clock_lost plain consultorio_alternativa_offerta
 clock_lost plain consultorio_annullata
 clock_lost plain consultorio_senza_ricetta
@@ -139,6 +140,8 @@ redeliver turns ospedale_slot_rubato
 redeliver turns p1_rinnovo_prenota
 redeliver turns p1_rinnovo_prenota_cittadino
 restart plain booking_letture_rare
+restart plain booking_slot_scarsi
+restart plain booking_slot_scarsi_ring
 restart plain cross_asst_rinfresco_raro
 restart plain ospedale_commit_unico
 restart turns booking_world_in_cache
@@ -181,14 +184,18 @@ say_tnv turns p1_rinnovo_prenota_cittadino
 say_tnv turns ricevuta_slot_specialista
 say_tnv turns specialista_annullata
 say_tnv turns specialista_finestra
+two_pods plain booking_confirm_doppio
 two_pods plain booking_letture_rare
 two_pods plain booking_partner_dopo_intoppo
 two_pods plain booking_slot_condivisi
 two_pods plain booking_slot_raffica
+two_pods plain booking_slot_scarsi
+two_pods plain booking_slot_scarsi_ring
 two_pods plain cross_asst_orologio_memoria
 two_pods plain cross_asst_rinfresco_raro
 two_pods plain ospedale_alternative
 two_pods plain ospedale_commit_unico
+two_pods turns booking_confirm_doppio
 two_pods turns booking_letture_rare
 two_pods turns booking_lingua_rara
 two_pods turns booking_lingua_rara_riavvio
