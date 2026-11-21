@@ -1718,7 +1718,9 @@ _CARDIOLOGY = ("VIS-CARD", _CONTROL)
 async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
     head = first_word(message.text)
     kind = words(message.text)
-    confirm = "confirm" in kind or message.type == "confirm"
+    # A booking party calls off one of our slots for the citizen (R:195): never a confirm.
+    release = message.sender.startswith("agent:") and (head == "cancel" or message.type == "cancel")
+    confirm = not release and ("confirm" in kind or message.type == "confirm")
     from_citizen = message.sender.startswith("citizen:")
     if from_citizen and not {"offer_id", "slot_id"} & _fields(message).keys():
         confirm = False  # "I'm here to confirm my appointment" is prose, not a booking confirm
@@ -1766,12 +1768,20 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
             except CapError:
                 pass
             if message.sender == LEDGER and (
-                head in {"cancelled", "cancel"}
+                head in {"cancelled", "cancel", "expired"}
                 or head == "refused" and bool({"commit", "op=commit"} & kind)
             ):
-                # The Ledger dropped our booking, or refused a commit after the confirm turn
-                # stopped waiting: whoever asked hears it once.
-                await _on_refused(city, message, chat, hold_self=False)
+                # The Ledger dropped our booking or let the hold expire, or refused a commit
+                # after the confirm turn stopped waiting: whoever asked hears it once. Not the
+                # answer to our own release: the booking party asked for that one.
+                if not _released(chat, city.agent_id, message):
+                    row = message
+                    if head == "expired" and not {"code", "reason"} & fields_of(message.text).keys():
+                        # ponytail: no expired row in the kit or live yet; its code goes on if any.
+                        row = replace(message, body={**message.body, "text": f"{message.text} reason=expired"})
+                    await _on_refused(city, row, chat, hold_self=False)
+            elif release:
+                await _release(city, message, chat)
             else:
                 booking = _facility(city, message, chat, reports=False, hold_self=False)
                 if confirm and message.sender != LEDGER:
@@ -2284,6 +2294,102 @@ def _drops_hold(row: Message) -> bool:
     )
 
 
+def _slot_of(chat: list[Message], agent: str, row: Message) -> str:
+    """The slot a refused/cancelled/expired Ledger row is about. Hospital: its ``slot_id=``, its
+    ``hold_id=``/``booking_id=`` through our rows, or ``detail=`` when that is a slot we held
+    (live: ``refused op=hold code=NO_CAPACITY detail=<slot_id>``; EXPIRED says ``detail=slot``).
+    Else, and always outside the hospital, the slot of our latest hold in the case."""
+
+    held = [
+        fields_of(r.text).get("slot_id", "")
+        for r in chat
+        if r.sender == agent and r.recipient == LEDGER and "hold" in words(r.text)
+    ]
+    if _HOSPITAL.get():
+        fields = fields_of(row.text)
+        ref = fields.get("hold_id") or fields.get("booking_id")
+        slot = fields.get("slot_id") or (_hold_slot(chat, agent, ref) if ref else "")
+        if not slot and fields.get("detail") in held:
+            slot = fields["detail"]
+        if slot:
+            return slot
+    return next((slot for slot in reversed(held) if slot), "")
+
+
+def _released(chat: list[Message], agent: str, row: Message) -> bool:
+    """A Ledger row answering our own ``cancel hold_id=`` (_release). ponytail: matched by its
+    hold_id/booking_id only; a cancelled row naming neither is passed on as the Ledger's own."""
+
+    fields = fields_of(row.text)
+    ref = fields.get("hold_id") or fields.get("booking_id", "")
+    return bool(ref) and _we(chat, agent, f"hold_id={ref}", to=LEDGER, word="cancel")
+
+
+async def _release(city: City, message: Message, chat: list[Message]) -> None:
+    """A booking party calls off our slot for the citizen, naming ``offer_id=``, ``slot_id=`` or
+    ``booking_id=``. Held or booked by us: ``cancel hold_id=`` on the Ledger once (no retry),
+    then ``cancelled`` to the sender. Never ``cancel`` back: a booking centre reads that as the
+    facility cancelling and offers again. A slot we do not hold: we say so."""
+
+    agent, sender = city.agent_id, message.sender
+    fields = _fields(message)
+    offer_id = fields.get("offer_id", "")
+    ref = fields.get("booking_id") or fields.get("hold_id")
+    slot = fields.get("slot_id") or (_hold_slot(chat, agent, ref) if ref else "")
+    for row in chat if offer_id and not slot else ():
+        for line in row.text.splitlines():
+            if f"offer_id={offer_id}" in line.split():
+                slot = fields_of(line).get("slot_id", slot)
+    held = _latest(chat, "held", f"slot_id={slot}") if slot else None
+    hold_id = fields_of(held.text).get("hold_id", "") if held else ""
+    token = f"hold_id={hold_id}"
+    ids = " ".join(f"{k}={v}" for k, v in (("offer_id", offer_id), ("slot_id", slot)) if v)
+    asked = bool(hold_id) and _we(chat, agent, token, to=LEDGER, word="cancel")
+    since = _since_hold(chat, agent, slot) if slot else None
+    if not asked and (not hold_id or since is None or any(_drops_hold(row) for row in since)):
+        if not _answered(chat, agent, message.msg_id, sender):
+            await _say(
+                city,
+                sender,
+                # Also a partner's "cancel reason=not_chosen" for an offer we never held (live).
+                f"{ids} Preso nota. Non risulta un posto trattenuto o prenotato da noi per questa "
+                "richiesta: non c'è nulla da annullare.".strip(),
+            )
+        return
+    if not asked and not await _say(city, LEDGER, f"cancel {token}"):
+        return
+
+    def answer(rows: list[Message]) -> Message | None:
+        """The Ledger's first row after our ``cancel``: cancelled, or its refusal."""
+
+        start = next(
+            (i for i, r in enumerate(rows) if r.sender == agent and r.recipient == LEDGER
+             and first_word(r.text) == "cancel" and token in r.text.split()),
+            None,
+        )
+        return None if start is None else next(
+            (r for r in rows[start + 1:] if r.sender == LEDGER and (
+                first_word(r.text) in {"cancelled", "cancel"}
+                or first_word(r.text) == "refused" and bool({"cancel", "op=cancel"} & words(r.text))
+            )),
+            None,
+        )
+
+    fresh = await _until(city, message.need_id, chat, lambda rows: answer(rows) is not None)
+    if _answered(fresh, agent, message.msg_id, sender):
+        return
+    reply = answer(fresh)
+    if reply is None:
+        text = (f"{ids} {token} Ho chiesto al registro di liberare il posto: la conferma non è "
+                "ancora arrivata.")
+    elif first_word(reply.text) == "refused":
+        code = fields_of(reply.text).get("code") or "refused"
+        text = f"{ids} {token} reason={code} Il registro non ha annullato il posto."
+    else:
+        text = f"cancelled {ids} {token} Posto liberato sul registro, come richiesto."
+    await _say(city, sender, text)
+
+
 def _slot_facts(chat: list[Message], agent: str, slot: str) -> dict[str, str]:
     """What the Ledger or we wrote about ``slot`` (``at``, ``procedure``...). Never a citizen's
     or another agent's word: a time we tell the citizen must be a fact."""
@@ -2345,7 +2451,8 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
             for booking, entry in _bookings(chat, agent).items()
             if _holder(chat, agent, entry["slot"]) in ("", citizen)
         ]
-        booking_id = ours[0] if len(ours) == 1 else ""
+        live = [booking for booking in ours if not _cancelled(chat, booking)]
+        booking_id = live[0] if len(live) == 1 else ours[0] if len(ours) == 1 else ""
     if not booking_id:
         if not _answered(chat, agent, message.msg_id, citizen):
             await _say(
@@ -2362,6 +2469,28 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
                     "lo può scrivere? Penso subito io al resto."
                 ),
             )
+        return
+    if _cancelled(chat, booking_id):
+        # The Ledger cancelled it: never a checkin for it. Say so, and name the booking of ours
+        # that stands, if there is exactly one (a re-booking in the same case).
+        if not _answered(chat, agent, message.msg_id, citizen):
+            other = [
+                booking for booking, entry in _bookings(chat, agent).items()
+                if not _cancelled(chat, booking) and _holder(chat, agent, entry["slot"]) in ("", citizen)
+            ]
+            if en:
+                note = (f"I'm sorry, booking {booking_id} has been cancelled, so I cannot register "
+                        "your arrival with it. ")
+                note += (f"Your booking {other[0]} is confirmed: send me that code and I will "
+                         "register your arrival straight away." if len(other) == 1
+                         else "The booking centre can find you a new date straight away.")
+            else:
+                note = (f"Mi dispiace, la prenotazione {booking_id} risulta annullata, quindi non "
+                        "posso registrare l'arrivo con questo codice. ")
+                note += (f"Risulta invece confermata la prenotazione {other[0]}: mi scriva quel "
+                         "codice e registro subito il suo arrivo." if len(other) == 1
+                         else "Il centro prenotazioni può trovarle subito una nuova data.")
+            await _say(city, citizen, f"booking_id={booking_id} reason=cancelled {note}")
         return
     token = f"booking_id={booking_id}"
     state = _checkin_state(chat, agent, token)
@@ -2884,10 +3013,7 @@ async def _on_refused(
     city: City, message: Message, chat: list[Message], *, hold_self: bool
 ) -> None:
     agent = city.agent_id
-    slot = ""
-    for row in chat:
-        if row.sender == agent and row.recipient == LEDGER and "hold" in words(row.text):
-            slot = fields_of(row.text).get("slot_id", slot)
+    slot = _slot_of(chat, agent, message)
     if not slot:
         return
     target, _, _ = _booking_of(chat, agent, slot)

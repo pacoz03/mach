@@ -47,6 +47,9 @@ REPLY = {
     "committed": "committed booking_id={hold_id} ledger_ref={ledger_ref} slot_id={slot_id} "
     "receipt=sig-{ledger_ref}",
     "cancelled": "cancelled hold_id={hold_id} slot_id={slot_id}",
+    # Nessun `expired` nel kit (LocalLedger non lo ha) né in episodes al 21/11: forma ipotetica,
+    # la stessa di cancelled.
+    "expired": "expired hold_id={hold_id} slot_id={slot_id}",
     "checked_in": "checked_in booking_id={booking_id} citizen={citizen} slot_id={slot_id}",
     "reported": "reported booking_id={booking_id} outcome_code={outcome_code} shared={shared}",
     "refused": "refused {op} code={code}",  # + i token identificativi della richiesta
@@ -162,6 +165,7 @@ class Ledger:
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
         self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
+        self.push_expired = sc.get("push_expired", 0)  # commit che arrivano a hold già scaduto
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -184,7 +188,7 @@ class Ledger:
     def taken(self, slot_id: str) -> bool:
         if datetime.fromisoformat(self.slots[slot_id]["at"]) < self.full:
             return True
-        return any(h["slot_id"] == slot_id and h["state"] != "cancelled" for h in self.holds.values())
+        return any(h["slot_id"] == slot_id and h["state"] not in ("cancelled", "expired") for h in self.holds.values())
 
     def answer(self, by: str, need: str | None, text: str, i: int) -> str:
         op = (text.split() or [""])[0]
@@ -193,7 +197,7 @@ class Ledger:
             return self.read(op, f)
         code, reply, injected = self.write(op, by, need, f)
         self.writes.append(dict(i=i, by=self.folder.get(by, by), op=op, f=f, code=code, injected=injected))
-        if code is None:
+        if code is None or reply:  # reply con un codice: il Ledger risponde altro (push_expired)
             return reply
         ids = [f"{k}={f[k]}" for k in ("prescription_number", "slot_id", "hold_id", "booking_id") if k in f]
         return " ".join([REPLY["refused"].format(op=op, code=code), *ids])
@@ -228,6 +232,10 @@ class Ledger:
             self.holds[hid] = dict(f, hold_id=hid, need_id=need, state="held")
             return None, REPLY["held"].format(**self.holds[hid]), False
         h = self.holds.get(f.get("hold_id") or f.get("booking_id", ""))
+        if op == "commit" and self.push_expired and h is not None and h["state"] == "held":
+            self.push_expired -= 1  # l'hold scade prima del commit: push `expired` (R:682)
+            h["state"] = "expired"
+            return "EXPIRED", REPLY["expired"].format(**h), True
         if op == "commit":
             if h is not None and h["state"] == "committed":  # come il Ledger vero (episodes)
                 return "DUPLICATE", "", False
@@ -360,7 +368,9 @@ class Port:
         m = b.add(self.me, to, body, need_id, conversation_id)
         if to == LEDGER:  # la risposta è subito nel log: il polling nel turno la vede
             text = b.ledger.answer(self.me, need_id, m.text, len(b.log) - 1)
-            if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città; il bus la aspetta
+            if text.startswith("expired "):  # un push: apre sempre un turno suo, mai una risposta
+                b.queue.append(b.add(LEDGER, self.me, {"text": text}, need_id, conversation_id))
+            elif delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città; il bus la aspetta
                 b.tasks.append(asyncio.create_task(b.later(delay, self.me, text, need_id, conversation_id)))
             else:
                 r = b.reply(self.me, text, need_id, conversation_id)
@@ -412,7 +422,7 @@ class Citizen:
 
     def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
         """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
-        if self.sc.get("ledger_cancel"):  # la città annulla prima della visita (Bus.run)
+        if self.sc.get("ledger_cancel") or self.sc.get("booking_cancel"):  # annullata prima della visita (Bus.run)
             return
         text = f"checkin booking_id={booking_id} ledger_ref={ledger_ref}"
         mode = self.sc.get("checkin", "testo")
@@ -567,14 +577,27 @@ class Bus:
         # domande, un secondo disturbo, un rinnovo chiesto a parole).
         # sc["foreign_after"]: altre richieste del centro dell'altra ASST all'ospedale.
         # sc["ledger_cancel"]: a prenotazione fatta il Ledger la annulla, poi il cittadino chiede l'orario.
-        cancel = (("ledger", self.citizen.sc["ledger_cancel"]), ("hospital", ORARIO)) if "ledger_cancel" in self.citizen.sc else ()
+        # sc["after_cancel"]: cosa il cittadino scrive all'ospedale dopo l'annullo (default ORARIO);
+        # {hold_id}/{ledger_ref} sono quelli della prenotazione annullata.
+        # sc["booking_cancel"]: a prenotazione fatta il centro annulla la visita per il cittadino.
+        sc = self.citizen.sc
+        cancel = (("ledger", sc["ledger_cancel"]), ("hospital", sc.get("after_cancel", ORARIO))) if "ledger_cancel" in sc else ()
+        cancel += (("booking", sc["booking_cancel"]),) if "booking_cancel" in sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
                          *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ())), *cancel):
             if to == "ledger":
-                h = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
+                h = self.dropped = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
                 h["state"] = "cancelled"
                 self.queue.append(self.add(LEDGER, self.ids["hospital"], {"text": REPLY["cancelled"].format(**h)
                                            + f" booking_id={h['hold_id']} reason={text}"}))
+            elif to == "booking":  # l'offer_id del confirm del centro, come lo nomina un centro vero
+                bc, hosp = self.ids["booking_centre"], self.ids["hospital"]
+                h = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
+                offer = next(fields(m.text)["offer_id"] for m in self.log if m.sender == bc and m.recipient == hosp
+                             and m.text.startswith("confirm") and f"slot_id={h['slot_id']}" in m.text.split())
+                self.queue.append(self.add(bc, hosp, {"text": f"cancel offer_id={offer} reason={text}"}))
+            elif to == "hospital" and "{hold_id}" in text:
+                self.citizen.say(self.ids[to], text.format(**self.dropped))
             elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
                 text, need = text if isinstance(text, tuple) else (text, NEED)  # (testo, need_id): altro caso
                 if self.citizen.sc.get("gap") and (to, text) != start:  # sc["gap"]: secondi tra le richieste
@@ -1365,6 +1388,46 @@ SCENARIOS.update({
     # Solo con --ledger-turns: senza push di held e committed nessuno finirebbe la prenotazione.
     "ospedale_scritture_lente": dict(start=BACK, slow_writes=25.0, pull_pause=0.5, ledger_turns=True,
                                      expect=[slow_booking, hospital_commits(1), wrote("checkin", "R:234")]),
+})
+
+
+# --- F: hold scaduto, check-in con codice annullato, annullo chiesto dal centro prenotazioni
+
+
+def released_once(b: Bus) -> str | None:
+    """Il centro annulla per il cittadino: un solo `cancel hold_id=` dell'ospedale sul Ledger,
+    poi `cancelled` al centro (prima il Ledger). Mai `cancel` al centro: gli farebbe riofferire."""
+    hosp, bc = b.ids["hospital"], b.ids["booking_centre"]
+    sent = [w for w in b.ledger.writes if w["op"] == "cancel" and w["by"] == "hospital"]
+    if len(sent) != 1 or sent[0]["code"] or not sent[0]["f"].get("hold_id"):
+        return f"hospital ha mandato {len(sent)} cancel sul Ledger invece di un `cancel hold_id=` accettato"
+    after = [m for m in b.log[sent[0]["i"] + 1:] if m.sender == hosp and m.recipient == bc]
+    if not any(m.text.startswith("cancelled ") for m in after):
+        return "hospital non ha confermato `cancelled` al centro dopo il Ledger"
+    if any(m.sender == hosp and m.recipient == bc and act(m) == "cancel" for m in b.log):
+        return "hospital ha mandato `cancel` al centro che aveva annullato lui"
+
+
+def checkin_cancelled(b: Bus) -> str | None:
+    """La risposta al check-in con il codice annullato dice che è annullata (non «controlli il codice»)."""
+    hosp = b.ids["hospital"]
+    q = max((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == hosp and m.text.startswith("checkin")), default=None)
+    reply = next((m for m in b.log[q + 1:] if m.sender == hosp and m.recipient == CIT), None) if q is not None else None
+    if reply is None or "annullata" not in reply.text or act(reply) == "checkin":
+        return f"hospital non ha detto che la prenotazione è annullata: «{reply.text[:80] if reply else ''}»"
+
+
+SCENARIOS.update({
+    # Il commit trova l'hold scaduto (push `expired`): cancel reason=expired al centro, una
+    # volta; il centro riofferta e la visita si fa lo stesso (R:682).
+    "ospedale_hold_scaduto": dict(start=BACK, push_expired=1, expect=[
+        cancel_told("booking_centre", "expired", 1), wrote("checkin", "R:682")]),
+    # Check-in con il codice di una prenotazione annullata dal Ledger: lo dice, niente checkin.
+    "ospedale_checkin_annullata": dict(
+        start=BACK, ledger_cancel="facility_closed", after_cancel="checkin booking_id={hold_id} ledger_ref={ledger_ref}",
+        expect=[no_write("checkin", "prenotazione annullata"), checkin_cancelled]),
+    # Il centro annulla per il cittadino: prima il Ledger, poi la conferma al centro.
+    "ospedale_annullo_dal_centro": dict(start=BACK, booking_cancel="citizen_request", expect=[released_once]),
 })
 
 
