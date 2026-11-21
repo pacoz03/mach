@@ -237,37 +237,6 @@ class Prescription:
             )
         return f"{self.head} {text}"
 
-    def holding(self, lang: str, prefs: dict[str, object]) -> str:
-        """To the person while the Ledger writes the prescription (live 21/11: minutes): their
-        reason, what we are doing and what comes next. No number and no act word: the Ledger first.
-        English says "referral": a bare "prescription" is the act word a citizen reads."""
-
-        reason = _REASON[lang].get(_code_of(self))
-        visit = _VISIT[lang].get(self.procedure, self.procedure)
-        noted, missing = _describe(prefs, lang), _missing(prefs, lang)
-        if lang == "en":
-            return (
-                (f"Thank you for telling me about {reason}" if reason else "Thank you for writing")
-                + f": I am taking care of it right away. I am registering your referral for a {visit}, "
-                "which can take a few minutes. As soon as it is confirmed I will send it to you here "
-                "with its number and pass it on to our booking centre, which will contact you to "
-                "arrange the visit: you do not need to repeat anything. "
-                + (f"I have noted your preferences ({noted}) and will pass them on. " if noted else "")
-                + (f"If you have a preference for {missing}, have it ready: the booking centre will "
-                   "ask you. " if missing else "")
-                + "If you feel worse or something new comes up in the meantime, write to me straight away."
-            )
-        return (
-            (f"Grazie per avermi descritto {reason}" if reason else "Grazie per avermi scritto")
-            + f": me ne occupo subito. Sto registrando la sua ricetta per una {visit} e può volerci "
-            "qualche minuto. Appena è confermata gliela mando qui con il numero e la passo al nostro "
-            "centro prenotazioni, che la contatterà per fissare la visita: non deve ripetere nulla. "
-            + (f"Ho preso nota delle sue preferenze ({noted}) e le passerò al centro. " if noted else "")
-            + (f"Se ha preferenze {missing}, le tenga pronte: il centro prenotazioni gliele chiederà. "
-               if missing else "")
-            + "Se nel frattempo si sente peggio o compare qualcosa di nuovo, mi scriva subito."
-        )
-
 
 # The reason in the citizen's own words (the protocol's symptom, never a diagnosis) and the visit.
 _REASON = {
@@ -788,7 +757,7 @@ async def _issue(
     city: City, need_id: str, request: Prescription, extra: str, lang: str,
     prefs: dict[str, object] | None = None,
 ) -> None:
-    """Ledger first: ``prescribe``, then the prescription to the citizen once it is written."""
+    """Ledger first: ``prescribe`` is written, then the citizen and the booking centre hear at once."""
 
     history = await city.history(need_id=need_id)
     asked = _previous_prescription(history, city.agent_id, number=request.number) is None
@@ -804,14 +773,12 @@ async def _issue(
             return
         history = await city.history(need_id=need_id)  # a quick Ledger has already answered
 
-    if await _notify(city, history, request, lang, prefs):
-        return
-    # Live 21/11 the Ledger answered in 4-6 minutes. Its reply opens a turn of its own (main), which
-    # sends the prescription and the handoff; polling here (24 reads, ~6 s) never saw it and left
-    # the citizen without a word. They hear from us now, once: only the turn that wrote prescribe.
-    if asked:
-        prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
-        await _tell(city, request.patient, request.holding(_reply_lang(lang), prefs), history)
+    # Live 21/11 the Ledger answered ``prescribed`` after 6-10 minutes. Waiting for it kept the
+    # booking centre idle for that long in every journey, and a failed journey restarts only ~14
+    # minutes after its verdict. The number is ours and the write is already sent (R:219), so the
+    # turn that wrote it goes on at once: the prescription to the citizen and the handoff. The
+    # Ledger's own turn (main) then finds the message sent, or corrects it on a ``refused``.
+    await _notify(city, history, request, lang, prefs, written=asked)
 
 
 def _previous_prescription(
@@ -841,8 +808,11 @@ async def _notify(
     request: Prescription,
     lang: str | None = None,
     prefs: dict[str, object] | None = None,
+    *,
+    written: bool = False,
 ) -> bool:
-    """``lang``/``prefs``: what this turn read; a Ledger turn has none and reads the case's."""
+    """``lang``/``prefs``: what this turn read; a Ledger turn has none and reads the case's.
+    ``written``: this turn just sent ``prescribe``, so it goes ahead without the Ledger's answer."""
 
     answer = None
     matching_request = False
@@ -868,7 +838,9 @@ async def _notify(
         if words[:1] == ["refused"] and "prescribe" in words and "DUPLICATE" not in row.text:
             answer = LEDGER_REFUSAL
     if answer is None:
-        return False
+        if not written:
+            return False
+        answer = request.head
     if answer == LEDGER_REFUSAL:
         if not _sent(history, city.agent_id, request.patient, answer):
             await city.say(request.patient, answer)
@@ -960,7 +932,7 @@ async def _handoff(
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
             f"procedure={request.procedure} priority={request.priority} lang={lang} notify_if=no_slots "
             + (f"{tokens} " if (tokens := _preference_tokens(prefs)) else "")
-            + "Buongiorno, vi passo la ricetta appena registrata sul Ledger per la prenotazione"
+            + "Buongiorno, vi passo la ricetta che ho appena scritto sul Ledger per la prenotazione"
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
             + "Se non trovate un posto, avvisatemi così posso aiutare la persona a proseguire. Grazie!",
         )

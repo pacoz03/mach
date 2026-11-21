@@ -1762,25 +1762,24 @@ SCENARIOS.update({
 # --- H: gp con il Ledger lento (live 21/11: ricetta dopo 6-10 minuti, cittadino senza notizie)
 
 
-def gp_answers_at_once(within: float, *subs: str):
-    """Il gp risponde al cittadino nel turno del suo messaggio, entro ``within`` s, una volta sola
-    prima della ricetta, senza numero né parola d'atto (prima il Ledger, R:219); ``subs`` nel testo.
-    La ricetta arriva poi con la risposta del Ledger."""
+def gp_prescribes_at_once(within: float, *subs: str):
+    """Il gp manda la ricetta al cittadino nel turno del suo messaggio, entro ``within`` s, dopo
+    aver scritto ``prescribe`` (R:219, lo controlla general) e senza aspettare ``prescribed``; quando
+    il Ledger risponde non la ripete. ``subs`` nel testo."""
     def check(b: Bus) -> str | None:
         gp = b.ids["gp"]
         asked = next(m for m in b.log if m.sender == CIT and m.recipient == gp)
         said = [m for m in b.log if m.sender == gp and m.recipient == CIT]
-        rx = next((i for i, m in enumerate(said) if act(m) == "prescription" and "prescription_number=" in m.text), None)
-        if not said or rx is None:
-            return "il gp non ha mandato la ricetta dopo la risposta lenta del Ledger"
+        if not said or act(said[0]) != "prescription" or "prescription_number=" not in said[0].text:
+            return f"il primo messaggio del gp al cittadino non è la ricetta: «{said[0].text[:80] if said else ''}»"
         first, took = said[0], b.stamp[said[0].msg_id] - b.stamp[asked.msg_id]
         if b.opened.get(b.turn_of[first.msg_id]) is not asked or took >= within:
-            return f"primo messaggio del gp al cittadino dopo {took:.1f} s e non nel turno del suo messaggio (atteso < {within} s)"
-        if rx != 1 or "=" in first.text or act(first) not in ("need.request", "chat"):
-            return f"prima della ricetta {rx} messaggi del gp invece di uno senza token: «{first.text[:80]}»"
+            return f"ricetta al cittadino dopo {took:.1f} s e non nel turno del suo messaggio (atteso < {within} s)"
+        if (n := sum(act(m) == "prescription" for m in said)) != 1:
+            return f"{n} messaggi di ricetta al cittadino invece di uno (ripetuta alla risposta del Ledger?)"
         missing = [s for s in subs if s not in first.text]
         if missing:
-            return f"messaggio d'attesa senza {missing}: «{first.text[:120]}»"
+            return f"ricetta senza {missing}: «{first.text[:120]}»"
     return check
 
 
@@ -1839,13 +1838,14 @@ def answered_fast(seconds: float):
 
 
 SCENARIOS.update({
-    # Il Ledger risponde a prescribe dopo 3 s (città 21/11: minuti). Solo con --ledger-turns: in
-    # città la risposta apre un turno suo, ed è lì che parte la ricetta.
+    # Il Ledger risponde a prescribe dopo 3 s (città 21/11: 6-10 minuti). Il gp non lo aspetta:
+    # ricetta e passaggio al centro partono nel turno che scrive prescribe, così il centro mette
+    # in coda le sue richieste al Ledger subito. Solo con --ledger-turns, come in città.
     "gp_ledger_lento": dict(start=BACK, handoff=True, slow_prescribe=3.0, ledger_turns=True, expect=[
-        gp_answers_at_once(1.5, "mal di schiena", "visita fisiatrica", "centro prenotazioni", "giorni"),
+        gp_prescribes_at_once(1.5, "mal di schiena", "visita fisiatrica", "centro prenotazioni", "giorni"),
         gp_prescription(), writes("prescribe", 1, "una sola ricetta"), handed_over, wrote("commit", "R:241")]),
     "gp_ledger_lento_en": dict(start=("gp", PREF_EN), handoff=True, slow_prescribe=3.0, ledger_turns=True, expect=[
-        gp_answers_at_once(1.5, "back pain", "physiatry visit", "booking centre", "Monday"),
+        gp_prescribes_at_once(1.5, "back pain", "physiatry visit", "booking centre", "Monday"),
         gp_prescription(), handoff_tokens("lang=en", "doctor_lang=en", "days=mon"), handed_over]),
     # 1. La lettura di agenda arriva vecchia di 4 minuti reali (4 ore di agenda): il Ledger è a
     # lunedì 12:00, la risposta dice 08:00. Le 10:00 di lunedì sono già passate.
