@@ -376,21 +376,33 @@ def _exact(chat: list[Message], agent: str, text: str) -> bool:
 # specialist and the consultorio as they were. ponytail: a ContextVar, not a flag threaded
 # through six shared signatures.
 _HOSPITAL: ContextVar[bool] = ContextVar("hospital", default=False)
-# Hospital: (to, text) the Relay refused with TARGET_NOT_VISIBLE. A later turn (the held or
-# committed push) must not send the same message again (R:701). ponytail: grows by bounced
-# messages only, never trimmed.
-_BOUNCED: set[tuple[str, str]] = set()
+# Hospital: (need_id, to, text) -> time.monotonic() of a TARGET_NOT_VISIBLE. The held or committed
+# push turns of the same case must not send the same message again within seconds (R:701). Keyed
+# by case and forgotten after _BOUNCE_TTL: a set kept forever blocked agenda, world and checkin
+# for the life of the process after a down window (every partner then got no_availability).
+_BOUNCED: dict[tuple[str, str, str], float] = {}
+_BOUNCE_TTL = 60.0
 
 
 async def _say(city: City, to: str, text: str) -> bool:
-    if _HOSPITAL.get() and (to, text) in _BOUNCED:
+    key = (getattr(city.inbound, "need_id", None) or "", to, text)
+    if _HOSPITAL.get() and time.monotonic() - _BOUNCED.get(key, float("-inf")) < _BOUNCE_TTL:
         return False
     try:
         msg_id = await city.say(to, text)
     except CapError as exc:
         if _HOSPITAL.get() and exc.code == "TARGET_NOT_VISIBLE":
-            _BOUNCED.add((to, text))
+            now = time.monotonic()
+            for old in [k for k, at in _BOUNCED.items() if now - at >= _BOUNCE_TTL]:
+                del _BOUNCED[old]
+            _BOUNCED[key] = now
         tools.said(to, text, error=exc.code)
+        return False
+    except Exception as exc:  # noqa: BLE001 - hospital: a Relay timeout must not end the turn
+        if not _HOSPITAL.get():
+            raise
+        _LOG.info("care.say.failed", extra={"error": type(exc).__name__})
+        tools.said(to, text, error=type(exc).__name__)
         return False
     tools.said(to, text, msg_id)
     return True
@@ -1729,7 +1741,15 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
                 else:
                     await booking
         if confirm or (message.sender == LEDGER and head in {"held", "committed"}):
-            await _welcome(city, message)
+            # Proactive (judge: "physical address + register arrival by chat"): the welcome names
+            # our door; it already says how to register the arrival by chat. Without a street,
+            # _welcome's own default text.
+            street = _own_street(city).replace("=", "").replace("\n", " ")
+            place = {
+                "place_it": f"l'ospedale dove si svolgerà la sua visita, in {street}",
+                "place_en": f"the hospital where your visit will take place, at {street}",
+            } if street else {}
+            await _welcome(city, message, **place)
 
 
 async def _ask_slots(city: City, message: Message, chat: list[Message]) -> None:
@@ -2043,18 +2063,23 @@ def _arrival(message: Message) -> bool:
 
 
 def _english(chat: list[Message], text: str = "") -> bool:
-    """The citizen's lang=, else the lang= of our booking centre's confirm, else their words."""
+    """The citizen's lang=, else the lang=en/it of a booking party's confirm or need.request (our
+    booking centre or another ASST's), else their words."""
 
     rows = [row for row in chat if row.sender.startswith("citizen:")]
-    confirms = [
-        row
-        for row in chat
-        if row.sender == _OUR_BOOKING and ("confirm" in words(row.text) or row.type == "confirm")
-    ]
-    for row in rows + confirms:
+    for row in rows:
         lang = _fields(row).get("lang", "")
         if lang:
             return lang == "en"
+    for row in chat:
+        if row.sender.startswith("agent:") and (
+            {"confirm", "need.request"} & words(row.text) or row.type in {"confirm", "need.request"}
+        ):
+            # ponytail: a partner's lang=sq names the doctor's language, not the chat's: only
+            # en/it decide, anything else falls through to the citizen's words.
+            lang = _fields(row).get("lang", "").lower()
+            if lang in {"en", "it"}:
+                return lang == "en"
     return bool(_ENGLISH.search(text or (rows[-1].text if rows else "")))
 
 
@@ -2795,6 +2820,19 @@ async def _on_refused(
         # A second commit of a hold already committed (its committed line brings the receipt)
         # or a prescription already booked: nothing was lost, so no cancel to anyone.
         return
+    if hospital and code == "NO_CAPACITY":
+        # The slot is gone: neither a cross-ASST answer nor _alternatives offers it again.
+        # Only VIS-FIS pages: the specialist's VIS-CARD pages stay its own.
+        for key, (at, world) in list(_WORLD.items()):
+            if key[0] == _PROCEDURE:
+                kept = [line for line in world.splitlines() if f"slot_id={slot}" not in line.split()]
+                _WORLD[key] = (at, "\n".join(kept))
+    if hospital and first_word(message.text) == "refused" and {"hold", "op=hold"} & words(
+        message.text
+    ) and (_booked(chat, agent, slot) or _held_now(chat, slot)):
+        # A late refusal of a duplicate hold (a second pod, or a re-hold while the Ledger took
+        # 20-33 s): our hold or booking of the slot stands, so no cancel to anyone.
+        return
     # Hospital: once per hold, so a re-hold of the same offer can be cancelled again.
     seen = (_since_hold(chat, agent, slot) or []) if hospital else chat
     if (
@@ -2817,6 +2855,14 @@ async def _on_refused(
                     else " Il centro prenotazioni può trovarle un'altra data."
                 )
         await _say(city, target, text)
+        # Proactive: a lost slot (taken, or expired) comes with other free ones. Only to another
+        # ASST's booking centre: ours drops a facility's offer lines (its _desk has no branch for
+        # them) and searches again by itself on the cancel; a citizen chooses from the first
+        # offers message only (R:95).
+        if hospital and code in {"NO_CAPACITY", "EXPIRED"} and target.startswith("agent:") and (
+            target != _OUR_BOOKING
+        ):
+            await _alternatives(city, chat, target, slot)
     citizen = (_holder(chat, agent, slot) or _citizen(chat) or "") if hospital else ""
     if (
         offer_id
@@ -2836,6 +2882,61 @@ async def _on_refused(
         await _say(city, citizen, f"cancel offer_id={offer_id} reason={code} {note}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+
+
+def _held_now(chat: list[Message], slot: str) -> bool:
+    """A Ledger ``held`` for ``slot`` that no later cancellation, expiry or refused commit ended.
+    A refused hold ends nothing: it refuses only the new hold. ponytail: drops are not matched
+    to the hold's id (as _drops_hold)."""
+
+    alive = False
+    for row in chat:
+        if row.sender == LEDGER and first_word(row.text) == "held":
+            alive = alive or f"slot_id={slot}" in row.text.split()
+        elif _drops_hold(row) and not ({"hold", "op=hold"} & words(row.text)):
+            alive = False
+    return alive
+
+
+async def _alternatives(city: City, chat: list[Message], partner: str, slot: str) -> None:
+    """Hospital, right after the cancel of a lost slot to another ASST's booking centre: up to 3
+    free slots of ours it was not offered yet, from the cached world pages (_WORLD, fresh only),
+    as offer lines with its request_id: the format of our cross-ASST answer. Nothing without
+    that request_id (the partner matches answers on it) or without a fresh page. Only Ledger
+    attributes, never citizen data."""
+
+    agent = city.agent_id
+    offers = _our_offers([row for row in chat if row.recipient == partner], agent)
+    mine = next((offer for offer in offers if offer.get("slot_id") == slot), {})
+    rid = mine.get("request_id", "")
+    if not rid:
+        return
+    procedure = mine.get("procedure") or _PROCEDURE
+    priority = mine.get("priority", "").upper()
+    priority = priority if priority in {"U", "B", "D", "P"} else None
+    skip = {slot} | {offer.get("slot_id", "") for offer in offers}
+    chosen: list[dict[str, str]] = []
+    for key in sorted(key for key in _WORLD if key[0] == procedure):
+        at, world = _WORLD[key]
+        now = _city_now() or _day_after(world)
+        if time.monotonic() - at > _WORLD_FRESH or now is None:
+            continue
+        lines = [line for line in world.splitlines() if "slot_id=" in line]
+        chosen += [
+            found
+            for found in fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
+            if found["slot_id"] not in skip
+        ]
+    if not chosen:
+        return
+    await _say(city, partner, "\n".join([
+        *(f"{_offer_line(found, None, priority)} request_id={rid}" for found in chosen[:3]),
+        "Ci dispiace, il posto scelto non è più disponibile. Per la stessa richiesta abbiamo "
+        "ancora queste disponibilità del nostro ospedale. Per prenotarne una inviateci il confirm "
+        "con offer_id, slot_id, citizen, prescription_number e consent_ref, più "
+        "cross_asst_consent_ref se la regola lo richiede: la registriamo sul Ledger e vi mandiamo "
+        "subito la ricevuta.",
+    ]))
 
 
 async def _on_checkin(city: City, message: Message, chat: list[Message], *, reports: bool) -> None:

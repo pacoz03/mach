@@ -156,6 +156,7 @@ class Ledger:
         self.consents: set[tuple[str, str]] = set()  # (purpose, consent_ref) dati dal cittadino
         self.writes: list[dict] = []
         self.refuse_holds = sc.get("refuse_holds", 0)
+        self.refuse_code = sc.get("refuse_code", "SLOT_TAKEN")  # codice dell'hold rifiutato
         self.refuse_checkin = sc.get("refuse_checkin")
         self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
@@ -212,7 +213,7 @@ class Ledger:
                 return "NOT_FOUND", "", False
             if self.refuse_holds:  # guasto facility_cancel iniettato dallo scenario
                 self.refuse_holds -= 1
-                return "SLOT_TAKEN", "", True
+                return self.refuse_code, "", True
             if self.taken(s["slot_id"]):
                 return "SLOT_TAKEN", "", False
             # ponytail: il mondo finto non ha ASST partner, quindi P2 non scatta finché non si
@@ -343,6 +344,13 @@ class Port:
         b = self.bus
         if b.race:  # sc["race"]: la rete cede il loop, gli altri turni vanno avanti intanto
             await asyncio.sleep(0)
+        if b.bounce and self.me == b.ids["hospital"]:  # sc["bounce"]: ospedale giù per i suoi primi N invii
+            b.bounce -= 1
+            b.bounced.append((self.me, to, body.get("text", "")))
+            raise CapError("TARGET_NOT_VISIBLE", to)
+        if b.timeouts and self.me == b.ids["hospital"]:  # sc["say_timeout"]: il Relay non risponde (httpx)
+            b.timeouts -= 1
+            raise TimeoutError(to)
         if to in b.down or self.me in b.down or (self.me, to) in b.hidden:
             b.bounced.append((self.me, to, body.get("text", "")))
             raise CapError("TARGET_NOT_VISIBLE", to)
@@ -492,13 +500,16 @@ class Bus:
         self.dup = sc.get("dup_confirm", 0)
         # sc["hidden"]: il cittadino non è visibile all'ospedale (altra ASST, TARGET_NOT_VISIBLE)
         self.hidden = {(self.ids["hospital"], CIT)} if sc.get("hidden") else set()
+        self.bounce = sc.get("bounce", 0)
+        self.timeouts = sc.get("say_timeout", 0)
+        self.late_refusal = sc.get("late_refusal", False)
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
 
     def add(self, sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
         lang = self.citizen.sc.get("confirm_lang")  # il centro manda lang= nel confirm all'ospedale
-        if (lang and sender == self.ids["booking_centre"] and to == self.ids["hospital"]
+        if (lang and sender in (self.ids["booking_centre"], FOREIGN) and to == self.ids["hospital"]
                 and str(body.get("text", "")).startswith("confirm")):
             body = {**body, "text": f"{re.sub(r' ?lang=\S+', '', body['text'])} lang={lang}"}
         m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
@@ -512,6 +523,10 @@ class Bus:
         r = self.add(LEDGER, to, {"text": text}, need, conv)
         if self.ledger_turns:
             self.queue.append(r)
+        if self.late_refusal and text.startswith("held "):  # sc["late_refusal"]: hold doppio rifiutato dopo il held
+            self.late_refusal = False
+            late = f"refused hold code=NO_CAPACITY slot_id={fields(text).get('slot_id', '')}"
+            self.queue.append(self.add(LEDGER, to, {"text": late}, need, conv))
         return r
 
     async def deliver(self, m: Message) -> None:
@@ -520,7 +535,9 @@ class Bus:
             self.crashes.append(f"{a.folder}: import fallito: {a.error}")
             return
         port = Port(self, a.id)
-        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm)
+        # sc["address"]: la via dell'ospedale (city.address, CITY_ADDRESS in città)
+        street = self.citizen.sc.get("address", "") if a.folder == "hospital" else ""
+        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm, address=street)
         with a.active():
             try:
                 await a.main(Need(summary=m.text, message=m), city)
@@ -546,7 +563,8 @@ class Bus:
                 self.queue.append(self.add(LEDGER, self.ids["hospital"], {"text": REPLY["cancelled"].format(**h)
                                            + f" booking_id={h['hold_id']} reason={text}"}))
             elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
-                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
+                text, need = text if isinstance(text, tuple) else (text, NEED)  # (testo, need_id): altro caso
+                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}, need))
             else:
                 self.citizen.say(self.ids[to], text)
             while (self.queue or self.tasks) and self.turn < MAX_TURNS:
@@ -1119,6 +1137,105 @@ SCENARIOS.update({
     "cross_asst_cittadino_invisibile": dict(
         start=("hospital", XFIS.format(rid="R-11", extra="")), foreign=True, hidden=True,
         expect=[wrote("commit", "R:194"), receipt_to_foreign]),
+})
+
+
+# --- D: ospedale, alternative a uno slot perso, via nel benvenuto, lingua del partner, rimbalzi
+# (_BOUNCED) per caso e a tempo, rifiuto tardivo di un hold doppio -----------------------------
+
+
+def lost_slot_alternatives(rid: str):
+    """Hold rifiutato NO_CAPACITY su un'offerta cross-ASST: cancel col motivo al centro dell'altra
+    ASST, poi da 1 a 3 offerte nuove con request_id e soli campi del Ledger; mai lo slot perso
+    (tolto anche dalla pagina in memoria) né uno già offerto."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        sent = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN]
+        lost = next((w["f"].get("slot_id") for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+        i = next((i for i, m in enumerate(sent) if act(m) == "cancel" and "reason=NO_CAPACITY" in m.text.split()), None)
+        if lost is None or i is None:
+            return "nessun hold rifiutato o nessun cancel reason=NO_CAPACITY al centro dell'altra ASST"
+        before = {o.get("slot_id") for m in sent[:i] for o in parse_offers(m.text)}
+        after = [o for m in sent[i + 1:] if act(m) == "offer" and f"request_id={rid}" in m.text.split()
+                 for o in parse_offers(m.text)]
+        if not 1 <= len(after) <= 3:
+            return f"{len(after)} offerte alternative dopo il cancel invece di 1-3"
+        for o in after:
+            s = b.ledger.slots.get(o.get("slot_id", ""))
+            if o.get("slot_id") == lost or o.get("slot_id") in before:
+                return f"alternativa {o.get('slot_id')} già persa o già offerta"
+            if s is None or s["facility"] != hosp or o.get("request_id") != rid:
+                return f"alternativa non dell'ospedale o senza request_id={rid}: {o}"
+            for k, v in o.items():
+                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                    return f"attributo {k}={v} non dal Ledger (R:243)"
+    return check
+
+
+def lost_not_offered(rid: str):
+    """Dopo un NO_CAPACITY la pagina in memoria non offre più lo slot perso a un'altra richiesta."""
+    def check(b: Bus) -> str | None:
+        lost = next((w["f"].get("slot_id") for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+        got = [o.get("slot_id") for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+               and f"request_id={rid}" in m.text.split() for o in parse_offers(m.text)]
+        if not got:
+            return f"nessuna offerta per {rid}"
+        if lost in got:
+            return f"{rid}: offerto di nuovo lo slot perso {lost} dalla pagina in memoria"
+    return check
+
+
+def silent_after_refused_hold(b: Bus) -> str | None:
+    hold = next((w for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+    if hold is None:
+        return "nessun hold rifiutato"
+    got = [m for m in b.log[hold["i"]:] if m.sender == b.ids["hospital"] and m.recipient == FOREIGN]
+    if got:
+        return f"hospital ha scritto al centro dopo un hold rifiutato DUPLICATE: «{got[0].text[:80]}»"
+
+
+def late_refusal_no_cancel(b: Bus) -> str | None:
+    """Il Ledger rifiuta un secondo hold sullo stesso slot dopo il held del primo (secondo pod,
+    Ledger lento): la prenotazione resta, nessun cancel a nessuno."""
+    hosp = b.ids["hospital"]
+    refused = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == hosp
+                    and m.text.startswith("refused hold")), None)
+    if refused is None:
+        return "nessun refused hold arrivato all'ospedale"
+    got = [m for m in b.log[refused:] if m.sender == hosp and act(m) == "cancel"]
+    if got:
+        return f"cancel falso dopo il rifiuto tardivo: «{got[0].text[:80]}»"
+
+
+SCENARIOS.update({
+    # Slot perso (NO_CAPACITY) su un'offerta cross-ASST: cancel, poi altre date dalla pagina in memoria.
+    "ospedale_alternative": dict(
+        start=("hospital", XFIS.format(rid="R-20", extra="")), foreign=True, refuse_holds=1,
+        refuse_code="NO_CAPACITY", foreign_after=[(XFIS.format(rid="R-25", extra=""), WALKIN)],
+        expect=[lost_slot_alternatives("R-20"), lost_not_offered("R-25")]),
+    # DUPLICATE: niente perso, niente cancel né alternative.
+    "ospedale_alternative_duplicate": dict(
+        start=("hospital", XFIS.format(rid="R-21", extra="")), foreign=True, refuse_holds=1,
+        refuse_code="DUPLICATE", expect=[silent_after_refused_hold]),
+    # Proattività: il benvenuto dice la via dell'ospedale (city.address).
+    "welcome_indirizzo": dict(start=BACK, address="Via Esempio 1", expect=[
+        told_text("hospital", "in Via Esempio 1", cite="proattività: indirizzo"), *CHECKED_IN]),
+    # Il centro di un'altra ASST conferma con lang=en: benvenuto in inglese.
+    "welcome_lang_en_partner": dict(
+        start=("hospital", XFIS.format(rid="R-22", extra="")), foreign=True, confirm_lang="en",
+        expect=[told_text("hospital", "Hello, this is the hospital", cite="lang=en dal partner")]),
+    # Ospedale giù per il primo invio (agenda di R-23): un caso dopo (R-24) l'agenda riparte e
+    # l'offerta arriva subito, non dopo l'attesa a freddo.
+    "ospedale_giu_poi_su": dict(
+        start=("hospital", XFIS.format(rid="R-23", extra="")), foreign=True, bounce=1,
+        foreign_after=[(XFIS.format(rid="R-24", extra=""), WALKIN)],
+        expect=[cross_reply("R-23", "B"), cross_reply("R-24", "B"), cross_fast("R-24", 4.0),
+                asked_ledger("hospital", "agenda")]),
+    # Ledger lento o secondo pod: un refused hold arriva dopo il held dello stesso slot.
+    "ospedale_rifiuto_tardivo": dict(start=BACK, late_refusal=True, expect=[
+        late_refusal_no_cancel, wrote("commit", "R:241"), *CHECKED_IN]),
+    # Una say dell'ospedale va in timeout (Relay oltre 10 s): il turno non si interrompe a metà.
+    "ospedale_say_timeout": dict(start=BACK, say_timeout=1, expect=[wrote("commit", "R:241"), *CHECKED_IN]),
 })
 
 
