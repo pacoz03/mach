@@ -343,7 +343,9 @@ def redirect(role: str | None = None) -> str:
 # l'inglese; da solo riconosce bene la lingua del cittadino (provato su it, en, es, fr, sq,
 # italiano da non madrelingua e injection). Italiano: nessuna traduzione, i nostri testi bastano.
 # city-default risponde in ~0.4 s o in ~13 s (una chiamata su quattro, misurato dal gp).
-_DETECT_TIMEOUT = 8.0
+# Rilevamento lingua: 8 s perdeva già tutte le risposte da ~13 s; 2 s non ne perde altre e
+# accorcia di 6 s i turni lenti del gp (21/11: risposte al cittadino con ~9 minuti di coda).
+_DETECT_TIMEOUT = 2.0
 _LOCALIZE_TIMEOUT = 15.0
 _DETECT_SYSTEM = (
     "Name the language this message is written in. Reply with the ISO 639-1 code only, for "
