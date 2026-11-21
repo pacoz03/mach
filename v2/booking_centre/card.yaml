@@ -1,0 +1,14 @@
+agent_id: agent:sbdpbpqz5sxe
+team: team:the-promptfather-s
+name: booking_centre
+version: 1.0.23
+cap_versions:
+  - "1.0"
+profiles:
+  - mhm/1.0
+role: booking_centre
+capabilities:
+  - booking_centre
+no_clinical_advice: true
+endpoints:
+  mailbox: agent:sbdpbpqz5sxe
