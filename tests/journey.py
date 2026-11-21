@@ -564,6 +564,8 @@ class Bus:
                                            + f" booking_id={h['hold_id']} reason={text}"}))
             elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
                 text, need = text if isinstance(text, tuple) else (text, NEED)  # (testo, need_id): altro caso
+                if self.citizen.sc.get("gap") and (to, text) != start:  # sc["gap"]: secondi tra le richieste
+                    await asyncio.sleep(self.citizen.sc["gap"])
                 self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}, need))
             else:
                 self.citizen.say(self.ids[to], text)
@@ -911,6 +913,13 @@ def no_world_of(proc: str):
     return check
 
 
+def by_turns(with_turns, without):
+    """Con --ledger-turns (come in città) la risposta del Ledger apre un turno suo, senza resta solo nella history."""
+    def check(b: Bus) -> str | None:
+        return (with_turns if b.ledger_turns else without)(b)
+    return check
+
+
 XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={rid} Buongiorno, cerchiamo disponibilità."
 XFIS = "need.request service_type=hospital.physiatry procedure=VIS-FIS priority=B request_id={rid}{extra} Buongiorno."
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
@@ -1049,12 +1058,15 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_vincoli": dict(
         start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True,
         expect=[cross_reply("R-13", "B"), cross_only("R-13", "h1")]),
-    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e il turno
-    # aspetta la risposta di world; R-12 trova la pagina in memoria e offre in meno di 1 s.
+    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e chiude il
+    # turno; R-12 arriva 6 s dopo. Con la risposta di world come turno suo (--ledger-turns, come in
+    # città) R-12 trova la pagina in memoria e offre in meno di 1 s; senza, R-12 è di nuovo a freddo.
     "cross_asst_world_lento": dict(
         start=("hospital", XFIS.format(rid="R-11", extra="")), foreign_after=[XFIS.format(rid="R-12", extra="")],
-        foreign=True, slow_world=12.0,
-        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5), cross_reply("R-12", "B"), cross_fast("R-12", 1.0)]),
+        foreign=True, slow_world=12.0, gap=6.0,
+        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5),
+                by_turns(cross_reply("R-12", "B"), cross_reply("R-12", None)),
+                by_turns(cross_fast("R-12", 1.0), cross_fast("R-12", 9.5))]),
     "cross_asst_tutto_pieno": dict(
         start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
         expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
@@ -1236,6 +1248,80 @@ SCENARIOS.update({
         late_refusal_no_cancel, wrote("commit", "R:241"), *CHECKED_IN]),
     # Una say dell'ospedale va in timeout (Relay oltre 10 s): il turno non si interrompe a metà.
     "ospedale_say_timeout": dict(start=BACK, say_timeout=1, expect=[wrote("commit", "R:241"), *CHECKED_IN]),
+})
+
+
+# --- Cross-ASST: offerte distribuite e ack subito (ospedale 1.0.8 in città: 80 offerte in 11 minuti
+# sugli stessi 3 slot, 3 confirm su 5 rifiutati NO_CAPACITY; ogni risposta dalla cache con ack a 12-20 s)
+
+
+def _hospital_hold(b: Bus) -> str | None:
+    return next((w["f"].get("slot_id") for w in b.ledger.writes
+                 if w["op"] == "hold" and w["by"] == "hospital" and not w["code"]), None)
+
+
+def cross_spread(*rids: str):
+    """Dopo l'hold dell'ospedale quello slot non viene più offerto, e le richieste ``rids``
+    ricevono più di 3 slot diversi (non sempre gli stessi 3)."""
+    def check(b: Bus) -> str | None:
+        hold = _hospital_hold(b)
+        if hold is None:
+            return "nessun hold accettato dell'ospedale"
+        got = {}
+        for rid in rids:
+            m = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                      and f"request_id={rid}" in m.text.split()), None)
+            got[rid] = [o.get("slot_id") for o in parse_offers(m.text)] if m else []
+        again = [rid for rid, slots in got.items() if hold in slots]
+        if again:
+            return f"{hold}, già in hold, offerto di nuovo a {again}"
+        if len(set().union(*got.values()) - {hold}) <= 3:
+            return f"offerte {got}: sempre gli stessi slot"
+    return check
+
+
+def cache_after_hold(b: Bus) -> str | None:
+    """--ledger-turns: la risposta di world letta dopo l'hold arriva in _WORLD nel suo turno."""
+    if not b.ledger_turns:
+        return None
+    hold = _hospital_hold(b)
+    page = b.agents[b.ids["hospital"]].mods["facility"]._WORLD.get(("VIS-FIS", 1))
+    line = next((l.split() for l in page[1].splitlines() if f"slot_id={hold}" in l.split()), []) if page else None
+    if line is None or {"free=1", "capacity=1"} & set(line):
+        return f"pagina di world in memoria vecchia: {hold} ancora libero dopo l'hold"
+
+
+def cross_turn_ends(rid: str, nxt: str):
+    """Il +1 della risposta veloce si misura sull'ack, che parte a fine turno (R:246): dopo la
+    risposta a ``rid`` il turno dell'ospedale finisce subito e la richiesta ``nxt`` parte entro 1 s."""
+    def check(b: Bus) -> str | None:
+        got = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                    and f"request_id={rid}" in m.text.split()), None)
+        asked = next((m for m in b.log if m.sender == FOREIGN and f"request_id={nxt}" in m.text.split()), None)
+        if got is None or asked is None:
+            return f"risposta a {rid} o richiesta {nxt} mancante"
+        took = b.stamp[asked.msg_id] - b.stamp[got.msg_id]
+        if took >= 1.0:
+            return f"turno dell'ospedale ancora aperto {took:.1f} s dopo la risposta a {rid}: ack in ritardo"
+    return check
+
+
+XFIS_D = XFIS.replace("priority=B", "priority=D")  # finestra di 5 giorni: 9 slot liberi in pagina 1
+
+SCENARIOS.update({
+    # R-20 a freddo, il centro conferma la prima offerta (hold); R-21..R-23 dalla cache.
+    "cross_asst_distribuite": dict(
+        start=("hospital", XFIS_D.format(rid="R-20", extra="")), foreign=True,
+        foreign_after=[XFIS_D.format(rid=r, extra="") for r in ("R-21", "R-22", "R-23")],
+        expect=[*(cross_reply(r, "D") for r in ("R-20", "R-21", "R-22", "R-23")),
+                *(cross_fast(r, 1.0) for r in ("R-21", "R-22", "R-23")),
+                cross_spread("R-21", "R-22", "R-23"), cache_after_hold]),
+    # world dopo 3 s: R-31 risponde dalla cache e chiude il turno senza aspettare la sua lettura.
+    "cross_asst_ack_subito": dict(
+        start=("hospital", XFIS.format(rid="R-30", extra="")), foreign=True, slow_world=3.0,
+        foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-31", "R-32")],
+        expect=[cross_reply("R-31", "B"), cross_fast("R-31", 1.0), cross_turn_ends("R-31", "R-32"),
+                cross_reply("R-32", "B"), cross_fast("R-32", 1.0)]),
 })
 
 

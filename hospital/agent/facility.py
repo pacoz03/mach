@@ -58,8 +58,9 @@ _SHORT_TRIES = 12
 _CROSS_WAIT = 5.5
 # Hospital: the live Ledger answers world after ~12 s (21/11 00:50), so a cross-ASST answer comes
 # from the last world page read (_WORLD) while it is _WORLD_FRESH seconds old; without one we wait
-# _CROSS_COLD (a history read can overrun it, still < 10 s) and keep waiting for the reply up to
-# _WORLD_WAIT after answering, so the next request finds it.
+# _CROSS_COLD (a history read can overrun it, still < 10 s). The specialist keeps waiting for the
+# reply up to _WORLD_WAIT after answering, so the next request finds it; the hospital ends the turn
+# (the fast reply is scored on the ack) and caches the reply in its own push turn.
 _CROSS_COLD = 7.0  # live 1.0.7: each Ledger say takes 1-5 s, 8.5 s gave cancels at 10.7 s
 _WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
 _WORLD_WAIT = 20.0
@@ -67,6 +68,14 @@ _WORLD_WAIT = 20.0
 # ponytail: one process's memory, empty after a restart or rollout and not shared between pods;
 # a shared store if the hospital ever runs on more than one pod.
 _WORLD: dict[tuple[str, int], tuple[float, str]] = {}
+# Hospital, cross-ASST (live 1.0.8: 80 offers in 11 min on the same 3 slots, 3 of 5 confirms
+# refused NO_CAPACITY): when we offered each slot in the last _OFFER_SPAN s, and the slots we sent
+# a hold for, kept _HOLD_SPAN s or until the Ledger ends the hold (_unhold). _spread reads both.
+# ponytail: one process's memory like _WORLD; a shared store if the hospital runs on more pods.
+_OFFER_SPAN = 60.0
+_HOLD_SPAN = 600.0
+_OFFERED: dict[str, list[float]] = {}
+_HELD: dict[str, float] = {}
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 # The kit names no outcome_code values: VISIT is the only one it writes (examples/agent.py).
@@ -246,6 +255,7 @@ async def handle(role: str, need: Need, city: City) -> None:
     if role == "hospital":
         flag = _HOSPITAL.set(True)
         try:
+            _unhold(message, chat, city.agent_id)
             await _hospital(city, message, chat)
         finally:
             _HOSPITAL.reset(flag)
@@ -1127,7 +1137,10 @@ async def _confirm_alone(
                 parts.append(f"prescription_number={number}")
             # P2: the hold carries the cross-ASST consent; the commit keeps the booking one.
             parts.append(f"consent_ref={fields.get('cross_asst_consent_ref') or consent}")
+            if _HOSPITAL.get():
+                _HELD[slot] = time.monotonic()  # out of cross-ASST offers before the 1-5 s say
             if not await _say(city, LEDGER, " ".join(parts)):
+                _HELD.pop(slot, None)
                 return
             sent.holds.add(slot)
         await _finish_booking(
@@ -1705,6 +1718,14 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
     elif message.sender == LEDGER and head == "checked_in":
         await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
+    elif message.sender == LEDGER and _latest_slots([message]) is not None:
+        # A world reply as its own turn (live: most do): _cross_asst no longer waits for it, so
+        # it fills _WORLD here, when our latest world ask in the case named our procedure (a
+        # ``world page=1`` from _ask_slots lists every facility's slots).
+        asks = [row.text.split() for row in chat if row.sender == city.agent_id
+                and row.recipient == LEDGER and first_word(row.text) == "world"]
+        if asks and f"procedure={_PROCEDURE}" in asks[-1]:
+            _keep_world(_PROCEDURE, [message])
     elif (
         message.sender.startswith("agent:")
         and not confirm
@@ -1888,6 +1909,9 @@ async def _cross_asst(
                 if every or page >= min(_page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
+            if hospital:
+                # Without slots we hold, least offered first: partners no longer race for one 3.
+                found, every = _spread(found), _spread(every)
             relaxed = rich and not found and bool(every)
             pool = found or every
             chosen = pool[:3]
@@ -1907,6 +1931,9 @@ async def _cross_asst(
                     _by_constraints([rare, chosen[-1]], fields)[0] is rare
                 ):
                     chosen = [*chosen[:2], rare]
+                at = time.monotonic()
+                for slot in chosen:
+                    _OFFERED.setdefault(slot["slot_id"], []).append(at)
             elif rich and pool:
                 # Level 5: the partner's lang/gender/days, when named, rank the slots that meet
                 # the most of them first; time order within a tie. Only Ledger attributes go out.
@@ -1941,7 +1968,12 @@ async def _cross_asst(
         # Marked even if the say fails: a redelivery is not a retry after a 4xx.
         sent.offers.add(key)
         await _say(city, sender, text)
-        if owed:
+        if owed and procedures == (_PROCEDURE,):
+            # Hospital: the fast reply (+1, R:246) is scored on the ack, sent when the turn ends,
+            # so nothing waits after the answer: the reads go out together and the world reply
+            # fills _WORLD in its own push turn (_hospital).
+            await asyncio.gather(*(_say(city, LEDGER, read) for read in later))
+        elif owed:
             for read in later:
                 await _say(city, LEDGER, read)
             # Answered without a world reply: wait for it now, so the next request finds it.
@@ -1963,6 +1995,34 @@ def _keep_world(procedure: str, rows: list[Message]) -> None:
         world = _latest_slots([row])
         if world is not None:
             _WORLD[(procedure, _page(world)[0])] = (time.monotonic(), world)
+
+
+def _spread(slots: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Hospital, cross-ASST: ``slots`` without those we hold, the ones we offered least in the
+    last _OFFER_SPAN s first. A stable sort: time order, then _by_constraints, still decide."""
+
+    now = time.monotonic()
+    for slot_id in [key for key, at in _HELD.items() if now - at > _HOLD_SPAN]:
+        del _HELD[slot_id]
+    for slot_id in list(_OFFERED):
+        _OFFERED[slot_id] = [at for at in _OFFERED[slot_id] if now - at < _OFFER_SPAN]
+        if not _OFFERED[slot_id]:
+            del _OFFERED[slot_id]
+    return sorted(
+        (slot for slot in slots if slot["slot_id"] not in _HELD),
+        key=lambda slot: len(_OFFERED.get(slot["slot_id"], ())),
+    )
+
+
+def _unhold(message: Message, chat: list[Message], agent: str) -> None:
+    """Hospital: a Ledger row ending our hold (_drops_hold) puts the slot back in cross-ASST
+    offers. Not NO_CAPACITY (or the kit's SLOT_TAKEN): then another ASST holds it."""
+
+    if not _drops_hold(message) or fields_of(message.text).get("code") in {"NO_CAPACITY", "SLOT_TAKEN"}:
+        return
+    holds = [fields_of(row.text).get("slot_id", "") for row in chat
+             if row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "hold"]
+    _HELD.pop(fields_of(message.text).get("slot_id") or (holds[-1] if holds else ""), None)
 
 
 _GENDERS = {"f": "f", "female": "f", "donna": "f", "femmina": "f", "woman": "f",
