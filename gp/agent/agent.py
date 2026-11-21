@@ -139,7 +139,8 @@ class Prescription:
             f"priority={self.priority}"
         )
 
-    def reply(self, lang: str, handed: bool, prefs: dict[str, object], *, again: bool = False) -> str:
+    def reply(self, lang: str, handed: bool, prefs: dict[str, object], *, again: bool = False,
+              advised: str = "") -> str:
         """To the person: their reason (their words, no diagnosis), the prescription, one concrete
         next step, their preferences and, unasked, the renewal (P1). ``again``: they wrote again
         after it, so what is ready and what happens next, never the reason asked again."""
@@ -154,6 +155,8 @@ class Prescription:
                 "again" if again else "ready"].format(visit=visit, rx=self)
         timing = TIMING[lang].get(self.priority)
         text += (f": {timing}. " if timing else ". ") + (say["handed" if self.priority != "P" else "handed_p"] if handed else say["write"].format(rx=self))
+        if advised:
+            text += say["advised"].format(advised)
         if noted := _describe(prefs, lang):
             text += say["passed" if handed and not again else "noted"].format(noted)
         else:
@@ -179,6 +182,7 @@ _SAY = {
         # Priority P has no deadline to flag (_handoff): only the prescription went.
         "handed_p": "Passo successivo: non deve ripetere nulla. Di mia iniziativa ho già passato la ricetta al "
                     "nostro centro prenotazioni: le scriverà e le basterà rispondere. ",
+        "advised": "Di mia iniziativa ho anche avvisato {}: sa già che arriverà con questa ricetta e la aspetta. ",
         "write": "Passo successivo: scriva al centro prenotazioni della sua ASST con il numero {rx.number}: le "
                  "proporrà gli orari disponibili. ",
         "passed": "Gli ho indicato anche le sue preferenze ({}). ",
@@ -204,6 +208,7 @@ _SAY = {
                   "need to reply to confirm one. ",
         "handed_p": "Next step: you do not need to repeat anything. On my own initiative I have already passed the "
                     "prescription to our booking centre: it will write to you and you only need to reply. ",
+        "advised": "On my own initiative I have also let {} know: they already expect you with this prescription. ",
         "write": "Next step: write to your ASST's booking centre with the number {rx.number}: it will offer you "
                  "the available slots. ",
         "passed": "I have also passed on your preferences ({}). ",
@@ -825,7 +830,43 @@ async def _issue(
     prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
     # Before the citizen's message, so that "already passed on" is true when we say it.
     handed = await _handoff(city, history, request, lang, prefs)
-    await _tell(city, request.patient, request.reply(lang, handed, prefs))
+    advised = await _preadvise(city, history, request, lang)
+    await _tell(city, request.patient, request.reply(lang, handed, prefs, advised=advised))
+
+
+# Our facility for each procedure, and how the citizen calls it (it, en).
+_CLINIC = {
+    "VIS-FIS": ("agent:m6py14a1ej77", "hospital.physiatry", "l'ambulatorio di fisiatria dell'ospedale",
+                "the hospital's physiatry clinic"),
+    "VIS-CARD": ("agent:h6krzxx6es83", "specialist_care.cardiology", "l'ambulatorio di cardiologia",
+                 "the cardiology clinic"),
+}
+
+
+async def _preadvise(city: City, history: list[Message], request: Prescription, lang: str) -> str:
+    """Unasked, once per prescription (review collaboration): our facility for the visit hears a
+    patient is coming with it. Only the prescription's tokens, never the citizen's data or words.
+    Returns how the citizen calls that clinic when it went, "" otherwise. Never raises."""
+
+    clinic = _CLINIC.get(request.procedure)
+    if clinic is None:
+        return ""
+    agent_id, capability, name_it, name_en = clinic
+    token = f"prescription_number={request.number}"
+    try:
+        if not any(row.sender == city.agent_id and row.recipient == agent_id and token in row.text.split()
+                   for row in history):
+            if not any(peer.agent_id == agent_id for peer in await city.find(capability)):
+                return ""
+            text = (f"data.response purpose=referral {token} procedure={request.procedure} "
+                    f"priority={request.priority} Buongiorno collega, le segnalo che ho appena prescritto "
+                    "questa visita a un mio paziente: il centro prenotazioni gli proporrà i vostri orari. "
+                    "Nessuna risposta necessaria, grazie!")
+            if not await _say(city, agent_id, text):
+                return ""
+        return name_it if lang == "it" else name_en
+    except Exception:  # CapError or network: the prescription goes without it
+        return ""
 
 
 async def _tell(city: City, patient: str, text: str) -> None:
