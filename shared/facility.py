@@ -1424,9 +1424,15 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
                    {"offer", "cancel", "consent", "booking.receipt", "checkin"}), None)
     last_act = first_word(latest.text) if latest else ""
     pending = fields_of(latest.text).get("offer_id", "") if last_act == "consent" else ""
-    offer_message = next((row for row in reversed(own) if first_word(row.text) == "offer"), None)
-    offers = _our_offers([offer_message], city.agent_id) if offer_message else []
-    offers = [offer for offer in offers if offer.get("offer_id") and offer.get("slot_id")]
+    # Offers go out in several messages (live 000123: three of two each): every offer we sent
+    # this citizen and did not cancel is live, not only those of the last message.
+    withdrawn = {fields_of(row.text).get("offer_id") for row in own if first_word(row.text) == "cancel"}
+    offers, seen = [], set()
+    for offer in _our_offers([row for row in own if first_word(row.text) == "offer"], city.agent_id):
+        oid = offer.get("offer_id")
+        if oid and offer.get("slot_id") and oid not in withdrawn and oid not in seen:
+            seen.add(oid)
+            offers.append(offer)
     waiting_for_days = bool(own and first_word(own[-1].text) == "data.request"
                             and fields_of(own[-1].text).get("fields") == "days")
     if waiting_for_days or last_act in {"cancel", "booking.receipt", "checkin"}:
@@ -1518,9 +1524,17 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     if explicit or offer_id or offers:
         selected = next((offer for offer in offers if offer["offer_id"] == offer_id), None)
         if not selected or data.get("slot_id") not in (None, selected["slot_id"]):
-            await _say(city, citizen, "data.request purpose=booking fields=offer_id "
-                       + ("Which of the proposed slots would you like?" if en else
-                          "Quale degli appuntamenti proposti preferisce?"))
+            # The choice is a confirm: a data.request for offer_id makes the citizen send back an
+            # empty data.response, again and again (live 000123: ~30 times). Ask once, in prose.
+            prompt = (
+                "Which of the proposed appointments would you like? Reply with your choice and "
+                "your consent reference, and I will book it right away."
+                if en
+                else "Quale degli appuntamenti proposti preferisce? Mi risponda con la sua scelta "
+                "e il riferimento del consenso, e prenoto subito."
+            )
+            if not any(row.text.strip() == prompt for row in own):
+                await _say(city, citizen, prompt)
             return
         consent = data.get("consent_ref", "")
         if denied:
