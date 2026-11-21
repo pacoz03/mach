@@ -13,6 +13,7 @@ import facility as f
 class FastReply(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         f._WORLD.clear()
+        f._REFRESHED.clear()  # per-process refresh throttle: each test starts as a fresh pod
         self.now=datetime(2026,11,23,8,tzinfo=timezone.utc)
         self.world=('slots page=1/1 count=1\nslot_id=S-fast doctor_id=asst-gorla-c1 '
                     'facility=agent:fc procedure=CONS-GIN at=2026-11-24T15:00:00+00:00 day=tue free=1')

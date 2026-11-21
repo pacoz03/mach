@@ -2793,6 +2793,22 @@ def dropped_not_offered(folder: str):
     return check
 
 
+def few_refreshes(first: str):
+    """Dopo la risposta dalla cache a ``first``, al più una lettura di rinfresco per tipo al Ledger
+    (ospedale 1.0.17 in città: ~110 richieste, 91 world page=1 + 87 page=2 + 87 agenda, 3 a richiesta)."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        got = next((i for i, m in enumerate(b.log) if m.sender == hosp and m.recipient == FOREIGN
+                    and f"request_id={first}" in m.text.split()), None)
+        if got is None:
+            return f"risposta a {first} mancante"
+        reads = [m.text for m in b.log[got:] if m.sender == hosp and m.recipient == LEDGER]
+        for read in ("world procedure=VIS-FIS page=1", "agenda"):
+            if reads.count(read) > 1:
+                return f"«{read}» chiesto {reads.count(read)} volte dopo le risposte dalla cache"
+    return check
+
+
 SCENARIOS.update({
     # Il Ledger annulla la prenotazione dallo specialista: cancel col motivo al centro e al cittadino,
     # una volta, come l'ospedale (arena annullo_citta_cardiologia: lo specialista taceva).
@@ -2814,6 +2830,12 @@ SCENARIOS.update({
         setup=our_booking_asks(("specialist_care", XREQ.format(
             svc="specialist_care.cardiology", proc="VIS-CARD", rid="x-ours4"))),
         expect=[offered_to_booking("specialist_care", "x-ours4", 10.0)]),
+    # R-40 a freddo riempie la cache; R-41..R-44 rispondono dalla cache e rinfrescano al più una volta.
+    "cross_asst_rinfresco_raro": dict(
+        start=("hospital", XFIS.format(rid="R-40", extra="")), foreign=True,
+        foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-41", "R-42", "R-43", "R-44")],
+        expect=[*(cross_reply(r, "B") for r in ("R-41", "R-42", "R-43", "R-44")),
+                *(cross_fast(r, 1.0) for r in ("R-41", "R-42", "R-43", "R-44")), few_refreshes("R-41")]),
 })
 
 

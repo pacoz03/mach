@@ -74,6 +74,14 @@ _WORLD_WAIT = 20.0
 # ponytail: one process's memory, empty after a restart or rollout and not shared between pods;
 # a shared store if the hospital ever runs on more than one pod.
 _WORLD: dict[tuple[str, int], tuple[float, str]] = {}
+# _cross_asst, cache hit: the refresh reads sent after the answer, at most one per read text every
+# _REFRESH_EVERY s (read text -> time.monotonic() it was last queued). Live hospital 1.0.17 (21/11,
+# 30 min): ~110 partner requests sent 91 world page=1, 87 page=2 and 87 agenda, 3 reads each with
+# _WORLD fresh. World answers in 12-96 s, so a page asked every 60 s stays inside _WORLD_FRESH;
+# agenda only picks up a rebase or a pause (_city_now extrapolates the anchor, the same all night).
+# ponytail: per process like _WORLD: a restarted pod or a second pod refreshes on its own.
+_REFRESH_EVERY = {"world": 60.0, "agenda": 300.0}
+_REFRESHED: dict[str, float] = {}
 # Hospital, cross-ASST (live 1.0.8: 80 offers in 11 min on the same 3 slots, 3 of 5 confirms
 # refused NO_CAPACITY): when we offered each slot in the last _OFFER_SPAN s, and the slots we sent
 # a hold for, kept _HOLD_SPAN s or until the Ledger ends the hold (_unhold). _spread reads both.
@@ -1892,6 +1900,11 @@ async def _cross_asst(
                       "elapsed_seconds": round(time.monotonic() - start, 3),
                       "delivered": delivered, "cached": bool(later),
                       "result": "offer" if chosen else "no_availability"})
+        if owed:  # the refresh reads below go out only with owed: drop those sent lately
+            tick = time.monotonic()
+            later = [read for read in later
+                     if tick - _REFRESHED.get(read, float("-inf")) >= _REFRESH_EVERY[first_word(read)]]
+            _REFRESHED.update(dict.fromkeys(later, tick))
         if owed and procedures == (_PROCEDURE,):
             # Hospital: the fast reply (+1, R:246) is scored on the ack, sent when the turn ends,
             # so nothing waits after the answer: the reads go out together and the world reply
