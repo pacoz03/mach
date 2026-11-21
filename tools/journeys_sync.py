@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Copy the console's journeys (verdict, rubric rows, review) into Supabase for the evals.
 
-    python3 tools/journeys_sync.py            # new or changed journeys only
+    python3 tools/journeys_sync.py            # new or changed journeys, and judged ones still awaiting a review
     python3 tools/journeys_sync.py --all      # every journey again
     python3 tools/journeys_sync.py --schema   # also apply shared/evals.sql (Management API)
 
@@ -19,6 +19,7 @@ import json
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -209,6 +210,36 @@ def upsert(table: str, rows: list[dict], key: str) -> None:
         )
 
 
+# The review (city:review) lands 5-6 hours after the verdict (21/11): a judged journey without
+# one is read again while it is this recent, so its votes reach ``outcomes``.
+REVIEW_WAIT = timedelta(hours=12)
+
+
+def _rows(query: str) -> list[dict]:
+    """Every row of a PostgREST query (it returns at most 1000 per call)."""
+
+    rows, offset = [], 0
+    while True:
+        page = sentiment._call("GET", f"{query}&limit=1000&offset={offset}") or []
+        rows += page
+        offset += 1000
+        if len(page) < 1000:
+            return rows
+
+
+def _awaiting_review(known: dict[str, dict]) -> list[dict]:
+    """Journeys judged in the last REVIEW_WAIT that have no review vote yet."""
+
+    since = (datetime.now(timezone.utc) - REVIEW_WAIT).strftime("%Y-%m-%dT%H:%M:%S")
+    reviewed = {row["need_id"] for row in _rows(
+        f"outcomes?select=need_id&fact=like.review.*&at=gte.{since}")}
+    return [
+        {"need_id": need, "updated_at": row["updated_at"]}
+        for need, row in known.items()
+        if row["verdict_at"] and row["verdict_at"] >= since and need not in reviewed
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="re-read every journey")
@@ -223,16 +254,16 @@ def main() -> int:
         return 2
     ours = {a["agent_id"]: a["name"] for a in console("agents", cookie)["agents"]}
     listed = console("team/journeys", cookie)["journeys"]
-    known = {}
-    if not args.all:
-        for row in sentiment._call("GET", "journeys?select=need_id,updated_at,verdict_at&limit=10000") or []:
-            known[row["need_id"]] = row
+    known = {row["need_id"]: row for row in _rows("journeys?select=need_id,updated_at,verdict_at")}
     todo = [
         j for j in listed
         if args.all or j["need_id"] not in known
         or known[j["need_id"]]["updated_at"] != j.get("updated_at")
         or known[j["need_id"]]["verdict_at"] is None
     ]
+    queued = {j["need_id"] for j in todo}
+    late = [j for j in _awaiting_review(known) if j["need_id"] not in queued]
+    todo += late
 
     def fetch(j):
         try:
@@ -251,7 +282,9 @@ def main() -> int:
     upsert("journeys", journeys, "need_id")
     upsert("outcomes", outcomes, "record_id")
     print(json.dumps({
-        "listed": len(listed), "fetched": len(journeys), "outcomes": len(outcomes), "errors": errors[:5],
+        "listed": len(listed), "awaiting_review": len(late), "fetched": len(journeys),
+        "outcomes": len(outcomes), "reviews": sum(o["fact"].startswith("review.") for o in outcomes),
+        "errors": errors[:5],
     }))
     return 0
 
