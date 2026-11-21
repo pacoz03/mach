@@ -1,0 +1,19 @@
+# Ledger reply to `checkin`, rebuilt from episodes.fields and anonymized (see README.md). Token order is reconstructed.
+# checkin_id is always ci-<booking_id>. Ids match held/committed/reported.txt.
+# specialist_care, 2026-11-21 01:01 UTC: specialist_care: held, committed, checked_in, reported
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000002 checkin_id=ci-bk-00000000-0000-4000-8000-000000000002 ledger_ref=aaaaaaaa-0000-4000-8000-000000000010 agenda_time=2026-11-20T09:34:48.754Z
+---
+# hospital, 2026-11-21 01:07 UTC: hospital: held, committed, checked_in (no report)
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000007 checkin_id=ci-bk-00000000-0000-4000-8000-000000000007 ledger_ref=aaaaaaaa-0000-4000-8000-000000000018 agenda_time=2026-11-20T14:52:26.336Z
+---
+# specialist_care, 2026-11-21 01:06 UTC: specialist_care: held, committed, checked_in, reported
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000003 checkin_id=ci-bk-00000000-0000-4000-8000-000000000003 ledger_ref=aaaaaaaa-0000-4000-8000-000000000016 agenda_time=2026-11-20T14:50:58.244Z
+---
+# specialist_care, 2026-11-21 01:01 UTC: specialist_care: held, committed, checked_in, reported
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000001 checkin_id=ci-bk-00000000-0000-4000-8000-000000000001 ledger_ref=aaaaaaaa-0000-4000-8000-000000000011 agenda_time=2026-11-20T09:36:29.235Z
+---
+# family_counseling, 2026-11-21 00:37 UTC: family_counseling, direct access (no prescription_number): held, committed, checked_in
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000004 checkin_id=ci-bk-00000000-0000-4000-8000-000000000004 ledger_ref=aaaaaaaa-0000-4000-8000-000000000005 agenda_time=2026-11-19T09:51:33.665Z
+---
+# hospital, 2026-11-21 01:07 UTC: hospital: held, committed, checked_in (no report)
+checked_in booking_id=bk-00000000-0000-4000-8000-000000000006 checkin_id=ci-bk-00000000-0000-4000-8000-000000000006 ledger_ref=aaaaaaaa-0000-4000-8000-000000000017 agenda_time=2026-11-20T14:50:24.251Z

@@ -1,0 +1,47 @@
+# Ledger reply to `hold`, rebuilt from episodes.fields and anonymized (see README.md). Token order is reconstructed.
+# Every real reply carries hold_id twice and consent_ref=<ref> (a literal placeholder): rebuilt here as a second
+# `commit ...` line, which matches the SKILL.md request `commit hold_id=... consent_ref=...`. Its wording is a guess.
+# need_id keeps the ASST code (890924, 890916, 890917) and the attempt suffix; the citizen number is fake.
+# specialist_care, 2026-11-21 00:28 UTC: later committed: same id in committed.txt (specialist_care: held, committed, checked_in, reported)
+held hold_id=bk-00000000-0000-4000-8000-000000000002 slot_id=W01QQQ-asst-gorla-s1-20261120-1200 need_id=N-2026-11-02-890924900002 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000002 consent_ref=<ref>
+---
+# family_counseling, 2026-11-21 01:02 UTC: later committed: same id in committed.txt (family_counseling, direct access (no prescription_number): held, committed)
+held hold_id=bk-00000000-0000-4000-8000-000000000009 slot_id=W01QQQ-asst-gorla-c1-20261120-1200 need_id=N-2026-11-02-890924900008 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000009 consent_ref=<ref>
+---
+# hospital, 2026-11-21 00:45 UTC: later committed: same id in committed.txt (hospital: held, committed, checked_in (no report))
+held hold_id=bk-00000000-0000-4000-8000-000000000007 slot_id=W01QQQ-asst-gorla-h2-20261120-1600 need_id=N-2026-11-02-890924900006 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000007 consent_ref=<ref>
+---
+# specialist_care, 2026-11-21 00:31 UTC: later committed: same id in committed.txt (specialist_care: held, committed, checked_in, reported)
+held hold_id=bk-00000000-0000-4000-8000-000000000003 slot_id=W01QQQ-asst-gorla-s1-20261120-1430 need_id=N-2026-11-02-8909169000030002 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000003 consent_ref=<ref>
+---
+# specialist_care, 2026-11-21 00:21 UTC: later committed: same id in committed.txt (specialist_care: held, committed, checked_in, reported)
+held hold_id=bk-00000000-0000-4000-8000-000000000001 slot_id=W01QQQ-asst-gorla-s1-20261120-1030 need_id=N-2026-11-02-890924900001 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000001 consent_ref=<ref>
+---
+# hospital, 2026-11-21 00:52 UTC: later committed: same id in committed.txt (hospital: held, committed, no check-in)
+held hold_id=bk-00000000-0000-4000-8000-000000000008 slot_id=W01QQQ-asst-gorla-h1-20261123-0900 need_id=N-2026-11-02-8909249000070002 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000008 consent_ref=<ref>
+---
+# family_counseling, 2026-11-21 00:35 UTC: later committed: same id in committed.txt (family_counseling, direct access (no prescription_number): held, committed, checked_in)
+held hold_id=bk-00000000-0000-4000-8000-000000000004 slot_id=W01QQQ-asst-gorla-c1-20261119-1200 need_id=N-2026-11-02-8909249000040002 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000004 consent_ref=<ref>
+---
+# hospital, 2026-11-21 00:43 UTC: later committed: same id in committed.txt (hospital: held, committed, checked_in (no report))
+held hold_id=bk-00000000-0000-4000-8000-000000000006 slot_id=W01QQQ-asst-gorla-h2-20261120-1430 need_id=N-2026-11-02-890917900005 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000006 consent_ref=<ref>
+---
+# family_counseling, 2026-11-21 03:41 UTC: no committed reply for this hold in episodes (commits stopped after 01:20 UTC)
+held hold_id=bk-00000000-0000-4000-8000-000000000012 slot_id=W01QQQ-asst-gorla-c1-20261201-1030 need_id=N-2026-11-02-8909249000100004 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000012 consent_ref=<ref>
+---
+# hospital, 2026-11-21 03:51 UTC: no committed reply for this hold in episodes (commits stopped after 01:20 UTC)
+held hold_id=bk-00000000-0000-4000-8000-000000000013 slot_id=W01QQQ-asst-gorla-h1-20261201-0900 need_id=N-2026-11-02-8909249000110004 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000013 consent_ref=<ref>
+---
+# specialist_care, 2026-11-21 03:01 UTC: no committed reply for this hold in episodes (commits stopped after 01:20 UTC)
+held hold_id=bk-00000000-0000-4000-8000-000000000011 slot_id=W01QQQ-asst-gorla-s1-20261127-1030 need_id=N-2026-11-02-8909249000090004 fence=1
+commit hold_id=bk-00000000-0000-4000-8000-000000000011 consent_ref=<ref>

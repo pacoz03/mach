@@ -1,0 +1,16 @@
+# Ledger reply to `agenda`, rebuilt from episodes.fields (see README.md). Token order is reconstructed.
+# One sample per agenda_day seen. rate, paused, epoch_real and epoch_agenda never changed during the night.
+# specialist_care, 2026-11-21 03:18 UTC: agenda_day=fri
+agenda rate=60.0 paused=false agenda_day=fri agenda_now=2026-11-27T23:59:26.427Z epoch_real=2026-11-20T19:15:09.977Z epoch_agenda=2026-11-02T00:00:00.000Z wave_id=W01QQQ
+---
+# specialist_care, 2026-11-21 03:42 UTC: agenda_day=mon
+agenda rate=60.0 paused=false agenda_day=mon agenda_now=2026-11-30T23:44:51.864Z epoch_real=2026-11-20T19:15:09.977Z epoch_agenda=2026-11-02T00:00:00.000Z wave_id=W01QQQ
+---
+# specialist_care, 2026-11-21 02:52 UTC: agenda_day=thu
+agenda rate=60.0 paused=false agenda_day=thu agenda_now=2026-11-26T23:43:01.190Z epoch_real=2026-11-20T19:15:09.977Z epoch_agenda=2026-11-02T00:00:00.000Z wave_id=W01QQQ
+---
+# booking_centre, 2026-11-21 04:03 UTC: agenda_day=tue
+agenda rate=60.0 paused=false agenda_day=tue agenda_now=2026-12-01T20:49:47.978Z epoch_real=2026-11-20T19:15:09.977Z epoch_agenda=2026-11-02T00:00:00.000Z wave_id=W01QQQ
+---
+# booking_centre, 2026-11-21 02:29 UTC: agenda_day=wed
+agenda rate=60.0 paused=false agenda_day=wed agenda_now=2026-11-25T23:56:28.399Z epoch_real=2026-11-20T19:15:09.977Z epoch_agenda=2026-11-02T00:00:00.000Z wave_id=W01QQQ

@@ -1,0 +1,127 @@
+# Ledger reply to `world` (act word `slots`), rebuilt from episodes.fields (see README.md). Nothing personal: not anonymized.
+# Line 1 = header with page=<n>/<pages>; then one line per slot (10 per page); a `more:` line only when a next page exists.
+# urgent_reserve=true is on the 09:00 slot of each doctor-day: that count matches all 3735 replies in episodes,
+# and our facilities (which skip reserved slots) never offered a 09:00 slot. Token order and `more:` wording are reconstructed.
+# hospital, 2026-11-21 04:03 UTC
+slots page=1/8 matching=80 asst=asst-gorla from=2026-12-01 until=2026-12-15 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h1-20261201-0900 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h3-20261201-0900 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h1-20261201-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1030 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-1200 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T12:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T12:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-1430 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T14:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1430 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T14:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-1600 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T16:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1600 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T16:00:00.000Z day=tue free=1
+more: world procedure=VIS-FIS page=2
+---
+# hospital, 2026-11-21 03:42 UTC: page spans two days, three reserved slots
+slots page=1/8 matching=80 asst=asst-gorla from=2026-11-30 until=2026-12-14 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h1-20261130-0900 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-30T09:00:00.000Z day=mon free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h1-20261130-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-30T10:30:00.000Z day=mon free=1
+slot_id=W01QQQ-asst-gorla-h1-20261130-1200 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-30T12:00:00.000Z day=mon free=1
+slot_id=W01QQQ-asst-gorla-h1-20261130-1430 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-30T14:30:00.000Z day=mon free=1
+slot_id=W01QQQ-asst-gorla-h1-20261130-1600 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-30T16:00:00.000Z day=mon free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-0900 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h3-20261201-0900 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h1-20261201-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1030 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-1200 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T12:00:00.000Z day=tue free=1
+more: world procedure=VIS-FIS page=2
+---
+# hospital, 2026-11-21 00:51 UTC: every slot free=0 (a day already past in agenda time)
+slots page=1/8 matching=80 asst=asst-gorla from=2026-11-19 until=2026-12-03 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h2-20261119-0900 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T09:00:00.000Z day=thu free=0 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h3-20261119-0900 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T09:00:00.000Z day=thu free=0 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h2-20261119-1030 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T10:30:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h3-20261119-1030 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T10:30:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h2-20261119-1200 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T12:00:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h3-20261119-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T12:00:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h2-20261119-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T14:30:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h3-20261119-1430 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T14:30:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h2-20261119-1600 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T16:00:00.000Z day=thu free=0
+slot_id=W01QQQ-asst-gorla-h3-20261119-1600 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-11-19T16:00:00.000Z day=thu free=0
+more: world procedure=VIS-FIS page=2
+---
+# booking_centre, 2026-11-21 03:34 UTC: middle page 4/8, one reserved slot
+slots page=4/8 matching=80 asst=asst-gorla from=2026-11-30 until=2026-12-14 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h3-20261203-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-03T12:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261203-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-03T14:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h3-20261203-1430 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-03T14:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261203-1600 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-03T16:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h3-20261203-1600 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-03T16:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261204-0900 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-04T09:00:00.000Z day=fri free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h2-20261204-1030 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-04T10:30:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261204-1200 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-04T12:00:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261204-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-04T14:30:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261204-1600 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-04T16:00:00.000Z day=fri free=1
+more: world procedure=VIS-FIS page=5
+---
+# booking_centre, 2026-11-21 03:21 UTC: last page 8/8, no `more:` line
+slots page=8/8 matching=80 asst=asst-gorla from=2026-11-30 until=2026-12-14 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h3-20261210-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-10T12:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261210-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-10T14:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h3-20261210-1430 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-10T14:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261210-1600 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-10T16:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h3-20261210-1600 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-10T16:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-h2-20261211-0900 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-11T09:00:00.000Z day=fri free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h2-20261211-1030 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-11T10:30:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261211-1200 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-11T12:00:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261211-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-11T14:30:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-h2-20261211-1600 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-11T16:00:00.000Z day=fri free=1
+---
+# booking_centre, 2026-11-21 03:27 UTC: VIS-CARD last page 4/4, no `more:` line
+slots page=4/4 matching=40 asst=asst-gorla from=2026-11-30 until=2026-12-14 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-s1-20261209-1200 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-09T12:00:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-s1-20261209-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-09T14:30:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-s2-20261210-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-10T09:00:00.000Z day=thu free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s2-20261210-1030 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-10T10:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-s2-20261210-1200 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-10T12:00:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-s2-20261210-1430 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-10T14:30:00.000Z day=thu free=1
+slot_id=W01QQQ-asst-gorla-s1-20261211-0900 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-11T09:00:00.000Z day=fri free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s1-20261211-1030 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-11T10:30:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-s1-20261211-1200 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-11T12:00:00.000Z day=fri free=1
+slot_id=W01QQQ-asst-gorla-s1-20261211-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-11T14:30:00.000Z day=fri free=1
+---
+# specialist_care, 2026-11-21 04:02 UTC: VIS-CARD page 1/4
+slots page=1/4 matching=40 asst=asst-gorla from=2026-12-01 until=2026-12-15 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-s2-20261201-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s2-20261201-1030 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-s2-20261201-1200 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T12:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-s2-20261201-1430 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T14:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-s1-20261202-0900 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-02T09:00:00.000Z day=wed free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s1-20261202-1030 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-02T10:30:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-s1-20261202-1200 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-02T12:00:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-s1-20261202-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-02T14:30:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-s2-20261203-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-03T09:00:00.000Z day=thu free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s2-20261203-1030 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-03T10:30:00.000Z day=thu free=1
+more: world procedure=VIS-CARD page=2
+---
+# family_counseling, 2026-11-21 03:46 UTC: CONS-GIN page 1/5, one slot free=0
+slots page=1/5 matching=50 asst=asst-gorla from=2026-12-01 until=2026-12-15 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-c1-20261201-0900 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-c1-20261201-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T10:30:00.000Z day=tue free=0
+slot_id=W01QQQ-asst-gorla-c1-20261201-1200 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T12:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-c1-20261201-1430 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T14:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-c1-20261201-1600 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T16:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-c1-20261202-0900 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-02T09:00:00.000Z day=wed free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-c1-20261202-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-02T10:30:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-c1-20261202-1200 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-02T12:00:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-c1-20261202-1430 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-02T14:30:00.000Z day=wed free=1
+slot_id=W01QQQ-asst-gorla-c1-20261202-1600 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-02T16:00:00.000Z day=wed free=1
+more: world procedure=CONS-GIN page=2
+---
+# specialist_care, 2026-11-21 04:02 UTC: `world page=1` without procedure: all three facilities mixed, `more:` without procedure
+slots page=1/18 matching=180 asst=asst-gorla from=2026-12-01 until=2026-12-15 wave_id=W01QQQ
+slot_id=W01QQQ-asst-gorla-h1-20261201-0900 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h3-20261201-0900 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-s2-20261201-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-c1-20261201-0900 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T09:00:00.000Z day=tue free=1 urgent_reserve=true
+slot_id=W01QQQ-asst-gorla-h1-20261201-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1030 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-s2-20261201-1030 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-c1-20261201-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN at=2026-12-01T10:30:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h1-20261201-1200 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T12:00:00.000Z day=tue free=1
+slot_id=W01QQQ-asst-gorla-h3-20261201-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS at=2026-12-01T12:00:00.000Z day=tue free=1
+more: world page=2

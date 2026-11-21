@@ -1,0 +1,32 @@
+# Ledger refusals, rebuilt from episodes.fields (see README.md). One sample per op/code/detail seen
+# (NO_CAPACITY: one per facility). The op is a bare word after `refused` (templates/examples/agent.py:308, :903).
+# detail= is free text in the real reply: episodes keeps only its first word, so the rest of the sentence is missing.
+# hospital, 2026-11-21 01:31 UTC
+refused checkin code=POLICY_VIOLATION detail=outside
+---
+# hospital, 2026-11-20 22:38 UTC
+refused commit code=DUPLICATE detail=prescription_number
+---
+# hospital, 2026-11-20 23:20 UTC
+refused commit code=POLICY_VIOLATION detail=VIS-FIS
+---
+# hospital, 2026-11-21 03:03 UTC
+refused commit code=STALE_FENCE detail=expired
+---
+# hospital, 2026-11-21 03:57 UTC
+refused commit code=STALE_FENCE detail=the
+---
+# hospital, 2026-11-21 04:02 UTC
+refused hold code=EXPIRED detail=slot
+---
+# hospital, 2026-11-21 03:49 UTC
+refused hold code=FACILITY_CANCELLED detail=the
+---
+# family_counseling, 2026-11-21 03:43 UTC
+refused hold code=NO_CAPACITY detail=W01QQQ-asst-gorla-c1-20261201-1030
+---
+# hospital, 2026-11-21 00:45 UTC
+refused hold code=NO_CAPACITY detail=W01QQQ-asst-gorla-h2-20261120-1430
+---
+# specialist_care, 2026-11-21 03:02 UTC
+refused hold code=NO_CAPACITY detail=W01QQQ-asst-gorla-s1-20261127-1030

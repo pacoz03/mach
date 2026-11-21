@@ -1,0 +1,16 @@
+# Ledger reply to `report`, rebuilt from episodes.fields and anonymized (see README.md). Token order is reconstructed.
+# report_id is always rp-<booking_id>. Only specialist_care received reports. Ids match held/committed/checked_in.txt.
+# specialist_care, 2026-11-21 01:03 UTC: specialist_care: held, committed, checked_in, reported
+reported booking_id=bk-00000000-0000-4000-8000-000000000002 report_id=rp-bk-00000000-0000-4000-8000-000000000002 ledger_ref=aaaaaaaa-0000-4000-8000-000000000012
+---
+# specialist_care, 2026-11-21 01:09 UTC: specialist_care: held, committed, checked_in, reported
+reported booking_id=bk-00000000-0000-4000-8000-000000000003 report_id=rp-bk-00000000-0000-4000-8000-000000000003 ledger_ref=aaaaaaaa-0000-4000-8000-000000000019
+---
+# specialist_care, 2026-11-21 01:03 UTC: specialist_care: held, committed, checked_in, reported
+reported booking_id=bk-00000000-0000-4000-8000-000000000001 report_id=rp-bk-00000000-0000-4000-8000-000000000001 ledger_ref=aaaaaaaa-0000-4000-8000-000000000014
+---
+# specialist_care, 2026-11-21 00:41 UTC: specialist_care report outside the chains above
+reported booking_id=bk-00000000-0000-4000-8000-000000000005 report_id=rp-bk-00000000-0000-4000-8000-000000000005 ledger_ref=aaaaaaaa-0000-4000-8000-000000000006
+---
+# specialist_care, 2026-11-21 01:03 UTC: specialist_care report outside the chains above
+reported booking_id=bk-00000000-0000-4000-8000-000000000010 report_id=rp-bk-00000000-0000-4000-8000-000000000010 ledger_ref=aaaaaaaa-0000-4000-8000-000000000013

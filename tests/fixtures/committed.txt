@@ -1,0 +1,26 @@
+# Ledger reply to `commit`, rebuilt from episodes.fields and anonymized (see README.md). Token order is reconstructed.
+# booking_id = the hold_id of held.txt. family_counseling commits carry no prescription_number.
+# signature keeps the real JWS header (alg EdDSA, kid city:ledger#k1); the signature part is fake.
+# specialist_care, 2026-11-21 00:29 UTC: specialist_care: held, committed, checked_in, reported
+committed booking_id=bk-00000000-0000-4000-8000-000000000002 ledger_ref=aaaaaaaa-0000-4000-8000-000000000002 slot_id=W01QQQ-asst-gorla-s1-20261120-1200 agenda_date=2026-11-20T12:00:00.000Z prescription_number=prescription_number-FACE00000000000000000002 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# family_counseling, 2026-11-21 01:03 UTC: family_counseling, direct access (no prescription_number): held, committed
+committed booking_id=bk-00000000-0000-4000-8000-000000000009 ledger_ref=aaaaaaaa-0000-4000-8000-000000000015 slot_id=W01QQQ-asst-gorla-c1-20261120-1200 agenda_date=2026-11-20T12:00:00.000Z signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0009AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# hospital, 2026-11-21 00:46 UTC: hospital: held, committed, checked_in (no report)
+committed booking_id=bk-00000000-0000-4000-8000-000000000007 ledger_ref=aaaaaaaa-0000-4000-8000-000000000008 slot_id=W01QQQ-asst-gorla-h2-20261120-1600 agenda_date=2026-11-20T16:00:00.000Z prescription_number=prescription_number-FACE00000000000000000005 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0007AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# specialist_care, 2026-11-21 00:32 UTC: specialist_care: held, committed, checked_in, reported
+committed booking_id=bk-00000000-0000-4000-8000-000000000003 ledger_ref=aaaaaaaa-0000-4000-8000-000000000003 slot_id=W01QQQ-asst-gorla-s1-20261120-1430 agenda_date=2026-11-20T14:30:00.000Z prescription_number=prescription_number-FACE00000000000000000003 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# specialist_care, 2026-11-21 00:21 UTC: specialist_care: held, committed, checked_in, reported
+committed booking_id=bk-00000000-0000-4000-8000-000000000001 ledger_ref=aaaaaaaa-0000-4000-8000-000000000001 slot_id=W01QQQ-asst-gorla-s1-20261120-1030 agenda_date=2026-11-20T10:30:00.000Z prescription_number=prescription_number-FACE00000000000000000001 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# hospital, 2026-11-21 00:53 UTC: hospital: held, committed, no check-in
+committed booking_id=bk-00000000-0000-4000-8000-000000000008 ledger_ref=aaaaaaaa-0000-4000-8000-000000000009 slot_id=W01QQQ-asst-gorla-h1-20261123-0900 agenda_date=2026-11-23T09:00:00.000Z prescription_number=prescription_number-FACE00000000000000000006 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# family_counseling, 2026-11-21 00:36 UTC: family_counseling, direct access (no prescription_number): held, committed, checked_in
+committed booking_id=bk-00000000-0000-4000-8000-000000000004 ledger_ref=aaaaaaaa-0000-4000-8000-000000000004 slot_id=W01QQQ-asst-gorla-c1-20261119-1200 agenda_date=2026-11-19T12:00:00.000Z signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+# hospital, 2026-11-21 00:44 UTC: hospital: held, committed, checked_in (no report)
+committed booking_id=bk-00000000-0000-4000-8000-000000000006 ledger_ref=aaaaaaaa-0000-4000-8000-000000000007 slot_id=W01QQQ-asst-gorla-h2-20261120-1430 agenda_date=2026-11-20T14:30:00.000Z prescription_number=prescription_number-FACE00000000000000000004 signature=eyJhbGciOiJFZERTQSIsImtpZCI6ImNpdHk6bGVkZ2VyI2sxIn0..FAKE0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA

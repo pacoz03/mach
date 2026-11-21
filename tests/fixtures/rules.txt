@@ -1,0 +1,4 @@
+# Ledger reply to `rules`, rebuilt from episodes.fields (see README.md).
+# All 258 replies up to 2026-11-21 04:03 UTC have the single token count=0: no P1/P2/P3 rule has been seen as text yet.
+# booking_centre, 2026-11-21 04:03 UTC: the only shape seen so far: no rule active
+rules count=0

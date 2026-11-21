@@ -1,0 +1,17 @@
+# Ledger reply to `prescription prescription_number=...`, rebuilt from episodes.fields and anonymized (see README.md).
+# Token order is reconstructed. Only state=issued was ever seen (no expired/used/not-found shape in episodes).
+# patient and need_id share the same fake citizen number, as the real ones share the real one.
+# booking_centre, 2026-11-21 04:00 UTC: priority/procedure/symptom combination B VIS-CARD SYM-PALPITATIONS
+prescription prescription_number=prescription_number-FACE00000000000000000008 patient=citizen:W01QQQ-24-0002-900013 procedure=VIS-CARD priority=B state=issued symptom_code=SYM-PALPITATIONS issued_by=agent:ck9w60ejwnvw need_id=N-2026-11-02-8909249000130002 ledger_ref=aaaaaaaa-0000-4000-8000-000000000021
+---
+# booking_centre, 2026-11-21 04:02 UTC: priority/procedure/symptom combination B VIS-FIS SYM-BACK
+prescription prescription_number=prescription_number-FACE00000000000000000011 patient=citizen:W01QQQ-24-900015 procedure=VIS-FIS priority=B state=issued symptom_code=SYM-BACK issued_by=agent:ck9w60ejwnvw need_id=N-2026-11-02-890924900015 ledger_ref=aaaaaaaa-0000-4000-8000-000000000024
+---
+# booking_centre, 2026-11-21 04:01 UTC: priority/procedure/symptom combination D VIS-FIS SYM-KNEE
+prescription prescription_number=prescription_number-FACE00000000000000000010 patient=citizen:W01QQQ-24-900014 procedure=VIS-FIS priority=D state=issued symptom_code=SYM-KNEE issued_by=agent:ck9w60ejwnvw need_id=N-2026-11-02-890924900014 ledger_ref=aaaaaaaa-0000-4000-8000-000000000023
+---
+# booking_centre, 2026-11-21 03:52 UTC: priority/procedure/symptom combination P VIS-CARD SYM-FOLLOWUP
+prescription prescription_number=prescription_number-FACE00000000000000000007 patient=citizen:W01QQQ-24-900012 procedure=VIS-CARD priority=P state=issued symptom_code=SYM-FOLLOWUP issued_by=agent:ck9w60ejwnvw need_id=N-2026-11-02-890924900012 ledger_ref=aaaaaaaa-0000-4000-8000-000000000020
+---
+# booking_centre, 2026-11-21 04:00 UTC: patient id with the longer shape citizen:<wave>-<asst>-<nnnn>-<nnnnnn>
+prescription prescription_number=prescription_number-FACE00000000000000000009 patient=citizen:W01QQQ-24-0004-900002 procedure=VIS-FIS priority=B state=issued symptom_code=SYM-BACK issued_by=agent:ck9w60ejwnvw need_id=N-2026-11-02-8909249000020004 ledger_ref=aaaaaaaa-0000-4000-8000-000000000022
