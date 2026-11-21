@@ -377,6 +377,8 @@ async def main(need: Need, city: City) -> None:
         return
     if message.sender == city.agent_id:
         return
+    if tools.too_long(message):  # an attack message: no work on its text
+        return
     text = message.text or need.summary
     # A red flag first, before anything else and before the clinical refusal.
     if message.sender.startswith("citizen:") and (

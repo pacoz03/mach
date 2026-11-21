@@ -220,6 +220,8 @@ async def main(need: Need, city: City) -> None:
     brain is a crash or, an httpx timeout, a redelivery that says every message of the turn twice
     (city_sdk harness.py ``_think``/``_deferred_turn``)."""
 
+    if city.inbound is not None and tools.too_long(city.inbound):  # an attack message: no work on its text
+        return
     msg_id = getattr(city.inbound, "msg_id", "")
     if msg_id and msg_id in _DONE:  # a redelivery of a finished turn: it said everything already
         return

@@ -211,6 +211,44 @@ def observe(message: Any) -> None:
     })
 
 
+# Messaggi lunghissimi mandati per rallentare gli agenti (regex, history, LLM su testo enorme).
+# Misure reali (24 h, 2026-11-21): cittadini al massimo 430 caratteri, agenti circa 1.700. Il
+# Ledger e la città (city:*) non hanno limite: le pagine di world e agenda sono lunghe davvero.
+MAX_CITIZEN_CHARS = 2000
+MAX_AGENT_CHARS = 6000
+
+
+def too_long(message: Any) -> bool:
+    """True per un messaggio troppo lungo per venire da un cittadino o da un agente onesto.
+
+    Chiamalo per primo in main() e, se è True, chiudi il turno senza rispondere: niente
+    controllo clinico, history, Ledger o LLM sul testo. Lascia in episodes un'uscita ``oversize``
+    con la sola lunghezza (``chars``), mai il testo.
+    """
+
+    sender = getattr(message, "sender", "") or ""
+    text = getattr(message, "text", "") or ""
+    if sender.startswith("city:"):
+        return False
+    limit = MAX_CITIZEN_CHARS if sender.startswith("citizen:") else MAX_AGENT_CHARS
+    if len(text) <= limit:
+        return False
+    role, version = me()
+    _background("observe", {
+        "p_agent": role,
+        "p_direction": "in",
+        "p_peer": sender,
+        "p_msg_id": getattr(message, "msg_id", None),
+        "p_need_id": getattr(message, "need_id", None),
+        "p_citizen": sender if sender.startswith("citizen:") else None,
+        "p_act": "oversize",
+        "p_fields": {"chars": len(text)},
+        "p_version": version,
+        "p_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return True
+
+
 def said(to: str, text: str, msg_id: str | None = None, *, error: str | None = None) -> None:
     """Registra un nostro messaggio in uscita (dopo city.say), con la latenza del turno.
     Se city.say ha sollevato CapError passa error=exc.code e msg_id=None."""

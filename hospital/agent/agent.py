@@ -21,6 +21,8 @@ async def main(need: Need, city: City) -> None:
     message = city.inbound
     if message is None:
         return
+    if tools.too_long(message):  # messaggio-attacco: nessun lavoro sul testo
+        return
     # Red flag prima del rifiuto clinico: escalate.emergency e stop (R:242).
     if await facility.emergency(need, city):
         return
