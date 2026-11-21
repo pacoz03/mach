@@ -1,7 +1,7 @@
 agent_id: agent:yg8debxe3x0p
 team: team:the-promptfather-s
 name: family_counseling
-version: 1.0.9
+version: 1.0.10
 cap_versions:
   - "1.0"
 profiles:
