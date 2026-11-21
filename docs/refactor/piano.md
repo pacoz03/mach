@@ -49,6 +49,26 @@ Il codice è cresciuto a forza di correzioni sui percorsi veri. Funziona, ma è 
 - **Controllo unico** (step 0): un solo comando che lancia tutto in parallelo.
 - **I subagent lavorano in worktree**, uno per file. Per `tests/journey.py`: `git merge-file` con la base, perché i blocchi aggiunti in coda vanno in conflitto e vanno tenuti entrambi.
 
+## Struttura di arrivo (decisione dell'utente, 05:09: gerarchica, fedele al kit, senza righe inutili)
+
+Il kit ha un solo brain di esempio (`templates/examples/agent.py`), diviso in sezioni: «shared», «medico di base», «centro prenotazioni e consultorio». Noi teniamo le stesse sezioni, ma come file. Il Dockerfile del kit copia tutta `agent/` (`COPY agent ./agent`, `PYTHONPATH=/opt/agent`), e `city deploy` include le sottocartelle (`city_deploy/image.py:239`), quindi un pacchetto dentro `agent/` funziona.
+
+```
+shared/mach/              fonte unica del codice comune; sync.sh la copia in <agente>/agent/mach/
+  protocol.py             leggere e scrivere i messaggi (sezione «shared» del kit)
+  case.py                 lo stato del caso dalla history (_offered, _withdrawn, _number, … del kit)
+  clock.py, world.py      orologio di agenda, pagine di world e fitting
+  facility.py             le parti comuni delle tre strutture: ricevuta, check-in, cross-ASST, sonda, emergenza
+  tools.py                memoria condivisa (oggi shared/tools.py, si sposta allo step 7)
+<agente>/agent/agent.py   main(): controllo clinico, start_turn, tabella (chi scrive, atto) → funzione
+<agente>/agent/<ruolo>.py il ramo del ruolo, scritto solo lì (hospital.py, specialist.py, family.py, booking.py, gp.py)
+```
+
+- Il codice usato da più agenti sta in `shared/mach/`. Quello di un solo ruolo sta nella cartella del suo agente, senza copie.
+- Nessun file sopra le ~800 righe e nessuna funzione sopra le ~80 nel percorso caldo.
+- Il codice morto si toglie nello step che tocca il file. Lo step 7 resta per ciò che avanza.
+- `AGENT.md` (regola 2 e «Memoria condivisa e tool») si aggiorna quando la struttura entra su master.
+
 ## Gli step
 
 | Step | Cosa | File | Fatto quando |
