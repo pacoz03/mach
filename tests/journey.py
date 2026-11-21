@@ -161,6 +161,7 @@ class Ledger:
         self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
+        self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -171,6 +172,8 @@ class Ledger:
         return bool(r) and self.rules["P1"] == "on" and self.now - r["issued"] > timedelta(days=2)
 
     def late(self, text: str) -> float:
+        if (text.split() or [""])[0] in ("hold", "commit"):
+            return self.slow_writes
         if (text.split() or [""])[0] == "world":
             return self.slow_world
         if (text.split() or [""])[0] != "agenda":
@@ -357,8 +360,8 @@ class Port:
         m = b.add(self.me, to, body, need_id, conversation_id)
         if to == LEDGER:  # la risposta è subito nel log: il polling nel turno la vede
             text = b.ledger.answer(self.me, need_id, m.text, len(b.log) - 1)
-            if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città
-                asyncio.get_running_loop().call_later(delay, b.reply, self.me, text, need_id, conversation_id)
+            if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città; il bus la aspetta
+                b.tasks.append(asyncio.create_task(b.later(delay, self.me, text, need_id, conversation_id)))
             else:
                 r = b.reply(self.me, text, need_id, conversation_id)
                 if b.race and text.startswith("held "):  # il push di held apre subito un turno suo
@@ -503,6 +506,10 @@ class Bus:
         self.bounce = sc.get("bounce", 0)
         self.timeouts = sc.get("say_timeout", 0)
         self.late_refusal = sc.get("late_refusal", False)
+        self.took: dict[str, float] = {}  # msg_id -> secondi del turno che ha aperto (l'ack parte alla fine)
+        self.opened: dict[int, Message] = {}  # turno -> messaggio che lo ha aperto
+        if "pull_pause" in sc:  # in città ogni lettura della history costa: 0,25 s di pausa + la lettura
+            self.agents[self.ids["hospital"]].mods["facility"]._PULL_PAUSE = sc["pull_pause"]
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -529,6 +536,10 @@ class Bus:
             self.queue.append(self.add(LEDGER, to, {"text": late}, need, conv))
         return r
 
+    async def later(self, delay: float, *reply) -> None:
+        await asyncio.sleep(delay)
+        self.reply(*reply)
+
     async def deliver(self, m: Message) -> None:
         a = self.agents[m.recipient]
         if a.main is None:
@@ -538,6 +549,7 @@ class Bus:
         # sc["address"]: la via dell'ospedale (city.address, CITY_ADDRESS in città)
         street = self.citizen.sc.get("address", "") if a.folder == "hospital" else ""
         city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm, address=street)
+        started = time.monotonic()
         with a.active():
             try:
                 await a.main(Need(summary=m.text, message=m), city)
@@ -545,6 +557,7 @@ class Bus:
                 self.oos.add(m.msg_id)
             except Exception:
                 self.crashes.append(f"crash {a.folder}: {traceback.format_exc().strip().splitlines()[-1]}")
+        self.took[m.msg_id] = time.monotonic() - started
         if self.dup and m.sender == self.ids["booking_centre"] and a.folder == "hospital" and m.text.startswith("confirm"):
             self.dup -= 1  # sc["dup_confirm"]: lo stesso confirm arriva di nuovo dopo il turno, msg_id nuovo
             self.queue.append(self.add(m.sender, m.recipient, m.body, m.need_id, m.conversation_id))
@@ -575,6 +588,7 @@ class Bus:
                     continue
                 m = self.queue.popleft()
                 self.turn += 1
+                self.opened[self.turn] = m
                 if m.recipient == CIT:
                     self.citizen.react(m)
                 elif m.recipient == FOREIGN:
@@ -1297,10 +1311,13 @@ def cross_turn_ends(rid: str, nxt: str):
     def check(b: Bus) -> str | None:
         got = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
                     and f"request_id={rid}" in m.text.split()), None)
+        req = next((m for m in b.log if m.sender == FOREIGN and f"request_id={rid}" in m.text.split()), None)
         asked = next((m for m in b.log if m.sender == FOREIGN and f"request_id={nxt}" in m.text.split()), None)
-        if got is None or asked is None:
+        if got is None or asked is None or req is None:
             return f"risposta a {rid} o richiesta {nxt} mancante"
-        took = b.stamp[asked.msg_id] - b.stamp[got.msg_id]
+        # The turn's own duration (b.took): the bus also waits for slow Ledger replies before nxt.
+        took = b.took[req.msg_id] - (b.stamp[got.msg_id] - b.stamp[req.msg_id]) if req.msg_id in b.took else (
+            b.stamp[asked.msg_id] - b.stamp[got.msg_id])
         if took >= 1.0:
             return f"turno dell'ospedale ancora aperto {took:.1f} s dopo la risposta a {rid}: ack in ritardo"
     return check
@@ -1322,6 +1339,32 @@ SCENARIOS.update({
         foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-31", "R-32")],
         expect=[cross_reply("R-31", "B"), cross_fast("R-31", 1.0), cross_turn_ends("R-31", "R-32"),
                 cross_reply("R-32", "B"), cross_fast("R-32", 1.0)]),
+})
+
+
+# --- E: scritture lente sul Ledger, il turno del confirm si chiude prima di 10 s (ack, R:246)
+
+
+def slow_booking(b: Bus) -> str | None:
+    """Il turno del confirm dell'ospedale finisce in meno di 10 s (l'harness manda l'ack a fine
+    turno), poi il push di held committa e quello di committed manda la ricevuta, una volta."""
+    hosp, bc = b.ids["hospital"], b.ids["booking_centre"]
+    took = [round(b.took[m.msg_id], 1) for m in b.log
+            if m.sender == bc and m.recipient == hosp and m.text.startswith("confirm") and m.msg_id in b.took]
+    if not took or max(took) >= 10:
+        return f"turno del confirm dell'ospedale {took} s, serve < 10 s (ack, R:246)"
+    for to, head, push in ((LEDGER, "commit", "held"), (bc, "booking.receipt", "committed")):
+        sent = [m for m in b.log if m.sender == hosp and m.recipient == to and m.text.startswith(head + " ")]
+        opened = [b.opened[b.turn_of[m.msg_id]].text.split()[0] for m in sent]
+        if opened != [push]:
+            return f"hospital: {head} nei turni aperti da {opened} invece che una volta dal push di {push}"
+
+
+SCENARIOS.update({
+    # Hold e commit rispondono dopo 25 s (città 21/11: ~30 s), ogni lettura della history 0,5 s.
+    # Solo con --ledger-turns: senza push di held e committed nessuno finirebbe la prenotazione.
+    "ospedale_scritture_lente": dict(start=BACK, slow_writes=25.0, pull_pause=0.5, ledger_turns=True,
+                                     expect=[slow_booking, hospital_commits(1), wrote("checkin", "R:234")]),
 })
 
 
@@ -1348,6 +1391,9 @@ def main() -> int:
     failed = 0
     for name, sc in SCENARIOS.items():
         if args.k and args.k not in name:
+            continue
+        if sc.get("ledger_turns") and not args.ledger_turns:  # vale solo con i push del Ledger
+            print(f"SKIP {name}")
             continue
         bus = Bus(sc, args.ledger_turns)
         asyncio.run(bus.run(sc["start"]))

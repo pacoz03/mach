@@ -244,6 +244,7 @@ async def handle(role: str, need: Need, city: City) -> None:
     The caller already refused clinical text and called ``tools.start_turn``.
     """
 
+    started = time.monotonic()
     message = city.inbound
     if message is None:
         return
@@ -254,10 +255,12 @@ async def handle(role: str, need: Need, city: City) -> None:
         return
     if role == "hospital":
         flag = _HOSPITAL.set(True)
+        by = _BOOK_BY.set(started + _BOOK_BUDGET)
         try:
             _unhold(message, chat, city.agent_id)
             await _hospital(city, message, chat)
         finally:
+            _BOOK_BY.reset(by)
             _HOSPITAL.reset(flag)
     elif role == "specialist_care":
         kind = words(message.text)
@@ -392,6 +395,14 @@ _HOSPITAL: ContextVar[bool] = ContextVar("hospital", default=False)
 # for the life of the process after a down window (every partner then got no_availability).
 _BOUNCED: dict[tuple[str, str, str], float] = {}
 _BOUNCE_TTL = 60.0
+# Hospital: the confirm turn stops waiting for held and committed this many seconds after the turn
+# began, then ends. The harness acks a push only when the turn ends and the fast reply (+1, R:246)
+# is scored on that ack (< 10 s); live writes take ~30 s each (21/11 00:36: hold -> held 30 s,
+# commit -> committed 30 s), so the held push commits and the committed push sends the receipt,
+# in turns of their own (_hospital: book: lock, fresh history).
+_BOOK_BUDGET = 7.0
+# Hospital: time.monotonic() at which this turn stops waiting on the Ledger (handle); else None.
+_BOOK_BY: ContextVar[float | None] = ContextVar("book_by", default=None)
 
 
 async def _say(city: City, to: str, text: str) -> bool:
@@ -459,9 +470,11 @@ async def _await_line(
     *,
     op: str,
     new: bool = False,
+    deadline: float | None = None,
 ) -> tuple[Message, list[Message]] | None:
     """The ledger line for ``token``, or a refusal of ``op`` that was not already in ``chat``.
-    ``new``: the line too must not be in ``chat`` (a re-hold: the old ``held`` is stale)."""
+    ``new``: the line too must not be in ``chat`` (a re-hold: the old ``held`` is stale).
+    ``deadline``: time.monotonic() after which no more reads, even with tries left."""
 
     known = {row.msg_id for row in chat}
     fresh = chat
@@ -480,8 +493,9 @@ async def _await_line(
             if first_word(row.text) == "refused" and op in words(row.text):
                 tools.observe(row)
                 return row, fresh
-        if attempt + 1 < _PULL_TRIES:
-            await asyncio.sleep(_PULL_PAUSE)
+        if attempt + 1 == _PULL_TRIES or deadline is not None and time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(_PULL_PAUSE)
     return None
 
 
@@ -2742,10 +2756,16 @@ async def _finish_booking(
     new: bool = False,
 ) -> None:
     """Hold is in the mailbox. Read the held line and commit before this turn ends.
-    ``new``: a hold just sent, so a ``held`` already in ``chat`` belongs to an older one."""
+    ``new``: a hold just sent, so a ``held`` already in ``chat`` belongs to an older one.
+    Hospital: only until _BOOK_BY; a line not read by then is the held or committed push's job
+    (_on_held commits a hold we never committed, _on_committed sends a receipt not yet sent).
+    ponytail: no sweeper. A lost held push leaves the hold uncommitted, a lost committed push
+    leaves the receipt unsent, until the next confirm of the case reads the line from history
+    (or, after an ``expired`` row, holds again: _since_hold, _drops_hold)."""
 
+    by = _BOOK_BY.get()
     found = await _await_line(
-        city, message.need_id, chat, "held", f"slot_id={slot}", op="hold", new=new
+        city, message.need_id, chat, "held", f"slot_id={slot}", op="hold", new=new, deadline=by
     )
     if found is None:
         _LOG.info("care.held.missing", extra={"need_id": (message.need_id or "")[:48]})
@@ -2761,7 +2781,7 @@ async def _finish_booking(
     if not hold_id:
         return
     done = await _await_line(
-        city, message.need_id, fresh, "committed", f"booking_id={hold_id}", op="commit"
+        city, message.need_id, fresh, "committed", f"booking_id={hold_id}", op="commit", deadline=by
     )
     if done is None:
         _LOG.info("care.commit.missing", extra={"need_id": (message.need_id or "")[:48]})
