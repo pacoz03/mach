@@ -670,6 +670,7 @@ class Bus:
         # sc["ledger_cancel"]: a prenotazione fatta il Ledger la annulla, poi il cittadino chiede l'orario.
         # sc["after_cancel"]: cosa il cittadino scrive all'ospedale dopo l'annullo (default ORARIO);
         # {hold_id}/{ledger_ref} sono quelli della prenotazione annullata.
+        # sc["cancel_at"]: la struttura della prenotazione annullata (default l'ospedale).
         # sc["booking_cancel"]: a prenotazione fatta il centro annulla la visita per il cittadino.
         sc = self.citizen.sc
         if sc.get("setup"):  # sc["setup"](bus): stub e push propri dello scenario, prima del primo turno
@@ -684,14 +685,15 @@ class Bus:
                 self.queue.append(self.add(LEDGER, hosp, {"text": text}, old))
         for c in self.others.values():
             c.say(self.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={c.rx} lang=it")
-        cancel = (("ledger", sc["ledger_cancel"]), ("hospital", sc.get("after_cancel", ORARIO))) if "ledger_cancel" in sc else ()
+        at, after = sc.get("cancel_at", "hospital"), sc.get("after_cancel", ORARIO)  # after_cancel=None: niente
+        cancel = (("ledger", sc["ledger_cancel"]), *(((at, after),) if after else ())) if "ledger_cancel" in sc else ()
         cancel += (("booking", sc["booking_cancel"]),) if "booking_cancel" in sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
                          *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ())), *cancel):
             if to == "ledger":
                 h = self.dropped = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
                 h["state"] = "cancelled"
-                self.queue.append(self.add(LEDGER, self.ids["hospital"], {"text": REPLY["cancelled"].format(**h)
+                self.queue.append(self.add(LEDGER, self.ids[at], {"text": REPLY["cancelled"].format(**h)
                                            + f" booking_id={h['hold_id']} reason={text}"}))
             elif to == "booking":  # l'offer_id del confirm del centro, come lo nomina un centro vero
                 bc, hosp = self.ids["booking_centre"], self.ids["hospital"]
@@ -699,7 +701,7 @@ class Bus:
                 offer = next(fields(m.text)["offer_id"] for m in self.log if m.sender == bc and m.recipient == hosp
                              and m.text.startswith("confirm") and f"slot_id={h['slot_id']}" in m.text.split())
                 self.queue.append(self.add(bc, hosp, {"text": f"cancel offer_id={offer} reason={text}"}))
-            elif to == "hospital" and "{hold_id}" in text:
+            elif to == at and "{hold_id}" in text:
                 self.citizen.say(self.ids[to], text.format(**self.dropped))
             elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
                 text, need = text if isinstance(text, tuple) else (text, NEED)  # (testo, need_id): altro caso
@@ -1385,14 +1387,15 @@ def rehold(b: Bus) -> str | None:
         return f"dopo il rifiuto {len(again)} hold su {slot} invece di uno accettato (re-hold)"
 
 
-def cancel_told(peer: str, reason: str | None, n: int):
-    """``reason=None``: un cancel con un motivo qualsiasi. ``peer``: cartella, "citizen" o FOREIGN."""
+def cancel_told(peer: str, reason: str | None, n: int, folder: str = "hospital"):
+    """``reason=None``: un cancel con un motivo qualsiasi. ``peer``: cartella, "citizen" o FOREIGN.
+    ``folder``: la struttura che lo manda."""
     def check(b: Bus) -> str | None:
         to = CIT if peer == "citizen" else b.ids.get(peer, peer)
-        got = [m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == to and act(m) == "cancel"
+        got = [m for m in b.log if m.sender == b.ids[folder] and m.recipient == to and act(m) == "cancel"
                and (f"reason={reason}" in m.text.split() if reason else "reason=" in m.text)]
         if len(got) != n:
-            return f"hospital ha mandato {len(got)} cancel reason={reason or '…'} a {b.name(to)} invece di {n}"
+            return f"{folder} ha mandato {len(got)} cancel reason={reason or '…'} a {b.name(to)} invece di {n}"
     return check
 
 
@@ -2754,6 +2757,63 @@ SCENARIOS.update({
         foreign_after=[XFIS_D.format(rid=r, extra="") for r in ("R-21", "R-22", "R-23")],
         setup=restart_hospital("request_id=R-21"),
         expect=[*(cross_reply(r, "D") for r in ("R-21", "R-22", "R-23")), cross_spread("R-21", "R-22", "R-23")]),
+})
+
+
+# --- Specialista e consultorio come l'ospedale: l'annullo del Ledger arriva a chi ha prenotato, la
+# ricevuta nomina lo slot, niente no_availability senza una pagina di world -----------------------
+PALPITAZIONI = ("gp", "Sento le palpitazioni da qualche giorno.")
+GINECOLOGIA = ("family_counseling", "Buongiorno, vorrei una visita ginecologica. lang=it")
+
+
+def receipt_slot(folder: str):
+    """Ogni booking.receipt di ``folder`` a un agente porta lo ``slot_id=`` della prenotazione sul Ledger."""
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender == b.ids[folder] and m.recipient.startswith("agent:")
+               and act(m) == "booking.receipt"]
+        if not got:
+            return f"{folder}: nessuna ricevuta a un agente"
+        for m in got:
+            h = b.ledger.holds.get(fields(m.text).get("booking_id", ""))
+            if h is None or fields(m.text).get("slot_id") != h["slot_id"]:
+                return f"{folder}: ricevuta senza lo slot_id della prenotazione: «{m.text[:80]}»"
+    return check
+
+
+def dropped_not_offered(folder: str):
+    """Dopo il cancelled del Ledger ``folder`` non offre più lo slot annullato."""
+    def check(b: Bus) -> str | None:
+        h = getattr(b, "dropped", None)
+        i = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.text.startswith("cancelled ")), None)
+        if h is None or i is None:
+            return "nessun cancelled dal Ledger"
+        if any(o.get("slot_id") == h["slot_id"] for m in b.log[i + 1:] if m.sender == b.ids[folder]
+               for o in parse_offers(m.text)):
+            return f"{folder} ha offerto di nuovo lo slot annullato {h['slot_id']}"
+    return check
+
+
+SCENARIOS.update({
+    # Il Ledger annulla la prenotazione dallo specialista: cancel col motivo al centro e al cittadino,
+    # una volta, come l'ospedale (arena annullo_citta_cardiologia: lo specialista taceva).
+    "specialista_annullata": dict(start=PALPITAZIONI, ledger_cancel="facility_closed", cancel_at="specialist_care",
+                                  expect=[cancel_told("booking_centre", "facility_closed", 1, "specialist_care"),
+                                          cancel_told("citizen", "facility_closed", 1, "specialist_care")]),
+    # Lo stesso al consultorio (accesso diretto): lo dice al cittadino e non gli rioffre lo slot chiuso.
+    "consultorio_annullata": dict(start=GINECOLOGIA, ledger_cancel="facility_closed", cancel_at="family_counseling",
+                                  after_cancel=None, expect=[cancel_told("citizen", "facility_closed", 1, "family_counseling"),
+                                          dropped_not_offered("family_counseling")]),
+    # La ricevuta al centro nomina lo slot del Ledger, anche quella ripetuta per un confirm doppio.
+    "ricevuta_slot_ospedale": dict(start=BACK, dup_confirm=1, expect=[receipt_slot("hospital")]),
+    "ricevuta_slot_specialista": dict(start=PALPITAZIONI, expect=[receipt_slot("specialist_care")]),
+    # world dello specialista lento (5 s, oltre l'attesa del turno): nessun no_availability senza
+    # pagina, le offerte partono dal turno della risposta di world (come cross_asst_world_prima_di_agenda).
+    "specialista_world_lento": dict(
+        start=("specialist_care", "need.request service=lab summary=visit district=8"), foreign=True,
+        ledger_turns=True, slow_world=5.0,
+        setup=our_booking_asks(("specialist_care", XREQ.format(
+            svc="specialist_care.cardiology", proc="VIS-CARD", rid="x-ours4"))),
+        expect=[offered_to_booking("specialist_care", "x-ours4", 10.0)]),
 })
 
 

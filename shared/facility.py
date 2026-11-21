@@ -302,10 +302,17 @@ async def _turn(role: str, need: Need, city: City) -> None:
             _BOOK_BY.reset(by)
             _HOSPITAL.reset(flag)
     elif role == "specialist_care":
+        cardiology = {"procedures": _CARDIOLOGY, "ours": "del nostro ambulatorio di cardiologia"}
+        # As the hospital: a late agenda or world answer, as its own Ledger turn, refreshes the
+        # clock or the cache, then the partner requests still waiting for it get their answer
+        # (after a restart, or on a second pod, the clock comes back from the case: _recover).
+        _recover(chat, city.agent_id)
         if message.sender == LEDGER and first_word(message.text) == "agenda":
             _ledger([message], "agenda")  # refreshes the city clock (_CLOCK) for the cache
+            await _answer_pending(city, chat, **cardiology)
         if message.sender == LEDGER and _keep_world_reply(message):
-            return  # a late world answer: cached for the next partner request
+            await _answer_pending(city, chat, **cardiology)
+            return
         kind = words(message.text)
         if (
             message.sender.startswith("agent:")
@@ -316,9 +323,7 @@ async def _turn(role: str, need: Need, city: City) -> None:
             and {"request_id", "procedure", "service_type"} & _fields(message).keys()
         ):
             # Level 4: another ASST's booking centre asks for our cardiology slots (R:191).
-            await _cross_asst(
-                city, message, procedures=_CARDIOLOGY, ours="del nostro ambulatorio di cardiologia"
-            )
+            await _cross_asst(city, message, **cardiology)
         else:
             confirm = "confirm" in kind or message.type == "confirm"
             booking = _facility(city, message, chat, reports=True, hold_self=False)
@@ -377,7 +382,7 @@ def _fields(row: Message) -> dict[str, str]:
 
 
 # True only inside a hospital turn (handle): the booking lifecycle fixes gated on it (one commit,
-# re-hold, duplicate confirm, Ledger cancel, no resend after TARGET_NOT_VISIBLE) leave the
+# re-hold, duplicate confirm, no resend after TARGET_NOT_VISIBLE) leave the
 # specialist and the consultorio as they were. ponytail: a ContextVar, not a flag threaded
 # through six shared signatures.
 _HOSPITAL: ContextVar[bool] = ContextVar("hospital", default=False)
@@ -633,8 +638,8 @@ def _offered(chat: list[Message], agent: str) -> set[str]:
 
 
 def _withdrawn(chat: list[Message], agent: str) -> set[str]:
-    """Slots we cancelled or the Ledger refused. The citizen drops the rest, so those are
-    offered again."""
+    """Slots we cancelled or the Ledger refused, cancelled or let expire. The citizen drops the
+    rest, so those are offered again."""
 
     by_offer = {
         offer["offer_id"]: offer["slot_id"]
@@ -644,7 +649,8 @@ def _withdrawn(chat: list[Message], agent: str) -> set[str]:
     dropped: set[str] = set()
     for row in chat:
         fields = fields_of(row.text)
-        if row.sender == LEDGER and first_word(row.text) == "refused" and fields.get("slot_id"):
+        if (row.sender == LEDGER and first_word(row.text) in {"refused", "cancelled", "expired"}
+                and fields.get("slot_id")):
             dropped.add(fields["slot_id"])
         if "cancel" not in words(row.text):
             continue
@@ -1006,7 +1012,7 @@ async def _confirm_alone(
                 await _say(
                     city,
                     message.sender,
-                    f"booking.receipt booking_id={booked[0]} ledger_ref={booked[1]}",
+                    f"booking.receipt booking_id={booked[0]} ledger_ref={booked[1]} slot_id={slot}",
                 )
             return
         # After a refusal, expiry or cancellation the old hold is gone: hold again.
@@ -1061,7 +1067,7 @@ def _facility_turn(message: Message) -> bool:
     kind = words(message.text)
     if message.sender == LEDGER and head in {"held", "committed", "checked_in", "reported"}:
         return True
-    if message.sender == LEDGER and head == "refused" and "hold" in kind:
+    if message.sender == LEDGER and head == "refused" and "hold" in kind or _dropped(message):
         return True
     if ("checkin" in kind or message.type == "checkin") and message.sender.startswith("citizen:"):
         return True
@@ -1447,7 +1453,9 @@ async def _facility_dispatch(
 ) -> None:
     head = first_word(message.text)
     kind = words(message.text)
-    if message.sender == LEDGER and head == "held":
+    if _dropped(message):
+        await _on_dropped(city, message, chat, hold_self=hold_self)
+    elif message.sender == LEDGER and head == "held":
         await _on_held(city, message, chat, direct=hold_self)
     elif message.sender == LEDGER and head == "committed":
         await _on_committed(city, message, chat, direct=hold_self)
@@ -1470,6 +1478,41 @@ async def _facility_dispatch(
         await _on_confirm(city, message, chat, hold_self=hold_self)
     elif message.sender.startswith("citizen:"):
         await _redirect(city, message, chat)
+
+
+def _dropped(message: Message) -> bool:
+    """A Ledger row that ends our hold or booking outside our turn: cancelled, expired, or a
+    refused commit. A refused hold has its own branch (_on_refused)."""
+
+    head = first_word(message.text)
+    return message.sender == LEDGER and (
+        head in {"cancelled", "cancel", "expired"}
+        or head == "refused" and bool({"commit", "op=commit"} & words(message.text))
+    )
+
+
+async def _on_dropped(
+    city: City, message: Message, chat: list[Message], *, hold_self: bool
+) -> None:
+    """Every facility: the Ledger dropped our booking or let the hold expire, or refused a commit
+    after the confirm turn stopped waiting: whoever asked hears it once (_on_refused). The answer
+    to our own release goes to the booking party that asked for it (_release)."""
+
+    if not _released(chat, city.agent_id, message):
+        row = message
+        if first_word(message.text) == "expired" and not {"code", "reason"} & fields_of(message.text).keys():
+            # ponytail: no expired row in the kit or live yet; its code goes on if any.
+            row = replace(message, body={**message.body, "text": f"{message.text} reason=expired"})
+        await _on_refused(city, row, chat, hold_self=hold_self)
+        return
+    # The answer to our own release, after its turn stopped waiting (a slow Ledger): the booking
+    # party that asked hears the outcome now. ponytail: the case's latest release request; one
+    # release per case.
+    asked = next((row for row in reversed(chat) if row.sender.startswith("agent:")
+                  and row.recipient == city.agent_id
+                  and (first_word(row.text) == "cancel" or row.type == "cancel")), None)
+    if asked is not None:
+        await _release(city, asked, chat)
 
 
 async def _redirect(
@@ -1586,29 +1629,7 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
                 chat = await city.history(need_id=message.need_id)
             except CapError:
                 pass
-            if message.sender == LEDGER and (
-                head in {"cancelled", "cancel", "expired"}
-                or head == "refused" and bool({"commit", "op=commit"} & kind)
-            ):
-                # The Ledger dropped our booking or let the hold expire, or refused a commit
-                # after the confirm turn stopped waiting: whoever asked hears it once. Not the
-                # answer to our own release: the booking party asked for that one.
-                if not _released(chat, city.agent_id, message):
-                    row = message
-                    if head == "expired" and not {"code", "reason"} & fields_of(message.text).keys():
-                        # ponytail: no expired row in the kit or live yet; its code goes on if any.
-                        row = replace(message, body={**message.body, "text": f"{message.text} reason=expired"})
-                    await _on_refused(city, row, chat, hold_self=False)
-                else:
-                    # The answer to our own release, after its turn stopped waiting (a slow
-                    # Ledger): the booking party that asked hears the outcome now (_release).
-                    # ponytail: the case's latest release request; one release per case.
-                    asked = next((row for row in reversed(chat) if row.sender.startswith("agent:")
-                                  and row.recipient == city.agent_id
-                                  and (first_word(row.text) == "cancel" or row.type == "cancel")), None)
-                    if asked is not None:
-                        await _release(city, asked, chat)
-            elif release:
+            if release:
                 await _release(city, message, chat)
             else:
                 booking = _facility(city, message, chat, reports=False, hold_self=False)
@@ -1666,8 +1687,8 @@ async def _cross_asst(
     in the priority window we offer the first free slots after it (relaxed alternative, R:232),
     page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days.
 
-    Hospital: no page by then means we do not know, so no answer at all, never a no_availability
-    (a false attribute, -2): the turn ends (the fast reply is the ack) and _answer_pending answers
+    Hospital and specialist: no page by then means we do not know, so no answer at all, never a
+    no_availability (a false attribute, -2): the turn ends (the fast reply is the ack) and _answer_pending answers
     when page and clock are in. ``pending``: that late answer, from _WORLD and _city_now only,
     without waiting (a page 2 it needs is asked, and its push turn answers)."""
 
@@ -1804,7 +1825,7 @@ async def _cross_asst(
                 if every or page >= min(protocol.page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
-            if hospital and world is None:
+            if rich and world is None:
                 _LOG.info("care.cross.pending", extra={"request_id": rid})
                 return
             if hospital:
@@ -1886,13 +1907,14 @@ async def _cross_asst(
             return
 
 
-async def _answer_pending(city: City, chat: list[Message], *, skip: str = "") -> None:
-    """Hospital: the partner searches of this case we have not answered (the Ledger's world came
-    after their turn, or before a restart), answered now from the cached page (_cross_asst
-    ``pending``). One we answered, in this process or in the history, is skipped."""
+async def _answer_pending(city: City, chat: list[Message], *, skip: str = "", **cross) -> None:
+    """Hospital and specialist: the partner searches of this case we have not answered (the
+    Ledger's world came after their turn, or before a restart), answered now from the cached page
+    (_cross_asst ``pending``, with ``cross``: the specialist's procedures and wording). One we
+    answered, in this process or in the history, is skipped."""
 
-    hit = _WORLD.get((_PROCEDURE, 1))
-    if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH:
+    hits = [_WORLD.get((procedure, 1)) for procedure in cross.get("procedures", (_PROCEDURE,))]
+    if not any(hit and time.monotonic() - hit[0] <= _WORLD_FRESH for hit in hits):
         return  # nothing to answer from: no history read in this turn
     agent = city.agent_id
     for row in chat:
@@ -1916,7 +1938,7 @@ async def _answer_pending(city: City, chat: list[Message], *, skip: str = "") ->
         else:
             done = _answered(chat, agent, row.msg_id, row.sender)
         if not done:
-            await _cross_asst(city, row, pending=True)
+            await _cross_asst(city, row, pending=True, **cross)
 
 
 # Background work of this process (late Ledger reads): kept referenced until it is done.
@@ -1962,10 +1984,11 @@ def _page_procedure(world: str) -> str:
 
 
 def _recover(chat: list[Message], agent: str) -> None:
-    """Hospital, a pod that restarted or never saw this case (two pods): the city clock and our
-    world pages come back from the case's Ledger rows, never guessed, so the cross-ASST answer,
-    _alternatives and _starts_soon do not start cold. Only what this process lacks: _CLOCK when
-    empty (one anchor all night, _ANCHOR), a page it has not cached. A page counts as read when
+    """Hospital (specialist: the clock only), a pod that restarted or never saw this case (two
+    pods): the city clock and our world pages come back from the case's Ledger rows, never
+    guessed, so the cross-ASST answer, _alternatives and _starts_soon do not start cold. Only
+    what this process lacks: _CLOCK when empty (one anchor all night, _ANCHOR), a page it has
+    not cached. A page counts as read when
     the Ledger sent it (``sent_at``): older than _WORLD_FRESH it stays out. Every slot we sent a
     hold for in the case leaves our cached pages, these and the ones we had: ours now, or lost
     (_HELD and _on_refused, in the memory of the pod that sent the hold). The next world read
@@ -2275,25 +2298,22 @@ def _drops_hold(row: Message) -> bool:
 
 
 def _slot_of(chat: list[Message], agent: str, row: Message) -> str:
-    """The slot a refused/cancelled/expired Ledger row is about. Hospital: its ``slot_id=``, its
+    """The slot a refused/cancelled/expired Ledger row is about: its ``slot_id=``, its
     ``hold_id=``/``booking_id=`` through our rows, or ``detail=`` when that is a slot we held
     (live: ``refused op=hold code=NO_CAPACITY detail=<slot_id>``; EXPIRED says ``detail=slot``).
-    Else, and always outside the hospital, the slot of our latest hold in the case."""
+    Else the slot of our latest hold in the case."""
 
     held = [
         fields_of(r.text).get("slot_id", "")
         for r in chat
         if r.sender == agent and r.recipient == LEDGER and "hold" in words(r.text)
     ]
-    if _HOSPITAL.get():
-        fields = fields_of(row.text)
-        ref = fields.get("hold_id") or fields.get("booking_id")
-        slot = fields.get("slot_id") or (_hold_slot(chat, agent, ref) if ref else "")
-        if not slot and fields.get("detail") in held:
-            slot = fields["detail"]
-        if slot:
-            return slot
-    return next((slot for slot in reversed(held) if slot), "")
+    fields = fields_of(row.text)
+    ref = fields.get("hold_id") or fields.get("booking_id")
+    slot = fields.get("slot_id") or (_hold_slot(chat, agent, ref) if ref else "")
+    if not slot and fields.get("detail") in held:
+        slot = fields["detail"]
+    return slot or next((slot for slot in reversed(held) if slot), "")
 
 
 def _released(chat: list[Message], agent: str, row: Message) -> bool:
@@ -2982,6 +3002,8 @@ async def _on_committed(
     if protocol.we(chat, city.agent_id, token, to=target, word="booking.receipt"):
         return
     text = f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}"
+    if slot:  # from the Ledger's committed row or our hold: never guessed
+        text += f" slot_id={slot}"
     if target.startswith("citizen:"):
         if direct:
             en = _family_preferences(chat, target).get("lang") == "en"
@@ -3078,7 +3100,7 @@ async def _on_refused(
             target != _OUR_BOOKING
         ):
             await _alternatives(city, chat, target, slot)
-    citizen = (_holder(chat, agent, slot) or protocol.citizen(chat) or "") if hospital else ""
+    citizen = _holder(chat, agent, slot) or protocol.citizen(chat) or ""
     if (
         offer_id
         and citizen.startswith("citizen:")
