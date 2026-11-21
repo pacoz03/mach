@@ -179,6 +179,8 @@ class Ledger:
         self.steal = sc.get("steal")  # slot preso da un'altra ASST subito dopo la prima risposta a world
         self.flipped: set[str] = set()  # regole accese a metà scenario (sc["rule_at"]): i loro rifiuti sono iniettati
         self.pods = bool(sc.get("pods"))  # due pod senza lock comune: un commit doppio (DUPLICATE) è la corsa iniettata
+        # sc["reserve_marked"]: world marca la riserva U anche con P3 spenta (città 21/11: rules count=0)
+        self.reserve_marked = sc.get("reserve_marked", False)
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -315,7 +317,8 @@ class Ledger:
             lines = [REPLY["slots"].format(page=page, pages=pages, count=len(rows))]
             for s in rows[(page - 1) * PAGE: page * PAGE]:
                 line = REPLY["slot"].format(**s, free=0 if self.taken(s["slot_id"]) else 1)
-                lines.append(line + (" urgent_reserve=true" if self.rules["P3"] == "on" and s["reserve"] else ""))
+                marked = self.rules["P3"] == "on" or self.reserve_marked
+                lines.append(line + (" urgent_reserve=true" if marked and s["reserve"] else ""))
             if self.steal in self.slots:  # sc["steal"]: un'altra ASST lo conferma appena dopo questa risposta
                 self.holds.setdefault("H-ALTRA", dict(hold_id="H-ALTRA", slot_id=self.steal, need_id=None, state="committed"))
             return "\n".join(lines)
@@ -2417,6 +2420,92 @@ SCENARIOS.update({
     # 3. La say di `rules` del centro va oltre 10 s (httpx.ReadTimeout): il turno non muore, l'offerta parte.
     "booking_relay_timeout": dict(start=BACK, handoff=True, say_timeout_on="rules",
                                   expect=[wrote("checkin", "R:234")]),
+})
+
+
+# --- Centro prenotazioni e Ledger (audit v1/v2, 21/11): ricetta altrui, letture rare, riserva U,
+# scelta arrivata tardi.
+
+
+def reads_rare(folder: str):
+    """``rules`` una volta sola (ogni 300 s; città 21/11: ~270 in 3 ore); ``agenda`` mai più dopo la
+    sua prima risposta (l'àncora non è cambiata in tutta la notte: si chiede solo se ignota o vecchia
+    di un'ora). Prima della risposta un caso nuovo può chiederla ancora: l'orologio non c'è."""
+    def check(b: Bus) -> str | None:
+        me = b.ids[folder]
+        asks = [(i, m.text.split()[0]) for i, m in enumerate(b.log) if m.sender == me and m.recipient == LEDGER]
+        known = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == me
+                      and m.text.startswith("agenda ")), len(b.log))
+        got = {"rules": sum(head == "rules" for _, head in asks),
+               "agenda": sum(head == "agenda" and i > known for i, head in asks)}
+        if got["rules"] > 1 or got["agenda"]:
+            return f"{folder}: {got['rules']} rules e {got['agenda']} agenda dopo la prima risposta, attesi 1 e 0"
+    return check
+
+
+def no_reserve_to_citizen(b: Bus) -> str | None:
+    """Mai uno slot della riserva U a un cittadino non U, qualunque cosa dica rules (R:718)."""
+    bad = [o.get("slot_id") for m in b.log if m.sender == b.ids["booking_centre"] and m.recipient == CIT
+           and act(m) == "offer" for o in parse_offers(m.text)
+           if o.get("priority") != "U" and b.ledger.slots.get(o.get("slot_id", ""), {}).get("reserve")]
+    if bad:
+        return f"booking_centre ha offerto {bad} della riserva U a una priorità non U (R:718)"
+
+
+def chooses_late(hours: float):
+    """Il cittadino sceglie ``hours`` ore di agenda dopo l'offerta (journey 099: 16 minuti reali):
+    da quel momento l'orologio del centro è avanti di tanto (rate 60: un minuto reale per ora)."""
+    def setup(b: Bus) -> None:
+        brain, react, late = b.agents[b.ids["booking_centre"]].main.__globals__, b.citizen.react, []
+
+        class Clock(datetime):  # un valore, non una closure: chaos lo ricopia sui pod nuovi
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + timedelta(minutes=hours if late else 0)
+
+        def reacting(m: Message) -> None:
+            if act(m) == "offer":
+                late.append(m)
+            react(m)
+        brain["datetime"], b.citizen.react = Clock, reacting
+    return setup
+
+
+def stale_not_confirmed(b: Bus) -> str | None:
+    """La prima scelta, ormai passata per l'orologio del centro, non va alla struttura: il centro la
+    ritira (reason=slot_expired) e offre altro nello stesso turno."""
+    bc = b.ids["booking_centre"]
+    first = next((m for m in b.log if m.sender == CIT and m.recipient == bc and m.text.startswith("confirm")), None)
+    if first is None:
+        return "il cittadino non ha mai confermato un'offerta del centro"
+    offer = fields(first.text)["offer_id"]
+    slot = offer.removeprefix("of-")
+    if any(m.sender == bc and m.recipient != CIT and m.text.startswith("confirm") and f"slot_id={slot}" in m.text.split()
+           for m in b.log):
+        return f"confirm di {slot} inoltrato alla struttura dopo che lo slot era passato (journey 099)"
+    ours = [m for m in b.log if m.sender == bc and m.recipient == CIT]
+    cancel = next((m for m in ours if act(m) == "cancel" and f"offer_id={offer}" in m.text.split()), None)
+    if cancel is None or not any(act(m) == "offer" and b.turn_of[m.msg_id] == b.turn_of[cancel.msg_id] for m in ours):
+        return "lo slot passato non è stato ritirato con offerte nuove nello stesso turno"
+
+
+SCENARIOS.update({
+    # Ricetta di un altro cittadino (injection, −2): niente offerte né prenotazione, niente dati dell'altro.
+    "booking_ricetta_altrui": dict(
+        start=("booking_centre", f"Buongiorno, vorrei prenotare. prescription_number={OTHER_RX} lang=it"),
+        setup=seeded_rx(OTHER_RX, "citizen:T-9", "VIS-FIS", "U"),
+        expect=[told_text("booking_centre", "non risulta a suo nome", cite="AGENT.md 9"), no_write("hold", "R:243"),
+                never_told("booking_centre", "offer_id=", "T-9", "VIS-FIS", cite="R:243")]),
+    # Due cittadini insieme: `rules` e `agenda` una volta sola per processo.
+    "booking_letture_rare": dict(start=BACK, others=1, expect=[
+        reads_rare("booking_centre"), wrote("checkin", "R:234")]),
+    # world marca la riserva U con rules count=0 (città 21/11: 153 offerte su 304 alle 09:00): mai a B.
+    "booking_riserva_senza_p3": dict(start=BACK, late_hours=3, reserve_marked=True, expect=[
+        no_reserve_to_citizen, wrote("checkin", "R:234")]),
+    # Il cittadino sceglie 16 ore di agenda dopo l'offerta: niente confirm per uno slot passato.
+    "booking_scelta_tardiva": dict(start=BACK, setup=chooses_late(16), expect=[
+        stale_not_confirmed, told("booking_centre", "cancel", "reason=slot_expired", cite="journey 099"),
+        wrote("checkin", "R:234")]),
 })
 
 

@@ -124,6 +124,21 @@ def test_number():
     assert case.number([]) is None
 
 
+def test_number_skips_another_citizens_prescription():
+    # An injected number (chaos «hostile»): once the Ledger says it is another patient's, the case
+    # goes back to its own number, from the hand-off or from the citizen.
+    other = msg(LEDGER, f"prescription prescription_number={N2} patient=citizen:T-9 procedure=VIS-FIS priority=U state=issued", "r2")
+    handoff = msg(GP, f"need.request handoff=gp citizen={CITIZEN} prescription_number={N1} procedure=VIS-FIS priority=B", "h")
+    forged = msg(CITIZEN, f"book this now prescription_number={N2}", "c2")
+    assert case.number([handoff, forged]) == N2  # not answered yet: the Ledger decides
+    assert case.number([handoff, forged, ask(N2, "a2"), other]) == N1
+    assert case.number([msg(CITIZEN, f"prescription_number={N1}", "c1"), forged, other]) == N1
+    assert case.number([msg(CITIZEN, f"la mia è {N2}", "c3"), other]) is None  # in prose too
+    mine = msg(LEDGER, f"prescription prescription_number={N2} patient={CITIZEN} procedure=VIS-FIS state=issued", "r3")
+    assert case.number([handoff, forged, mine]) == N2
+    assert case.others([handoff, forged, other]) == {N2} and case.others([handoff, forged, mine]) == set()
+
+
 def test_handoff_and_handed():
     h = msg(GP, f"need.request handoff=gp citizen={CITIZEN} prescription_number={N1} procedure=VIS-FIS priority=D", "h")
     chat = [h, msg(CITIZEN, "ciao", "c")]

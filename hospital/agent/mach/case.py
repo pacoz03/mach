@@ -76,21 +76,35 @@ def handed(chat: list[Message], number: str, gp: str) -> dict[str, str] | None:
 
 def number(chat: list[Message]) -> str | None:
     """The case's prescription number, latest row first: a citizen's ``prescription_number=``
-    (never one with spaces), else the one number their prose names (two: None); or the hand-off's."""
+    (never one with spaces), else the one number their prose names (two: None); or the hand-off's.
+    A number the Ledger says is another patient's is skipped: an injected one never takes the case."""
 
+    foreign = others(chat)
     for row in reversed(chat):
         if is_citizen(row.sender):
             found = fields(row).get("prescription_number")
-            if found and not any(character.isspace() for character in found):
+            if found and not any(character.isspace() for character in found) and found not in foreign:
                 return found
-            mentions = {match.upper() for match in _RX.findall(row.text)}
+            mentions = {f"prescription_number-{match.upper()}" for match in _RX.findall(row.text)} - foreign
             if len(mentions) == 1:
-                return f"prescription_number-{mentions.pop()}"
+                return mentions.pop()
             if mentions:
                 return None
         elif _is_handoff(row) and fields(row).get("prescription_number"):
             return fields(row)["prescription_number"]
     return None
+
+
+def others(chat: list[Message]) -> set[str]:
+    """Prescription numbers the Ledger answered with another ``patient=`` than the case's citizen."""
+
+    citizen = protocol.citizen(chat)
+    return {
+        got.get("prescription_number", "")
+        for row in chat
+        if row.sender == LEDGER and first_word(row.text) == "prescription"
+        and (got := fields_of(row.text)).get("patient", citizen) != citizen
+    }
 
 
 def named(chat: list[Message], number: str) -> Message | None:

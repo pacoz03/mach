@@ -51,6 +51,7 @@ from mach.protocol import fields_of, first_word, words  # noqa: E402
 #   _GONE     b  slots lost or booked: no TTL, no cap
 #   _DOWN     b  facility -> refusal time: 600 s on read, never evicted
 #   _RULES    b  rules of the latest answer of any case, no TTL (c: city:rules)
+#   _ASKED    b  agenda/rules -> our latest ask in any case: asked again after _EVERY
 #   _GATES       per-need lock, dropped when its last turn ends
 #   _SENT     b  per-need sends history may not show yet (read-your-writes), LRU 4096
 #   _HEARD    b  msg_id -> the model's reading of a citizen message, LRU 4096
@@ -62,6 +63,8 @@ _SAY_MAX = 1900
 # citizen decides (the citizen confirms within seconds of the offer). _lead() adds the Ledger's
 # round trip: the facility's hold lands that much later (21/11: ~270 s, 4-5 agenda hours).
 _LEAD = timedelta(hours=1)
+# The lead while no round trip is measured yet: confirm -> hold is ~6 agenda hours (21/11).
+_LEAD_UNMEASURED = timedelta(hours=6)
 # The freshest agenda reply this process read, in any case: the city has one agenda clock.
 _CLOCK: dict[str, str] = {}
 # (answer's sent_at, seconds) of the latest Ledger round trip seen in a case history.
@@ -109,6 +112,11 @@ _DOWN: dict[str, float] = {}
 # Rules in force from the latest ``rules`` answer of any case: (rule ids, effective from).
 # None until the Ledger has answered once in this process.
 _RULES: list[tuple[frozenset[str], datetime | None]] | None = None
+# Our latest ``agenda`` and ``rules`` asks (time.monotonic()), in any case: they hold for every
+# case. The clock's anchor (epoch_real, epoch_agenda, rate) did not change all night (1856
+# answers): agenda while unknown, then once an hour. Rules every 300 s (21/11: ~270 asks in 3 hours).
+_ASKED: dict[str, float] = {}
+_EVERY = {"agenda": 3600.0, "rules": 300.0}
 
 ESCALATION = "escalate.emergency reason=red_flag Contatti subito il 112."
 # One short courteous sentence after the act and its tokens, in the case's language.
@@ -122,6 +130,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "unknown_rx": (
             "Mi scusi, non trovo una ricetta con questo numero: può ricontrollarlo? Appena ce l'ho, "
             "prenotiamo."
+        ),
+        "not_yours": (
+            "Mi scusi, questa ricetta non risulta a suo nome, quindi non posso prenotare con questa. "
+            "Può ricontrollare il numero della sua ricetta?"
         ),
         "renewal": (
             "Mi dispiace, la ricetta non è più valida: il suo medico di base può rinnovarla con lo "
@@ -191,6 +203,7 @@ _PHRASES: dict[str, dict[str, str]] = {
             "cerco subito un'alternativa."
         ),
         "cancelled": "Mi dispiace, la struttura ha annullato questo posto: cerco subito un'alternativa per lei.",
+        "past": "Mi dispiace, nel frattempo questo orario non è più prenotabile: le propongo subito altre date.",
         "expired": "Mi dispiace, la struttura segnala che la ricetta è scaduta.",
         "receipt": "La prenotazione è confermata: conservi questa ricevuta per il check-in in struttura.",
         "hello": (
@@ -214,6 +227,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "unknown_rx": (
             "Sorry, I cannot find a prescription with this number: could you check it? As soon as "
             "I have it, we book."
+        ),
+        "not_yours": (
+            "Sorry, this prescription is not in your name, so I cannot book with it. Could you "
+            "check the number of your prescription?"
         ),
         "renewal": (
             "I am sorry, the prescription is no longer valid: your GP can renew it with the same "
@@ -281,6 +298,7 @@ _PHRASES: dict[str, dict[str, str]] = {
             "looking for an alternative straight away."
         ),
         "cancelled": "I am sorry, the facility withdrew this slot: I am looking for an alternative for you.",
+        "past": "I am sorry, this time can no longer be booked: here are other dates straight away.",
         "expired": "I am sorry, the facility reports that the prescription has expired.",
         "receipt": "Your booking is confirmed: please keep this receipt for check-in at the facility.",
         "hello": (
@@ -389,6 +407,12 @@ async def main(need: Need, city: City) -> None:
         row.sender == city.agent_id and first_word(row.text) == "escalate.emergency" for row in chat
     ):
         return  # An emergency ends the case: nothing else on this need (R:442), whatever arrives.
+    flagged = next((row.sender for row in chat if row.sender.startswith("citizen:") and red_flag(row.text)), None)
+    if message.need_id and flagged:
+        # A red flag whose own turn has not run yet (a Ledger answer's turn came first): it still
+        # goes first, before anything this turn would say.
+        await _say(city, flagged, ESCALATION)
+        return
     await _desk(city, message, chat)
 
 
@@ -504,7 +528,8 @@ class _Sent:
         self.said: set[str] = set()
         self.trigger = ""
         self.again: set[str] = set()
-        # Our latest ``agenda`` ask: agenda and world answers before it are stale.
+        # Our latest marking read (``agenda``, or ``world`` when agenda is not _due): answers before
+        # it are stale.
         self.mark = ""
         # The rows the case had when we asked: until history shows the mark (or if the city gave
         # the ask no id), only rows that are not among these are answers to it.
@@ -589,13 +614,15 @@ async def _advance_alone(
     sent = _sent(key)
     number = case.number(chat)
     if not number:
-        if again:
-            ask = f"data.request purpose=booking fields=prescription_number {_phrase(chat, 'number')}"
+        # Only another citizen's number (its answer may open a turn of its own): say so, once.
+        key = "not_yours" if case.others(chat) else "number"
+        if again or key == "not_yours":
+            ask = f"data.request purpose=booking fields=prescription_number {_phrase(chat, key)}"
             await _tell(city, chat, citizen, ask, again=again)
         return
-    # A cancel drops every offer the citizen was holding: read agenda and world again, then send
+    # A cancel drops every offer the citizen was holding: read world again (agenda when _due), then send
     # what is still free, once per cancel.
-    refresh = False
+    refresh = renewal = False
     resumed = not replacing and sent.pending
     if resumed:
         replacing = True
@@ -626,8 +653,14 @@ async def _advance_alone(
     if known is None and fresh is None and not case.asked(chat, agent, number, since):
         if not await _say(city, LEDGER, f"prescription prescription_number={number}"):
             return
-        # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
-        refresh = refresh or bool(sent.mark) or protocol.ledger(chat, "agenda") is not None
+        # A number seen for the first time after an earlier phase: fresh pages. After another number
+        # (a renewal, agenda days later): a fresh agenda too.
+        renewal = any(
+            row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "prescription"
+            and fields_of(row.text).get("prescription_number") != number
+            for row in chat
+        )
+        refresh = refresh or renewal or bool(sent.mark) or protocol.ledger(chat, "agenda") is not None
     # Our GP's handoff names procedure and priority of the prescription it just wrote: the search
     # starts at once and the Ledger's check runs beside it (21/11: 5-7 minutes for that answer).
     # The Ledger's answer prevails when it comes (expired, used: the renewal below). P1 in force,
@@ -642,6 +675,11 @@ async def _advance_alone(
     if reply is None:
         # Not answered yet (21/11: 4-7 minutes): its answer opens a turn. Never "not found" for an
         # answer still on its way; only a real one (no procedure, or refused) says so, below.
+        return
+    if reply.get("patient", citizen) != citizen:
+        # Another citizen's prescription (an injection obeyed is -2): never booked, nothing of it said.
+        ask = f"data.request purpose=booking fields=prescription_number {_phrase(chat, 'not_yours')}"
+        await _tell(city, chat, citizen, ask, again=again)
         return
     procedure = reply.get("procedure")
     priority = reply.get("priority")
@@ -684,22 +722,30 @@ async def _advance_alone(
         if replacing:
             sent.reread = [f"world procedure={procedure} page=1"]
         elif not protocol.asked(chat, agent, procedure, 1):
-            sent.reread = ["agenda", "rules", f"world procedure={procedure} page=1"]
+            sent.reread = [*filter(_due, ("agenda", "rules")), f"world procedure={procedure} page=1"]
     else:
+        read, world_ask = "", f"world procedure={procedure} page=1"
         if refresh or (
             not sent.mark and protocol.ledger(chat, "agenda") is None and not protocol.exact(chat, agent, "agenda")
+            and not protocol.asked(chat, agent, procedure, 1)
         ):
-            mark = await _say(city, LEDGER, "agenda")
+            # Our first read marks what is fresh (_recent): agenda when due or after a renewal, else
+            # world itself.
+            read = "agenda" if renewal or _due("agenda") else world_ask
+            mark = await _say(city, LEDGER, read)
             if mark:
                 sent.mark, sent.before = mark, frozenset(row.msg_id for row in chat)
-            await _say(city, LEDGER, "rules")
+            if _due("rules"):
+                await _say(city, LEDGER, "rules")
         recent = _recent(chat, sent)
-        if _world_page(recent, 1) is None and not protocol.asked(recent, agent, procedure, 1):
-            await _say(city, LEDGER, f"world procedure={procedure} page=1")
+        if read != world_ask and _world_page(recent, 1) is None and not protocol.asked(recent, agent, procedure, 1):
+            await _say(city, LEDGER, world_ask)
 
         def fresh(rows: list[Message]) -> bool:
+            # The clock runs from its anchor: once known, no fresh agenda to wait for, but after a
+            # renewal (agenda days later).
             rows = _recent(rows, sent)
-            return _has_agenda(rows) and page_of(rows, 1) is not None
+            return (_has_agenda(rows) if renewal else _now(rows) is not None) and page_of(rows, 1) is not None
 
         if not fresh(chat):
             chat = await _until(city, need_id, chat, fresh)
@@ -710,7 +756,7 @@ async def _advance_alone(
     world = page_of(recent, 1)
     if now is None or world is None:
         return
-    rules = _rules(chat, now)
+    _rules(chat, now)  # the case's rules answer, for every case (_RULES)
     if replacing:
         taken = case.withdrawn(chat, agent) | sent.again
     else:
@@ -727,8 +773,6 @@ async def _advance_alone(
         "gender": gender,
         "days": days,
         "procedure": procedure,
-        # The urgent reserve is closed to B, D and P while P3 is in force, or if unknown.
-        "reserve": rules is None or "P3" in rules,
     }
     fallback: list[dict[str, str]] = []
     all_lines: dict[str, str] = {}
@@ -972,6 +1016,8 @@ async def _on_confirm(
     facility = offer.get("facility", "")
     if not slot or not facility or protocol.we(chat, agent, f"offer_id={offer_id}", to=citizen, word="cancel"):
         # Not one of our live offers: nothing goes to a facility on the citizen's word.
+        if _answered(chat, agent, message):
+            return  # the same confirm again (a redelivery): we withdrew its offer when it came
         ask = f"data.request purpose=booking fields=offer_id {_phrase(chat, 'which')}"
         await _tell(city, chat, citizen, ask, again=True)
         return
@@ -983,6 +1029,17 @@ async def _on_confirm(
         for live in _live_offers(chat, agent, citizen):
             await _say(city, citizen, f"cancel offer_id={live['offer_id']} reason=prescription_expired")
         await _renewal(city, chat, citizen, again=False)
+        return
+    _round_trip(chat, agent)  # a new pod measures it from the case, not the 6 h of an unmeasured one
+    at, now = protocol.when(offer.get("agenda_date", "")), _now(chat)
+    if at is not None and now is not None and at <= now + _lead() and not protocol.we(
+        chat, agent, f"slot_id={slot}", to=facility, word="confirm"
+    ):
+        # Chosen too late (journey 099: 16 agenda hours after the offer): its hold would come back
+        # EXPIRED after a Ledger round. The offer goes, new ones follow in this turn.
+        _GONE.add(slot)
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason=slot_expired {_phrase(chat, 'past')}")
+        await _advance(city, message, chat, replacing=True)
         return
     consent = fields.get("consent_ref", "")
     if not consent:
@@ -1487,9 +1544,8 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     reply = case.prescription(chat, agent, number) if number else None
     _round_trip(chat, agent)
     now = _now(chat)
-    if not number or reply is None or not reply.get("procedure") or now is None:
+    if not number or reply is None or not reply.get("procedure") or reply.get("patient", citizen) != citizen or now is None:
         return
-    rules = _rules(chat, now)
     pick = {
         "now": now,
         "born": _born(chat),
@@ -1498,7 +1554,6 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
         "gender": case.gender(chat, _heard),
         "days": case.days(chat, _heard),
         "procedure": reply["procedure"],
-        "reserve": rules is None or "P3" in rules,
     }
     refused_slots, refused_doctors = _refused(chat, agent)
     slots = _partner_fit(chat, agent, pick, offered | refused_slots | _GONE, refused_doctors)
@@ -1767,13 +1822,12 @@ def fitting(
     gender: str | None = None,
     procedure: str | None = None,
     days: frozenset[str] = frozenset(),
-    reserve: bool = True,
     relaxed: bool = False,
     born: datetime | None = None,
 ) -> list[dict[str, str]]:
-    """The answer set S: future, free, in the priority window, outside the urgent reserve when
-    ``reserve``. S_pref first (doctor speaks ``lang``, is ``gender``, on one of ``days``), then
-    the rest of S, earliest first. ``relaxed`` drops the priority window (S is empty)."""
+    """The answer set S: future, free, in the priority window, outside the urgent reserve (but for
+    U). S_pref first (doctor speaks ``lang``, is ``gender``, on one of ``days``), then the rest of
+    S, earliest first. ``relaxed`` drops the priority window (S is empty)."""
 
     if relaxed or priority == "P":
         horizon: datetime | None = None
@@ -1798,8 +1852,9 @@ def fitting(
         free = slot.get("free")
         if free is not None and free.isdigit() and int(free) <= 0:
             continue
-        # The urgent reserve is only for priority U (rule P3).
-        if reserve and slot.get("urgent_reserve", "").lower() == "true" and priority != "U":
+        # The urgent reserve is only for priority U, whatever rules says (R:718; 21/11: rules count=0
+        # and 153 of 304 offers were reserve slots given to B, D and P).
+        if slot.get("urgent_reserve", "").lower() == "true" and priority != "U":
             continue
         if not earliest < at or (horizon is not None and at >= horizon):
             continue
@@ -1841,6 +1896,8 @@ async def _say(city: City, to: str, text: str) -> str:
     """protocol.say: the msg_id, or "". A citizen who heard from us is owed no replacement."""
 
     msg_id = await protocol.say(city, to, text)
+    if msg_id and to == LEDGER and text in _EVERY:
+        _ASKED[text] = time.monotonic()
     if msg_id and to.startswith("citizen:") and city.inbound is not None:
         owed = _SENT.get(city.inbound.need_id or city.inbound.msg_id)
         if owed is not None:
@@ -1956,7 +2013,9 @@ def _round_trip(chat: list[Message], agent: str) -> None:
 def _lead() -> timedelta:
     """How far ahead an offered slot must be: the citizen's choice, then the hold's trip to the Ledger."""
 
-    return _LEAD + timedelta(seconds=(_RTT[1] if _RTT else 0.0) * _rate())
+    if _RTT is None:
+        return _LEAD_UNMEASURED
+    return _LEAD + timedelta(seconds=_RTT[1] * _rate())
 
 
 def _has_agenda(chat: list[Message]) -> bool:
@@ -1964,8 +2023,17 @@ def _has_agenda(chat: list[Message]) -> bool:
     return protocol.when("" if agenda is None else agenda.get("agenda_now", "")) is not None
 
 
+def _due(read: str) -> bool:
+    """Whether to ask the Ledger ``read`` ("agenda" or "rules") now; agenda always while the clock
+    is unknown."""
+
+    if read == "agenda" and not _CLOCK:
+        return True
+    return time.monotonic() - _ASKED.get(read, float("-inf")) >= _EVERY[read]
+
+
 def _recent(chat: list[Message], sent: "_Sent") -> list[Message]:
-    """Rows that answer our latest ``agenda`` ask. A history read before the ask shows neither
+    """Rows that answer our latest marking read (sent.mark). A history read before the ask shows neither
     the mark nor its answers: then nothing is recent, never the old agenda (journey 0099: slots
     already past were offered from a clock sixteen agenda hours old)."""
 
