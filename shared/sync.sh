@@ -1,13 +1,13 @@
 #!/bin/sh
 # Copia shared/tools.py in ogni agente, shared/facility.py nelle tre strutture, il pacchetto
-# shared/mach/ in <agente>/agent/mach/ (booking e strutture; il gp non ancora) e genera
+# shared/mach/ in <agente>/agent/mach/ (in tutti e 5) e genera
 # <agente>/agent/_secrets.py da .env.
 # city deploy impacchetta solo <agente>/agent/ e salta symlink e .env: servono file veri.
 set -eu
 cd "$(dirname "$0")/.."
 AGENTS="booking_centre gp hospital specialist_care family_counseling"
 FACILITIES="hospital specialist_care family_counseling"
-MACH="booking_centre hospital specialist_care family_counseling"
+MACH="booking_centre gp hospital specialist_care family_counseling"
 SUPABASE_URL=""
 SUPABASE_PUBLISHABLE_KEY=""
 EXA_API_KEY=""
@@ -36,4 +36,4 @@ fi
 if [ -z "$EXA_API_KEY" ]; then
   echo "attenzione: .env senza EXA_API_KEY, web_search restituisce []" >&2
 fi
-echo "tools sincronizzati nei 5 agenti, facility nelle 3 strutture, mach in booking e strutture"
+echo "tools sincronizzati nei 5 agenti, facility nelle 3 strutture, mach nei 5 agenti"

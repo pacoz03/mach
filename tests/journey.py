@@ -999,16 +999,6 @@ def emergency_to_citizen(b: Bus) -> str | None:
         return "il gp non ha inviato l'escalation di emergenza con il numero 112 (R:242)"
 
 
-def no_slots_followup(b: Bus) -> str | None:
-    gp, bc = b.ids["gp"], b.ids["booking_centre"]
-    number = next(iter(b.ledger.rx), "")
-    notice = ("data.response", "purpose=booking_follow_up", "outcome=no_slots", f"prescription_number={number}")
-    updates = [i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == gp and has(m.text, notice)]
-    followups = [i for i, m in enumerate(b.log) if m.sender == gp and m.recipient == CIT and has(m.text, notice)]
-    if len(updates) != 1 or len(followups) != 1 or updates[0] >= followups[0]:
-        return "dopo la ricerca serve un esito dal centro e un solo seguito del gp per la stessa ricetta"
-
-
 def earliest_relaxed_offer(b: Bus) -> str | None:
     prescription = next(iter(b.ledger.rx.values()), None)
     if prescription is None:
@@ -1241,12 +1231,11 @@ SCENARIOS: dict[str, dict] = {
     "gp_handoff": dict(start=BACK, handoff=True, expect=[
         handed_over, told_text("gp", "mi scriva e gliela rinnovo io", cite="proattività: P1"),
         told_text("gp", "Se ha preferenze sui giorni, sul genere o sulla lingua del medico", cite="proattività"), wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
+    # Nessun avviso «nessun posto» tra centro e gp: la collaborazione vale 0 su 508 review.
     "gp_nessun_posto": dict(start=BACK, handoff=True, full_days=15, after=[GRAZIE], llm={GRAZIE: NONE_IT}, expect=[
-        handoff_tokens("notify_if=no_slots"), writes("prescribe", 1, "una sola ricetta"),
+        writes("prescribe", 1, "una sola ricetta"),
         told("booking_centre", "offer", "waiting_list=true", cite="lista d'attesa"),
-        no_slots_followup, gp_prescription(after_followup=True),
-        told("gp", "prescription", "booking_status=no_slots", cite="esito del centro"),
-        no_write("commit", "nessuno slot")]),
+        gp_prescription(after_followup=True), no_write("commit", "nessuno slot")]),
     "gp_alternativa_primo_posto": dict(start=BACK, handoff=True, full_days=2, expect=[
         earliest_relaxed_offer, wrote("commit", "scelta del cittadino")]),
     "checkin_body": dict(start=BACK, checkin="body", expect=[*CHECKED_IN, hospital_to_gp(True)]),
@@ -1265,11 +1254,11 @@ SCENARIOS: dict[str, dict] = {
                                     wrote("checkin", "R:234"), llm_read(LOMBARE, 1)]),
     "gp_testo_libero_en": dict(start=("gp", KNEE_EN), llm={KNEE_EN: '<think>knee</think> {"code":"SYM-KNEE","red_flag":false,"lang":"en"}'},
                                expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
-                                       gp_prescription(), requested_translation("en")]),
+                                       gp_prescription(), llm_read(KNEE_EN, 1)]),  # l'inglese non si traduce
     # Le regole decidono il protocollo (VIS-FIS/B anche se il modello direbbe SYM-KNEE); il modello
-    # viene chiamato una volta sola, per la lingua del cittadino (tools.language).
+    # non viene chiamato, nemmeno per la lingua: le regole la danno (it/en).
     "gp_regole_prima": dict(start=BACK, llm={BACK[1]: '{"code": "SYM-KNEE"}'}, expect=[
-        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 1)]),
+        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 0)]),
     "gp_red_flag_modello": dict(start=("gp", PECHO), llm={PECHO: '{"code": "NONE", "red_flag": true, "lang": "es"}'},
                                 expect=[emergency_to_citizen, no_write("prescribe", "R:442")]),
     # Codice inventato dal modello o Gateway giù: nessuna ricetta, il gp chiede il motivo (mai muto).
@@ -1867,6 +1856,110 @@ def gp_prescribes_at_once(within: float, *subs: str):
         if missing:
             return f"ricetta senza {missing}: «{first.text[:120]}»"
     return check
+
+
+def rewrite_at_once(text: str):
+    """Appena riceve la ricetta, prima del ``prescribed`` del Ledger (sc["slow_prescribe"]), il
+    cittadino riscrive al gp ``text`` (città 21/11: il Ledger conferma dopo 5-10 minuti)."""
+    def setup(b: Bus) -> None:
+        c, react = b.citizen, b.citizen.react
+
+        def wrapped(m: Message) -> None:
+            react(m)
+            if m.sender == b.ids["gp"] and act(m) == "prescription" and not getattr(c, "rewrote", False):
+                c.rewrote = True
+                c.say(b.ids["gp"], text)
+        c.react = wrapped
+    return setup
+
+
+RAFFICA_ROSSO = "Dottore, ho un forte dolore al petto da questa mattina."  # fixture gp_red_flag_non_escalato
+RAFFICA_ALTRO = "Buongiorno dottore, avrei bisogno di parlarle."
+
+
+def gp_raffica(n: int, every: int, slow: float):
+    """Città 21/11 05:15 (fixture gp_red_flag_non_escalato): ``n`` cittadini scrivono al gp nello
+    stesso istante, uno ogni ``every`` con una red flag (anche T-1, l'inizio dello scenario); ogni
+    lettura della history del gp torna dopo ``slow`` s. I turni del gp girano insieme, come nel pod."""
+    def setup(b: Bus) -> None:
+        gp, deliver = b.ids["gp"], b.deliver
+        b.reads = []  # (need_id, istante) di ogni lettura della history del gp
+
+        class Slow(Port):
+            async def history(self, *, peer, need_id):
+                b.reads.append((need_id, time.monotonic()))
+                await asyncio.sleep(slow)
+                return await super().history(peer=peer, need_id=need_id)
+
+        async def turn(m: Message) -> None:
+            port = Slow(b, gp)
+            city = City(index=port, messages=port, history=port, agent_id=gp, inbound=m, llm=b.llm)
+            with b.agents[gp].active():
+                try:
+                    await b.agents[gp].main(Need(summary=m.text, message=m), city)
+                except OutOfScope:
+                    b.oos.add(m.msg_id)
+                except Exception:
+                    b.crashes.append(f"crash gp: {traceback.format_exc().strip().splitlines()[-1]}")
+
+        async def concurrent(m: Message) -> None:
+            if m.recipient == gp and m.sender.startswith("citizen:"):
+                b.tasks.append(asyncio.create_task(turn(m)))
+            else:
+                await deliver(m)
+
+        b.deliver = concurrent
+        for k in range(1, n):
+            text = RAFFICA_ROSSO if k % every == 0 else RAFFICA_ALTRO
+            b.queue.append(b.add(f"citizen:R-{k}", gp, {"text": text}, f"N-R-{k:03d}"))
+    return setup
+
+
+def escalated_in_raffica(flagged: int, within: float):
+    """Ognuna delle ``flagged`` red flag riceve escalate.emergency reason=red_flag con il 112 entro
+    ``within`` s, prima di ogni lettura della history del suo caso; nessuna escalation agli altri."""
+    def check(b: Bus) -> str | None:
+        gp = b.ids["gp"]
+        asked: dict[str, Message] = {}  # il primo messaggio di ogni cittadino
+        for m in b.log:
+            if m.recipient == gp and m.sender.startswith("citizen:"):
+                asked.setdefault(m.sender, m)
+        red = {c for c, m in asked.items() if m.text == RAFFICA_ROSSO}
+        esc = {m.recipient: m for m in b.log if m.sender == gp and act(m) == "escalate.emergency"}
+        if len(red) != flagged or esc.keys() - red:
+            return f"{len(red)} red flag invece di {flagged}, escalation a {len(esc.keys() - red)} cittadini senza"
+        for c in sorted(red):
+            m, ask = esc.get(c), asked[c]
+            if m is None or fields(m.text).get("reason") != "red_flag" or not re.search(r"\b112\b", m.text):
+                return f"nessuna escalate.emergency reason=red_flag con il 112 a {c} (R:242)"
+            took = b.stamp[m.msg_id] - b.stamp[ask.msg_id]
+            read = any(need == ask.need_id and at <= b.stamp[m.msg_id] for need, at in b.reads)
+            if took >= within or read:
+                return (f"escalation a {c} dopo {took:.1f} s" + (" e una lettura della history" if read else "")
+                        + f": attesa entro {within} s, prima di ogni lettura (R:242)")
+    return check
+
+
+SCENARIOS.update({
+    # Città 21/11 05:15: 50 cittadini nello stesso secondo, 10 con una red flag, history lenta (10 s):
+    # l'escalation parte prima di ogni lettura (lì arrivava dopo la chiusura della wave, −2 ciascuna).
+    "gp_red_flag_raffica": dict(start=("gp", RAFFICA_ROSSO), setup=gp_raffica(50, 5, 10.0), expect=[
+        escalated_in_raffica(10, 1.0), no_write("prescribe", "R:442")]),
+    # Una red flag che le regole non leggono: la vede il modello, poi l'escalation.
+    "gp_red_flag_solo_modello": dict(
+        start=("gp", "Mi sento come se un elefante mi stesse seduto sul torace e sudo freddo"),
+        llm={"elefante": '{"code": "NONE", "red_flag": true, "lang": "it"}'},
+        expect=[emergency_to_citizen, no_write("prescribe", "R:442")]),
+    # Il cittadino riscrive prima che il Ledger confermi la ricetta (3 s; città 5-10 minuti): un
+    # grazie o lo stesso disturbo hanno il promemoria della ricetta, mai la domanda sul disturbo né il silenzio.
+    "gp_grazie_prima_del_ledger": dict(start=BACK, handoff=True, slow_prescribe=3.0, llm={GRAZIE: NONE_IT},
+                                       setup=rewrite_at_once(GRAZIE), expect=[
+        writes("prescribe", 1, "una sola ricetta"), gp_prescription(after_followup=True),
+        never_told("gp", "Mi descrive", cite="la ricetta è già scritta")]),
+    "gp_sintomo_prima_del_ledger": dict(start=BACK, handoff=True, slow_prescribe=3.0,
+                                        setup=rewrite_at_once("Il mal di schiena non passa, quando mi chiamano?"), expect=[
+        writes("prescribe", 1, "una sola ricetta"), gp_prescription(after_followup=True)]),
+})
 
 
 # --- Centro prenotazioni con il Ledger lento (città 21/11 02:37-02:45: risposte in ~270 s, agenda

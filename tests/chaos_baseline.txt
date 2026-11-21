@@ -1,6 +1,7 @@
 # tests/chaos.py: terne `guasto modalità scenario` che falliscono su HEAD (cricchetto: solo togliere)
 # 2026-11-21 ff300ff (fix A B F G H dall'audit di v2): 313 (111 risolte; 8 nuove, tutte nei 3 scenari aggiunti, come i gemelli ospedale_alternative*)
 # 2026-11-21 booking C D E F: 301 (26 risolte; 14 nuove: 12 negli scenari nuovi su debolezze note, più booking_world_in_cache sotto restart e ledger_lost, da R2 «mai muto»)
+# 2026-11-21 gp (red flag prima delle letture, safety, msg_id già fatto): 269 (34 risolte; 2 nuove in gp_grazie_prima_del_ledger: il booking tace con ledger_lost, R2)
 clock_lost plain booking_letture_rare
 clock_lost plain booking_margine_ledger_lento
 clock_lost plain booking_orologio_vecchio
@@ -85,12 +86,10 @@ clock_lost turns welcome_indirizzo
 clock_lost turns welcome_lang_en
 hostile plain booking_rifiuto_subito
 hostile plain checkin_codice_prosa
-hostile plain gp_nessun_posto
 hostile plain gp_rinnovo_a_parole_lento
 hostile plain richiesta_clinica
 hostile turns booking_rifiuto_subito
 hostile turns checkin_codice_prosa
-hostile turns gp_nessun_posto
 hostile turns gp_rinnovo_a_parole_lento
 hostile turns richiesta_clinica
 ledger_late turns booking_nostro_consultorio
@@ -133,6 +132,7 @@ ledger_lost plain booking_world_in_cache
 ledger_lost plain consultorio_alternativa_offerta
 ledger_lost plain facility_cancel
 ledger_lost plain gp_alternativa_primo_posto
+ledger_lost plain gp_grazie_prima_del_ledger
 ledger_lost plain gp_preferenze_falsi
 ledger_lost plain gp_rinnovo_p1_lento
 ledger_lost plain gp_secondo_sintomo
@@ -150,6 +150,7 @@ ledger_lost turns booking_world_in_cache
 ledger_lost turns consultorio_alternativa_offerta
 ledger_lost turns facility_cancel
 ledger_lost turns gp_alternativa_primo_posto
+ledger_lost turns gp_grazie_prima_del_ledger
 ledger_lost turns gp_preferenze_falsi
 ledger_lost turns gp_rinnovo_p1_lento
 ledger_lost turns gp_secondo_sintomo
@@ -178,8 +179,6 @@ ledger_reorder turns cross_asst_orologio
 ledger_reorder turns cross_asst_orologio_nota
 ledger_reorder turns cross_asst_prenota
 ledger_reorder turns cross_asst_vincoli
-ledger_reorder turns gp_nessun_posto
-ledger_reorder turns gp_rinnovo_en
 ledger_reorder turns gp_rinnovo_p1_lento
 ledger_reorder turns ospedale_alternative
 ledger_reorder turns ospedale_alternative_duplicate
@@ -195,20 +194,7 @@ ledger_reorder turns specialista_hold_duplicate
 ledger_reorder turns welcome_lang_en_partner
 redeliver plain checkin_rifiutato
 redeliver plain facility_cancel
-redeliver plain gp_dopo_grazie
-redeliver plain gp_modello_inventa
-redeliver plain gp_modello_lento
-redeliver plain gp_nessun_posto
-redeliver plain gp_preferenze_dopo
-redeliver plain gp_regole_prima
-redeliver plain gp_rinnovo_altrui
-redeliver plain gp_rinnovo_grazie
-redeliver plain gp_rinnovo_inesistente
 redeliver plain gp_rinnovo_p1_lento
-redeliver plain gp_rinnovo_riscritto
-redeliver plain gp_senza_modello
-redeliver plain gp_stesso_sintomo
-redeliver plain gp_testo_libero
 redeliver plain injection_facility
 redeliver plain ospedale_alternative
 redeliver plain ospedale_alternative_duplicate
@@ -217,21 +203,7 @@ redeliver plain ospedale_regola_p3
 redeliver plain ospedale_slot_rubato
 redeliver turns checkin_rifiutato
 redeliver turns facility_cancel
-redeliver turns gp_dopo_grazie
-redeliver turns gp_modello_inventa
-redeliver turns gp_modello_lento
-redeliver turns gp_nessun_posto
-redeliver turns gp_preferenze_dopo
-redeliver turns gp_regole_prima
-redeliver turns gp_rinnovo_altrui
-redeliver turns gp_rinnovo_grazie
-redeliver turns gp_rinnovo_inesistente
-redeliver turns gp_rinnovo_ledger_lento
 redeliver turns gp_rinnovo_p1_lento
-redeliver turns gp_rinnovo_riscritto
-redeliver turns gp_senza_modello
-redeliver turns gp_stesso_sintomo
-redeliver turns gp_testo_libero
 redeliver turns injection_facility
 redeliver turns ospedale_alternative
 redeliver turns ospedale_alternative_duplicate
@@ -275,14 +247,11 @@ say_tnv turns cross_asst_distribuite
 say_tnv turns cross_asst_orologio_nota
 say_tnv turns cross_asst_push_reale
 say_tnv turns cross_asst_world_lento
-say_tnv turns domanda_orario
 say_tnv turns gp_nessun_posto
 say_tnv turns gp_rinnovo_altrui
 say_tnv turns gp_rinnovo_inesistente
 say_tnv turns gp_rinnovo_ledger_lento
 say_tnv turns gp_rinnovo_riscritto
-say_tnv turns gp_secondo_sintomo
-say_tnv turns injection_slot
 say_tnv turns ospedale_annullata
 say_tnv turns ospedale_commit_unico
 say_tnv turns ospedale_rehold

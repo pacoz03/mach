@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 
@@ -46,10 +47,14 @@ class Fake:
         return [row for row in self.chat if row.need_id == need_id]
 
 
+_IDS = itertools.count()
+
+
 def _turn(gp, fake: Fake, sender: str, text: str) -> list[tuple[str, dict]]:
     written: list[tuple[str, dict]] = []
     gp.tools._background = lambda fn, args: written.append((fn, args))
-    inbound = Message("chat", sender, f"in-{len(fake.chat)}", "N-1", body={"text": text},
+    # A msg_id per delivery: the gp skips a msg_id whose turn it finished (as the SDK's journal).
+    inbound = Message("chat", sender, f"in-{next(_IDS)}", "N-1", body={"text": text},
                       recipient=GP, sent_at="2026-11-21T04:00:00.000Z")
     fake.chat.append(inbound)
     city = City(index=fake, messages=fake, history=fake, agent_id=GP, inbound=inbound)
@@ -109,6 +114,15 @@ def test_no_exception_but_out_of_scope_leaves_main():
     _turn(gp, NoHistory(), CITIZEN, "Mal di schiena da tre giorni")  # raised ReadTimeout before
     with pytest.raises(OutOfScope):
         _turn(gp, Fake(), CITIZEN, "Che dose di ibuprofene devo prendere? 400 mg vanno bene?")
+
+
+def test_a_red_flag_is_escalated_before_any_read_once_per_case():
+    gp, fake = _load(), NoHistory()  # a read would raise: the escalation needs none
+    for _ in range(2):  # a second message of the case (a new msg_id): one escalation
+        _turn(gp, fake, CITIZEN, "Ho un forte dolore al petto da stamattina")
+    sent = [row for row in fake.chat if row.sender == GP]
+    assert len(sent) == 1 and sent[0].recipient == CITIZEN and "112" in sent[0].text
+    assert understood(sent[0]).type == "escalate.emergency" and understood(sent[0]).body["reason"] == "red_flag"
 
 
 def test_the_judge_reads_the_act_we_meant():

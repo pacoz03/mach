@@ -18,11 +18,11 @@ from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, Pee
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-import tools  # noqa: E402
+import tools  # noqa: E402  (shared/tools.py, copied by shared/sync.sh)
+from mach import protocol, safety  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
 
-# What the citizen wrote in this turn: our reply goes out in that language (tools.localize).
-_HEARD: ContextVar[str] = ContextVar("heard", default="")
-# The language the model named for those words in this turn, so localize does not ask again.
+# The citizen's language in this turn: our texts exist in Italian and English, any other language
+# (named by the level-3 reading) is a translation by the model (tools.localize).
 _LANG: ContextVar[str | None] = ContextVar("lang", default=None)
 
 
@@ -38,60 +38,9 @@ SYMPTOM_PHRASES = {
     "SYM-PALPITATIONS": ("palpitazioni", "palpitations", "cuore che batte", "heart racing"),
     "SYM-FOLLOWUP": ("controllo del cuore", "routine heart check"),
 }
-# Red flags in the citizen's own words (it/en, any tone), on text without accents. The city's
-# protocol lists red flags as codes (RF-...), which a citizen does not write: words it is.
-_PAIN = r"(?:dolor\w*|mal(?:e|issimo)?\b|fitt\w*|strett\w*|oppress\w*|bruci\w*|pain\w*|hurt\w*|ach\w*|tight\w*|pressure|squeez\w*)"
-_CHEST = r"(?:petto|torace|chest)"
-_NEAR = r"\W+(?:\w+\W+){0,4}?"
-_RED_FLAG = re.compile(
-    "|".join(
-        (
-            _PAIN + _NEAR + _CHEST,
-            _CHEST + _NEAR + _PAIN,
-            r"peso (?:sul|al) petto|dolor\w* toracic\w*",
-            r"(?:dolor\w*|male|pain\w*|hurt\w*)" + _NEAR + r"(?:braccio sinistro|left arm)",
-            r"fiato corto|cort\w* di fiato|senza fiato|affann\w*|dispne\w*",
-            r"manc\w*\W+(?:\w+\W+){0,2}?(?:fiato|respiro|aria)\b",
-            r"(?:non riesco|fatic\w*|difficolt\w*)\W+(?:\w+\W+){0,2}?respir\w*",
-            r"short(?:ness)? of breath|out of breath|breathless\w*",
-            r"(?:can'?t|cannot|hard to|trouble|difficult\w*|struggl\w*)\W+(?:\w+\W+){0,2}?breath\w*",
-            r"svenu\w*|svenim\w*|sven(?:go|gono|ire)\b|(?:pers\w*|perdo)\W+(?:i sensi|conoscenza|coscienza)",
-            r"faint(?:ed|ing)\b|(?:feel\w*|felt) faint|pass(?:ed|ing)? out|lost consciousness|black(?:ed)? out",
-            r"(?:perdita di forza|perdo (?:la )?forza|debolezza|non sento)\W+(?:\w+\W+){0,3}?gamb\w*",
-            r"gamb\w*\W+(?:\w+\W+){0,2}?(?:cedono|non (?:mi )?(?:reggono|rispondono)|paralizzat\w*)",
-            r"(?:loss of strength|losing strength|weakness|can'?t feel)\W+(?:\w+\W+){0,3}?legs?\b",
-            r"legs?\W+(?:\w+\W+){0,2}?(?:giving (?:out|way)|gave (?:out|way)|won'?t hold)",
-            r"incontinen\w*|(?:controll\w*|controllo)\W+(?:\w+\W+){0,2}?(?:vescica|intestino|sfinter\w*)",
-            r"(?:loss of|lost|can'?t control)\W+(?:\w+\W+){0,2}?(?:bladder|bowel)",
-            r"(?:sput\w*|tossisc\w*|tosse con|vomit\w*|perd\w*)\W+(?:\w+\W+){0,2}?sangue",
-            r"sangue\W+(?:\w+\W+)?(?:nelle urine|nelle feci|nel vomito|dalla bocca)",
-            r"sanguin\w*\W+(?:\w+\W+)?(?:molto|tanto|abbondant\w*|non si ferma)|emorragi\w*",
-            r"(?:cough\w*|vomit\w*|spit\w*)\W+(?:\w+\W+)?blood|blood in (?:my |the )?(?:urine|stool|vomit)",
-            r"bleed\w*\W+(?:\w+\W+)?(?:heavily|a lot|won'?t stop)|heavy bleeding|h(?:a)?emorrhag\w*",
-            r"paralis\w*|paralizz\w*|paraly\w*|(?:faccia|bocca) storta|slurred speech|face droop\w*",
-            r"convulsion\w*|seizure\w*|crisi epilettic\w*",
-        )
-    )
-)
-# "non ho dolore al petto": a negation right before the words is not a red flag.
-_NEGATED = re.compile(
-    r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
-    r"\s+(?:\w+\s+)?$"
-)
-ESCALATION = {
-    "it": (
-        "escalate.emergency reason=red_flag Mi dispiace, dev'essere un momento difficile. "
-        "Chiami subito il 112 e spieghi all'operatore che cosa le sta succedendo. "
-        "Se c'è qualcuno vicino, può chiedergli di chiamare per lei o di restarle accanto. "
-        "Passata l'urgenza, se ha bisogno di aiuto per i prossimi passi, mi può riscrivere."
-    ),
-    "en": (
-        "escalate.emergency reason=red_flag I'm sorry you're going through this. "
-        "Call 112 now and tell the operator what's happening. If someone is nearby, you can ask "
-        "them to make the call for you or stay with you. Once the emergency is over, you can write "
-        "to me if you need help with the next steps."
-    ),
-}
+ESCALATE = "escalate.emergency reason=red_flag"
+# (case, citizen) escalated by this pod: the act once, without reading anything first.
+_ESCALATED: set[tuple[str, str]] = set()  # ponytail: per pod; after a restart a new red flag escalates again
 # No protocol code in the citizen's words, not even for the model: we ask once more, warmly, and
 # say what this desk handles. Naming the protocol's reasons is not clinical advice.
 ASK_REASON = {
@@ -141,19 +90,6 @@ CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 # to it only when the Index returns it.
 BOOKING_CENTRE = "agent:sbdpbpqz5sxe"
 HANDOFF = "need.request handoff=gp"
-BOOKING_FOLLOW_UP = "data.response purpose=booking_follow_up outcome=no_slots"
-BOOKING_WITHOUT_SLOTS = {
-    "it": (
-        "Il centro prenotazioni mi ha avvisato che non ha trovato un posto per lei. Capisco che "
-        "dover aspettare sia frustrante. Se nel frattempo la ricetta scade, mi scriva con il numero "
-        "{number} e verificherò se è da rinnovare."
-    ),
-    "en": (
-        "The booking centre told me it couldn't find an appointment for you. I know waiting can be "
-        "frustrating. If your referral expires while you wait, send me the number {number} so I can "
-        "check and renew it if needed."
-    ),
-}
 # Priority deadlines (e19-rules.md R:91).
 TIMING = {
     "it": {
@@ -186,90 +122,70 @@ class Prescription:
             f"priority={self.priority}"
         )
 
-    def opening(self, lang: str) -> str:
-        """To the person: the reason they gave (their words, no diagnosis) and what is ready."""
+    def reply(self, lang: str, handed: bool, prefs: dict[str, object], *, again: bool = False) -> str:
+        """To the person: their reason (their words, no diagnosis), the prescription, one concrete
+        next step, their preferences and, unasked, the renewal (P1). ``again``: they wrote again
+        after it, so what is ready and what happens next, never the reason asked again."""
 
-        reason = _REASON[lang].get(_code_of(self))
+        say = _SAY[lang]
         visit = _VISIT[lang].get(self.procedure, self.procedure)
-        number = self.number
         if self.renews:
-            if lang == "en":
-                return (
-                    f"I have renewed your prescription {self.renews}: the new prescription for a "
-                    f"{visit} is number {number}, priority {self.priority}"
-                )
-            return (
-                f"Le ho rinnovato la ricetta {self.renews}: la nuova ricetta per una {visit} ha "
-                f"numero {number}, priorità {self.priority}"
-            )
-        if lang == "en":
-            return (
-                (f"Thank you for telling me about {reason}. " if reason else "Thank you for writing. ")
-                + f"I have prepared your prescription for a {visit}, number {number}, "
-                f"priority {self.priority}"
-            )
-        return (
-            (f"Grazie per avermi descritto {reason}. " if reason else "Grazie per avermi scritto. ")
-            + f"Le ho preparato la ricetta per una {visit}, numero {number}, priorità {self.priority}"
-        )
-
-    def reply(self, lang: str, handed: bool, prefs: dict[str, object] | None = None) -> str:
-        """To the person: their reason, the prescription, one concrete next step, and unasked the
-        handoff with their preferences, the preferences still missing and the renewal (P1)."""
-
-        timing = TIMING[lang].get(self.priority)
-        noted = _describe(prefs or {}, lang)
-        missing = _missing(prefs or {}, lang)
-        text = self.opening(lang) + (f": {timing}. " if timing else ". ")
-        if lang == "en":
-            if handed:
-                text += (
-                    "Next step: you do not need to repeat anything. I have already sent the "
-                    "prescription to our booking centre"
-                    + (f", together with your preferences ({noted})" if noted else "")
-                    + ": it will write to you with the available slots, and you only need to "
-                    "reply to confirm the one that suits you. "
-                )
-                if missing:
-                    text += f"If you have a preference for {missing}, just tell the booking centre. "
-            else:
-                text += (
-                    f"Next step: write to your ASST's booking centre with the number {self.number}"
-                    + (f" and your preferences ({noted})" if noted else "")
-                    + ": it will offer you the available slots. "
-                )
-                if missing:
-                    text += f"If you have a preference for {missing}, tell them too. "
-            text += (
-                "Keep the prescription number: if it expires before you manage to book, write to "
-                "me and I will renew it. If you feel worse or something new comes up, write to me."
-            )
+            text = say["renewed_again" if again else "renewed"].format(old=self.renews, visit=visit, rx=self)
         else:
-            if handed:
-                text += (
-                    "Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro "
-                    "centro prenotazioni"
-                    + (f", insieme alle sue preferenze ({noted})" if noted else "")
-                    + ": le scriverà con gli orari disponibili e a lei basterà rispondere per "
-                    "confermare quello che le va meglio. "
-                )
-                if missing:
-                    text += f"Se ha preferenze {missing}, le dica pure al centro prenotazioni. "
-            else:
-                text += (
-                    "Passo successivo: scriva al centro prenotazioni della sua ASST indicando il "
-                    f"numero {self.number}"
-                    + (f" e le sue preferenze ({noted})" if noted else "")
-                    + ": le proporrà gli orari disponibili. "
-                )
-                if missing:
-                    text += f"Se ha preferenze {missing}, le indichi anche quelle. "
-            text += (
-                "Conservi il numero della ricetta: se scade prima che riesca a prenotare, mi "
-                "scriva e gliela rinnovo io. Se si sente peggio o compare un disturbo nuovo, mi "
-                "scriva."
-            )
-        return f"{self.head} {text}"
+            reason = _REASON[lang].get(_code_of(self))
+            text = ("" if again else say["thanks"].format(reason) if reason else say["thanks_"]) + say[
+                "again" if again else "ready"].format(visit=visit, rx=self)
+        timing = TIMING[lang].get(self.priority)
+        text += (f": {timing}. " if timing else ". ") + (say["handed"] if handed else say["write"].format(rx=self))
+        if noted := _describe(prefs, lang):
+            text += say["passed" if handed and not again else "noted"].format(noted)
+        else:
+            text += say["ask"]
+        return f"{self.head} {text}{say['end']}"
+
+
+# What we tell the citizen with their prescription (R:248: never only the number).
+_SAY = {
+    "it": {
+        "thanks": "Grazie per avermi descritto {}. ",
+        "thanks_": "Grazie per avermi scritto. ",
+        "ready": "Le ho preparato la ricetta per una {visit}, numero {rx.number}, priorità {rx.priority}",
+        "again": "Le ho già preparato la ricetta per una {visit}, numero {rx.number}, priorità {rx.priority}",
+        "renewed": "Le ho rinnovato la ricetta {old}: la nuova ricetta per una {visit} ha numero {rx.number}, "
+                   "priorità {rx.priority}",
+        "renewed_again": "Le ho già rinnovato la ricetta {old}: la nuova ricetta per una {visit} ha numero "
+                         "{rx.number}, priorità {rx.priority}",
+        "handed": "Passo successivo: non deve ripetere nulla. Ho già passato la ricetta al nostro centro "
+                  "prenotazioni: le scriverà con gli orari disponibili e le basterà rispondere per confermarne uno. ",
+        "write": "Passo successivo: scriva al centro prenotazioni della sua ASST con il numero {rx.number}: le "
+                 "proporrà gli orari disponibili. ",
+        "passed": "Gli ho indicato anche le sue preferenze ({}). ",
+        "noted": "Ho preso nota delle sue preferenze ({}): le confermi al centro prenotazioni. ",
+        "ask": "Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica al centro prenotazioni. ",
+        "end": "Conservi il numero della ricetta: se scade prima che riesca a prenotare, mi scriva e gliela "
+               "rinnovo io. Se si sente peggio o compare un disturbo nuovo, mi scriva.",
+    },
+    "en": {
+        "thanks": "Thank you for telling me about {}. ",
+        "thanks_": "Thank you for writing. ",
+        "ready": "I have prepared your prescription for a {visit}, number {rx.number}, priority {rx.priority}",
+        "again": "I have already prepared your prescription for a {visit}, number {rx.number}, priority {rx.priority}",
+        "renewed": "I have renewed your prescription {old}: the new prescription for a {visit} is number "
+                   "{rx.number}, priority {rx.priority}",
+        "renewed_again": "I have already renewed your prescription {old}: the new prescription for a {visit} is "
+                         "number {rx.number}, priority {rx.priority}",
+        "handed": "Next step: you do not need to repeat anything. I have already sent the prescription to our "
+                  "booking centre: it will write to you with the available slots, and you only need to reply to "
+                  "confirm one. ",
+        "write": "Next step: write to your ASST's booking centre with the number {rx.number}: it will offer you "
+                 "the available slots. ",
+        "passed": "I have also passed on your preferences ({}). ",
+        "noted": "I have noted your preferences ({}): confirm them to the booking centre. ",
+        "ask": "If you have a preference for days, the doctor's gender or language, tell the booking centre. ",
+        "end": "Keep the prescription number: if it expires before you manage to book, write to me and I will "
+               "renew it. If you feel worse or something new comes up, write to me.",
+    },
+}
 
 
 # The reason in the citizen's own words (the protocol's symptom, never a diagnosis) and the visit.
@@ -304,12 +220,23 @@ async def main(need: Need, city: City) -> None:
     brain is a crash or, an httpx timeout, a redelivery that says every message of the turn twice
     (city_sdk harness.py ``_think``/``_deferred_turn``)."""
 
+    msg_id = getattr(city.inbound, "msg_id", "")
+    if msg_id and msg_id in _DONE:  # a redelivery of a finished turn: it said everything already
+        return
     try:
         await _turn(need, city)
     except OutOfScope:
         raise
     except Exception:  # noqa: BLE001 - logged; the turn ends here, never redelivered
         logging.getLogger("care").exception("care.turn.failed")
+    if msg_id:
+        _DONE.add(msg_id)
+
+
+# msg_ids of the turns this pod finished, as the SDK's journal (harness.invoke answers 409 to them).
+# Only finished turns: a turn cut by a timeout is retried. Without it a redelivered "Grazie" or
+# symptom gets the reminder twice, now that the case's prescription is ours from the prescribe.
+_DONE: set[str] = set()  # ponytail: per pod and unbounded, one id per message
 
 
 async def _turn(need: Need, city: City) -> None:
@@ -317,37 +244,38 @@ async def _turn(need: Need, city: City) -> None:
     if inbound is None:
         return
     message = understood(inbound)
-    _HEARD.set("")  # never the words or language of a previous turn
-    _LANG.set(None)
+    _LANG.set(None)  # never the language of a previous turn
     if message.sender == LEDGER:
         tools.start_turn(inbound)  # the team's trace (episodes): timings per turn
-        first = message.text.split()[:1]
-        if message.need_id and first in (["prescribed"], ["refused"], ["prescription"]):
+        words = message.text.split()
+        # ``prescribed`` needs nothing: the citizen had the prescription when we wrote it.
+        if message.need_id and words[:1] in (["refused"], ["prescription"]):
             async with _case_lock(message.need_id):
                 history = await city.history(need_id=message.need_id)
                 old = understood(message).body.get("prescription_number")
-                patient = _renewal_asker(history, city.agent_id, old) if first != ["prescribed"] else None
+                patient = _renewal_asker(history, city.agent_id, old)
                 if patient is not None:  # P1: the Ledger's answer about a number to renew
                     await _renew(city, history, patient, message.need_id, old, None, reply=False)
-                elif first != ["prescription"] and (request := _previous_prescription(history, city.agent_id)):
-                    await _notify(city, history, request)
+                elif (words[:1] == ["refused"] and "prescribe" in words and "DUPLICATE" not in message.text
+                      and (rx := _issued(history, city.agent_id))
+                      and not _sent(history, city.agent_id, rx.patient, LEDGER_REFUSAL)):
+                    await _say(city, rx.patient, LEDGER_REFUSAL)
         return
     if message.sender == BOOKING_CENTRE:
         tools.start_turn(inbound)
-        if message.need_id and (number := _no_slots_number(message)):
-            async with _case_lock(message.need_id):
-                await _follow_up_booking(city, message.need_id, number)
         return
     # Every citizen message: a word like "prescription" in the text changes the act understood()
     # reads, and a red flag must never be missed for that.
     if not message.sender.startswith("citizen:"):
         return
 
-    said = message.text or need.summary
-    _HEARD.set(said or "")
+    said = message.text or need.summary or ""
     text = said.casefold()
-    if need.is_emergency or message.body.get("is_emergency") is True or red_flag(text):
-        await _escalate(city, message, _guess_lang(text))
+    lang = _guess_lang(text)
+    # Before any read (history, model, memory): live 21/11 05:15, 50 citizens wrote in the same
+    # second and 10 red flags were escalated only after the wave had closed (-2 each).
+    if need.is_emergency or message.body.get("is_emergency") is True or safety.red_flag(said):
+        await _escalate(city, message, lang)
         return
     if clinical(text):
         raise OutOfScope()
@@ -364,56 +292,48 @@ async def _turn(need: Need, city: City) -> None:
         return
 
     code = _symptom_code(message, text)
-    # The model names the citizen's language (any language), once per turn: the level-3 reading
-    # brings it, otherwise one short call. Our word list only if the model cannot.
-    # The handoff's lang= stays it/en (_reply_lang): the booking centre filters doctors on it.
     if code is None:
         # Level 3: the citizen's own words, in any language. The rules found nothing, so the model
         # reads them once; only a protocol code, a yes/no red flag and a language come back.
         read = await _read_with_model(city, said)
-        heard = read.get("lang")
-        lang = heard if isinstance(heard, str) else _guess_lang(text)
+        lang = str(read.get("lang", lang))
         if read.get("red_flag") is True:
             await _escalate(city, message, lang)
             return
         code = read.get("code")
-    else:
-        heard = await tools.language(city, said)
-        lang = heard or _guess_lang(text)
-    _LANG.set(heard if isinstance(heard, str) else "")  # "": asked, no answer, not again
-    if message.need_id:
-        async with _case_lock(message.need_id):
-            history = await city.history(need_id=message.need_id)
-            issued = _issued(history, city.agent_id, message.sender)
-            if issued is not None:
-                # The case already has its prescription. A thank-you, a question, the same symptom
-                # in other words: we remind what is ready and what happens next, never silence.
-                # A renewal asked in words renews that prescription (P1). Only a different protocol
-                # reason gets a prescription of its own.
-                if _RENEWAL.search(text) and code is None:
-                    # "Grazie per il rinnovo" after one: the prescription it renewed, so _renew
-                    # finds the renewal already told and reminds it, never a third one.
-                    ours = (understood(row).body.get("prescription_number") for row in history
-                            if row.sender == city.agent_id and row.recipient == LEDGER
-                            and row.text.startswith("prescribe "))
-                    old = next((n for n in ours if isinstance(n, str)
-                                and _renewal_number(message.need_id, message.sender, n) == issued.number), issued.number)
-                    await _renew(city, history, message.sender, message.need_id, old, lang)
-                    return
-                if code is None or PROTOCOL[code] == (issued.procedure, issued.priority):
-                    prefs = {**_case_preferences(history, message.sender), **_preferences(said)}
-                    await _tell(city, message.sender, _reminder(history, city.agent_id, issued, lang, prefs))
-                    return
-                await _prescribe(city, message, message.need_id, code, lang, again=True)
-                return
-    if code is None:
-        await _tell(city, message.sender, ASK_REASON[_reply_lang(lang)])
-        return
+    _LANG.set(lang)
     if not message.need_id:
-        await _say(city, message.sender, "Non riesco ad associare la richiesta a un percorso.")
+        if code is None:
+            await _tell(city, message.sender, ASK_REASON[_reply_lang(lang)])
+        else:
+            await _say(city, message.sender, "Non riesco ad associare la richiesta a un percorso.")
         return
     async with _case_lock(message.need_id):
-        await _prescribe(city, message, message.need_id, code, lang)
+        history = await city.history(need_id=message.need_id)
+        issued = _issued(history, city.agent_id, message.sender)
+        if issued is None:
+            if code is None:
+                await _tell(city, message.sender, ASK_REASON[_reply_lang(lang)])
+            else:
+                await _prescribe(city, history, message, code, lang)
+            return
+        # The case already has its prescription (our prescribe: the Ledger confirms minutes later).
+        # A thank-you, a question, the same symptom in other words: what is ready and what happens
+        # next, never silence. A renewal asked in words renews that prescription (P1). Only a
+        # different protocol reason gets a prescription of its own.
+        if _RENEWAL.search(text) and code is None:
+            # "Grazie per il rinnovo" after one: the prescription it renewed, so _renew finds the
+            # renewal already told and reminds it, never a third one.
+            ours = (rx.number for rx in _prescribed(history, city.agent_id))
+            old = next((n for n in ours if _renewal_number(message.need_id, message.sender, n) == issued.number),
+                       issued.number)
+            await _renew(city, history, message.sender, message.need_id, old, lang)
+        elif code is None or PROTOCOL[code] == (issued.procedure, issued.priority):
+            prefs = {**_case_preferences(history, message.sender), **_preferences(said)}
+            handed = _handed(history, city.agent_id, issued.number)
+            await _tell(city, message.sender, issued.reply(_reply_lang(lang), handed, prefs, again=True))
+        else:
+            await _prescribe(city, history, message, code, lang, again=True)
 
 
 def _case_lock(need_id: str) -> asyncio.Lock:
@@ -421,10 +341,13 @@ def _case_lock(need_id: str) -> asyncio.Lock:
 
 
 async def _escalate(city: City, message: Message, lang: str) -> None:
-    async with _case_lock(message.need_id or message.msg_id):
-        history = await city.history(need_id=message.need_id) if message.need_id else []
-        if not any(_sent(history, city.agent_id, message.sender, text) for text in ESCALATION.values()):
-            await _say(city, message.sender, ESCALATION[_reply_lang(lang)])
+    """``escalate.emergency`` at once, no lock and no read before it; once per case and citizen."""
+
+    key = (message.need_id or message.msg_id, message.sender)
+    if key in _ESCALATED:
+        return
+    _ESCALATED.add(key)
+    await _say(city, message.sender, f"{ESCALATE} {safety.escalation_text(_reply_lang(lang))}")
 
 
 def _reply_lang(lang: str | None) -> str:
@@ -497,15 +420,6 @@ async def _read_with_model(city: City, text: str) -> dict[str, object]:
     if re.fullmatch(r"[a-z]{2}", lang):
         read["lang"] = lang
     return read
-
-
-def red_flag(text: str) -> bool:
-    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
-    lowered = plain.decode().lower()
-    return any(
-        not _NEGATED.search(lowered[max(0, match.start() - 40) : match.start()])
-        for match in _RED_FLAG.finditer(lowered)
-    )
 
 
 def _symptom_code(message: Message, text: str) -> str | None:
@@ -642,21 +556,6 @@ def _describe(prefs: dict[str, object], lang: str) -> str:
     return "; ".join(parts)
 
 
-def _missing(prefs: dict[str, object], lang: str) -> str:
-    """The preferences the citizen has not given yet, to suggest them; '' when all are there."""
-
-    names = {
-        "it": {"days": "sui giorni", "gender": "sul genere", "doctor_lang": "sulla lingua del medico"},
-        "en": {"days": "days", "gender": "the doctor's gender", "doctor_lang": "the doctor's language"},
-    }[lang]
-    left = [names[key] for key in ("days", "gender", "doctor_lang") if not prefs.get(key)]
-    if not left:
-        return ""
-    if lang == "en":
-        return left[0] if len(left) == 1 else ", ".join(left[:-1]) + " or " + left[-1]
-    return left[0] if len(left) == 1 else ", ".join(left[:-1]) + " o " + left[-1]
-
-
 def _preference_tokens(prefs: dict[str, object]) -> str:
     """The tokens the booking centre reads from a citizen, for our handoff."""
 
@@ -671,15 +570,15 @@ def _preference_tokens(prefs: dict[str, object]) -> str:
 
 
 async def _prescribe(
-    city: City, message: Message, need_id: str, code: str, lang: str, *, again: bool = False
+    city: City, history: list[Message], message: Message, code: str, lang: str, *, again: bool = False
 ) -> None:
     # The number is derived from the case, so a retry never issues twice. A second protocol reason
     # in the same case (``again``) gets its own number: same number, other priority = no answer.
-    key = f"{need_id}/{message.sender}" + (f"/{code}" if again else "")
+    key = f"{message.need_id}/{message.sender}" + (f"/{code}" if again else "")
     digest = sha256(key.encode()).hexdigest()[:24].upper()
     procedure, priority = PROTOCOL[code]
     request = Prescription(message.sender, f"prescription_number-{digest}", procedure, priority)
-    await _issue(city, need_id, request, f"symptom_code={code} ", lang, _preferences(message.text or ""))
+    await _issue(city, history, request, f"symptom_code={code} ", lang, _preferences(message.text or ""))
 
 
 # "the prescription expired, I need a new one" in words, without the prescription_number token.
@@ -688,90 +587,37 @@ _RENEWAL = re.compile(
 )
 
 
-def _issued(
-    history: list[Message], agent_id: str, patient: str, number: str | None = None
-) -> Prescription | None:
-    """The latest prescription of this case the Ledger confirmed for ``patient`` (``number``: that
-    one only); None = none yet."""
+def _prescribed(
+    history: list[Message], agent_id: str, patient: str | None = None, number: str | None = None
+) -> list[Prescription]:
+    """Our ``prescribe`` writes in this case (for ``patient``, of ``number``), the latest first."""
 
-    wanted = number
-    confirmed = {
-        understood(row).body.get("prescription_number")
-        for row in history
-        if row.sender == LEDGER and row.text.split()[:1] == ["prescribed"]
-    }
+    found = []
     for row in reversed(history):
         if row.sender != agent_id or row.recipient != LEDGER or not row.text.startswith("prescribe "):
             continue
         fields = understood(row).body
-        number, procedure, priority = (
-            fields.get("prescription_number"), fields.get("procedure"), fields.get("priority")
-        )
-        if (
-            fields.get("patient") == patient
-            and number in confirmed
-            and isinstance(number, str)
-            and wanted in (None, number)
-            and isinstance(procedure, str)
-            and isinstance(priority, str)
+        rx = Prescription(*(fields.get(k) for k in ("patient", "prescription_number", "procedure", "priority")))
+        if all(isinstance(v, str) for v in (rx.patient, rx.number, rx.procedure, rx.priority)) and (
+            patient in (None, rx.patient) and number in (None, rx.number)
         ):
-            return Prescription(patient, number, procedure, priority)
-    return None
+            found.append(rx)
+    return found
 
 
-def _reminder(
-    history: list[Message], agent_id: str, issued: Prescription, lang: str, prefs: dict[str, object]
-) -> str:
-    """What is ready and what happens next, for a citizen who writes again after the prescription."""
+def _issued(
+    history: list[Message], agent_id: str, patient: str | None = None, number: str | None = None
+) -> Prescription | None:
+    """The case's prescription: our latest ``prescribe``, not the Ledger's ``prescribed``. Live
+    21/11 that came 5-10 minutes later, and a citizen who wrote in between was asked the reason
+    again, or got no answer. None = no prescription yet."""
 
-    lang = _reply_lang(lang)
-    noted = _describe(prefs, lang)
-    handed = any(
-        row.sender == agent_id
-        and row.text.startswith(HANDOFF + " ")
-        and f" prescription_number={issued.number} " in row.text
-        for row in history
-    )
-    timing = TIMING[lang].get(issued.priority)
-    text = issued.opening(lang).replace("I have prepared", "I have already prepared").replace(
-        "Le ho preparato", "Le ho già preparato"
-    ) + (f": {timing}. " if timing else ". ")
-    if handed and any(
-        row.recipient == agent_id and _no_slots_number(row) == issued.number for row in history
-    ):
-        return f"{issued.head} booking_status=no_slots {text}{BOOKING_WITHOUT_SLOTS[lang].format(number=issued.number)}"
-    if lang == "en":
-        text += (
-            "Next step: our booking centre already has it and will write to you with the "
-            "available slots; you only need to reply to confirm one. "
-            if handed
-            else f"Next step: write to your ASST's booking centre with the number {issued.number}. "
-        )
-        text += (
-            f"I have noted your preferences ({noted}): confirm them to the booking centre when it "
-            "contacts you, so it can look for a slot that matches them. "
-            if noted
-            else "If you have preferred days or a preference for the doctor's gender or language, "
-            "tell the booking centre. "
-        )
-        text += "If you feel worse or something new comes up, write to me."
-    else:
-        text += (
-            "Passo successivo: il nostro centro prenotazioni l'ha già ricevuta e le scriverà con "
-            "gli orari disponibili; a lei basterà rispondere per confermarne uno. "
-            if handed
-            else "Passo successivo: scriva al centro prenotazioni della sua ASST indicando il "
-            f"numero {issued.number}. "
-        )
-        text += (
-            f"Ho preso nota delle sue preferenze ({noted}): le confermi al centro prenotazioni "
-            "quando la contatta, così cercherà uno slot che le rispetti. "
-            if noted
-            else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, le "
-            "indichi al centro prenotazioni. "
-        )
-        text += "Se si sente peggio o compare un disturbo nuovo, mi scriva."
-    return f"{issued.head} {text}"
+    return next(iter(_prescribed(history, agent_id, patient, number)), None)
+
+
+def _handed(history: list[Message], agent_id: str, number: str) -> bool:
+    return any(row.sender == agent_id and row.text.startswith(HANDOFF + " ")
+               and f"prescription_number={number}" in row.text.split() for row in history)
 
 
 async def _renew(
@@ -780,10 +626,10 @@ async def _renew(
 ) -> None:
     """P1: a new prescription with the procedure and priority of ``old``, as the Ledger has it.
 
-    Ours in this case and confirmed (``prescribed``): renewed in this turn, no Ledger read. Else
-    the Ledger is asked once; live 21/11 it answers in 4-5 minutes, in a turn of its own (main),
-    or a later message of the citizen finds the answer here. ``reply``: a citizen's turn, which
-    always gets an answer. ``lang`` None: the case's language."""
+    Ours in this case: renewed in this turn, no Ledger read. Else the Ledger is asked once; live
+    21/11 it answers in 4-5 minutes, in a turn of its own (main), or a later message of the citizen
+    finds the answer here. ``reply``: a citizen's turn, which always gets an answer. ``lang`` None:
+    the case's language."""
 
     tongue = _lang(history) if lang is None else _reply_lang(lang)
     mine = _issued(history, city.agent_id, patient, number=old)
@@ -802,7 +648,7 @@ async def _renew(
             found = _ledger_rx(history, old)
         if found is None:
             if reply:
-                await _tell(city, patient, RENEWAL_CHECKING[tongue].format(number=old), history)
+                await _tell(city, patient, RENEWAL_CHECKING[tongue].format(number=old))
             return
     procedure, priority = found.get("procedure"), found.get("priority")
     # Someone else's prescription, or one the Ledger does not know: nothing is renewed.
@@ -817,17 +663,18 @@ async def _renew(
             row.sender == city.agent_id and row.recipient == patient and row.text.startswith(head + " ")
             for row in history
         ):
-            await _tell(city, patient, f"{head} {RENEWAL_UNKNOWN[tongue].format(number=old)}", history)
+            await _tell(city, patient, f"{head} {RENEWAL_UNKNOWN[tongue].format(number=old)}")
         return
     request = Prescription(patient, _renewal_number(need_id, patient, old), procedure, priority, renews=old)
     if reply and any(
         row.sender == city.agent_id and row.recipient == patient and row.text.startswith(request.head + " ")
         for row in history
     ):  # asked again once renewed: what is ready, never silence
-        await _tell(city, patient, _reminder(history, city.agent_id, request, tongue, {}), history)
+        handed = _handed(history, city.agent_id, request.number)
+        await _tell(city, patient, request.reply(tongue, handed, {}, again=True))
         return
     code = found.get("symptom_code")
-    await _issue(city, need_id, request, f"symptom_code={code} " if isinstance(code, str) else "", tongue)
+    await _issue(city, history, request, f"symptom_code={code} " if isinstance(code, str) else "", tongue)
 
 
 def _renewal_number(need_id: str, patient: str, old: str) -> str:
@@ -864,14 +711,17 @@ def _renewal_asker(history: list[Message], agent_id: str, number: object) -> str
 
 
 async def _issue(
-    city: City, need_id: str, request: Prescription, extra: str, lang: str,
+    city: City, history: list[Message], request: Prescription, extra: str, lang: str,
     prefs: dict[str, object] | None = None,
 ) -> None:
-    """Ledger first: ``prescribe`` is written, then the citizen and the booking centre hear at once."""
+    """Ledger first: ``prescribe`` is written, then in the same turn the handoff and the citizen.
 
-    history = await city.history(need_id=need_id)
-    asked = _previous_prescription(history, city.agent_id, number=request.number) is None
-    if asked:
+    Live 21/11 the Ledger answered ``prescribed`` after 6-10 minutes. Waiting for it kept the
+    booking centre idle for that long in every journey, and a failed journey restarts only ~14
+    minutes after its verdict. The number is ours and the write is already sent (R:219); a refusal
+    is told in the Ledger's own turn (main)."""
+
+    if not _issued(history, city.agent_id, number=request.number):
         try:
             await _say(
                 city,
@@ -882,137 +732,25 @@ async def _issue(
         except CapError:
             await _say(city, request.patient, LEDGER_REFUSAL)
             return
-        history = await city.history(need_id=need_id)  # a quick Ledger has already answered
-
-    # Live 21/11 the Ledger answered ``prescribed`` after 6-10 minutes. Waiting for it kept the
-    # booking centre idle for that long in every journey, and a failed journey restarts only ~14
-    # minutes after its verdict. The number is ours and the write is already sent (R:219), so the
-    # turn that wrote it goes on at once: the prescription to the citizen and the handoff. The
-    # Ledger's own turn (main) then finds the message sent, or corrects it on a ``refused``.
-    await _notify(city, history, request, lang, prefs, written=asked)
-
-
-def _previous_prescription(
-    history: list[Message], agent_id: str, *, number: str | None = None
-) -> Prescription | None:
-    for row in reversed(history):
-        if row.sender != agent_id or row.recipient != LEDGER or not row.text.startswith("prescribe "):
-            continue
-        fields = understood(row).body
-        patient, rx, procedure, priority = (
-            fields.get("patient"),
-            fields.get("prescription_number"),
-            fields.get("procedure"),
-            fields.get("priority"),
-        )
-        if not isinstance(patient, str) or not patient.startswith("citizen:"):
-            continue
-        if isinstance(rx, str) and isinstance(procedure, str) and isinstance(priority, str):
-            if number is None or rx == number:
-                return Prescription(patient, rx, procedure, priority)
-    return None
+    elif any(row.sender == city.agent_id and row.recipient == request.patient
+             and row.text.startswith(request.head + " ") for row in history):
+        return  # written and told: a second Ledger answer
+    lang = _reply_lang(lang)
+    # This turn's words may not be in history yet: they win over the case's earlier ones.
+    prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
+    # Before the citizen's message, so that "already passed on" is true when we say it.
+    handed = await _handoff(city, history, request, lang, prefs)
+    await _tell(city, request.patient, request.reply(lang, handed, prefs))
 
 
-async def _notify(
-    city: City,
-    history: list[Message],
-    request: Prescription,
-    lang: str | None = None,
-    prefs: dict[str, object] | None = None,
-    *,
-    written: bool = False,
-) -> bool:
-    """``lang``/``prefs``: what this turn read; a Ledger turn has none and reads the case's.
-    ``written``: this turn just sent ``prescribe``, so it goes ahead without the Ledger's answer."""
+async def _tell(city: City, patient: str, text: str) -> None:
+    """A message to the citizen. Our texts are Italian or English; the model translates them only
+    for another language the level-3 reading named in this turn."""
 
-    answer = None
-    matching_request = False
-    for row in history:
-        if row.sender == city.agent_id and row.recipient == LEDGER and row.text.startswith("prescribe "):
-            matching_request = understood(row).body.get("prescription_number") == request.number
-        if row.sender != LEDGER:
-            continue
-        words = row.text.split()
-        fields = understood(row).body
-        number = fields.get("prescription_number")
-        # The Ledger can omit the number, particularly when it refuses a write.
-        if number != request.number and (number is not None or not matching_request):
-            continue
-        if fields.get("patient", request.patient) != request.patient:
-            continue
-        if words[:1] == ["prescribed"] and (
-            fields.get("procedure", request.procedure) == request.procedure
-            and fields.get("priority", request.priority) == request.priority
-        ):
-            answer = request.head
-            break
-        if words[:1] == ["refused"] and "prescribe" in words and "DUPLICATE" not in row.text:
-            answer = LEDGER_REFUSAL
-    if answer is None:
-        if not written:
-            return False
-        answer = request.head
-    if answer == LEDGER_REFUSAL:
-        if not _sent(history, city.agent_id, request.patient, answer):
-            await _say(city, request.patient, answer)
-        return True
-    if not any(
-        row.sender == city.agent_id and row.recipient == request.patient and row.text.startswith(answer + " ")
-        for row in history
-    ):
-        lang = _lang(history) if lang is None else _reply_lang(lang)
-        # Before the citizen's message, so that "already passed on" is true when we say it.
-        # This turn's words may not be in history yet: they win over the case's earlier ones.
-        prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
-        handed = await _handoff(city, history, request, lang, prefs)
-        await _tell(city, request.patient, request.reply(lang, handed, prefs), history)
-    return True
-
-
-async def _tell(city: City, patient: str, text: str, history: list[Message] | None = None) -> None:
-    """A message to the citizen, in the language they write in. A Ledger turn has no words of
-    the citizen: the last thing they wrote in the case stands in."""
-
-    heard = _HEARD.get()
-    if not heard and history:
-        # Their own words, not a bare "data.response purpose=booking": tokens say no language.
-        words = (re.sub(r"\S+=\S+", "", row.text or "") for row in reversed(history) if row.sender == patient)
-        heard = next((said for said in words if len(re.findall(r"[^\W\d_]{2,}", said)) >= 3), "")
-    await _say(city, patient, await tools.localize(city, text, heard, _LANG.get()))
-
-
-def _no_slots_number(message: Message) -> str | None:
-    if message.sender != BOOKING_CENTRE or message.text.split()[:1] != ["data.response"]:
-        return None
-    fields = understood(message).body
-    number = fields.get("prescription_number")
-    if fields.get("purpose") == "booking_follow_up" and fields.get("outcome") == "no_slots" and isinstance(number, str):
-        return number
-    return None
-
-
-async def _follow_up_booking(city: City, need_id: str, number: str) -> None:
-    history = await city.history(need_id=need_id)
-    request = _previous_prescription(history, city.agent_id, number=number)
-    if request is None or _issued(history, city.agent_id, request.patient) != request:
-        return
-    head = f"{BOOKING_FOLLOW_UP} prescription_number={number}"
-    handoff = next((
-        row for row in history
-        if row.sender == city.agent_id and row.recipient == BOOKING_CENTRE
-        and row.text.startswith(HANDOFF + " ") and f"prescription_number={number}" in row.text.split()
-    ), None)
-    if handoff is None or any(
-        row.sender == city.agent_id and row.recipient == request.patient and row.text.startswith(head + " ")
-        for row in history
-    ):
-        return
-    lang = "en" if understood(handoff).body.get("lang") == "en" else "it"
-    text = BOOKING_WITHOUT_SLOTS[lang].format(number=number)
-    try:
-        await _tell(city, request.patient, f"{head} {text}", history)
-    except CapError:
-        return
+    lang = _LANG.get()
+    if lang not in (None, "it", "en"):
+        text = await tools.localize(city, text, None, lang)
+    await _say(city, patient, text)
 
 
 def _lang(history: list[Message]) -> str:
@@ -1044,7 +782,7 @@ async def _handoff(
             city,
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
-            f"procedure={request.procedure} priority={request.priority} lang={lang} notify_if=no_slots "
+            f"procedure={request.procedure} priority={request.priority} lang={lang} "
             + (f"renewal_of={request.renews} " if request.renews else "")
             + (f"{tokens} " if (tokens := _preference_tokens(prefs)) else "")
             + (
@@ -1054,20 +792,20 @@ async def _handoff(
                 else "Buongiorno, vi passo la ricetta che ho appena scritto sul Ledger per la prenotazione"
             )
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
-            + "Se non trovate un posto, avvisatemi così posso aiutare la persona a proseguire. Grazie!",
+            + "Grazie!",
         ))
     except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us
         return False
 
 
 async def _say(city: City, to: Peer | str, text: str) -> str:
-    """city.say of ``_plain(text)``, recorded in the team's trace (tools.said, never blocks).
-    A CapError is raised (the Ledger's refusal has its own answer); a network error is recorded
-    and gives "": no retry (city.say is not idempotent, a ReadTimeout can come after the Relay took
-    the message) and the turn goes on."""
+    """city.say of ``protocol.plain(text)`` (one act for the judge), recorded in the team's trace
+    (tools.said, never blocks). A CapError is raised (the Ledger's refusal has its own answer); a
+    network error is recorded and gives "": no retry (city.say is not idempotent, a ReadTimeout can
+    come after the Relay took the message) and the turn goes on."""
 
     recipient = to.agent_id if isinstance(to, Peer) else to
-    text = _plain(text)
+    text = protocol.plain(text)
     try:
         msg_id = await city.say(to, text)
     except CapError as exc:
@@ -1080,34 +818,8 @@ async def _say(city: City, to: Peer | str, text: str) -> str:
     return msg_id
 
 
-# The act words understood() (and the judge) reads: city_sdk.city._ACTS, private, so copied.
-ACT_WORDS = frozenset({
-    "need.request", "offer", "confirm", "cancel", "prescription", "consent", "data.request",
-    "data.response", "checkin", "report", "booking.receipt", "escalate.emergency", "hold",
-    "case.closed",
-})
-
-
-def _plain(text: str) -> str:
-    """As shared/mach/protocol.py ``plain`` (the gp has no mach/ yet): the judge reads the LAST act
-    word, commas as spaces (understood, e19-rules.md:212). Every act word other than the
-    message's first gets a capital letter; ``key=value`` tokens and other bytes stay."""
-
-    acts = [token for token in text.replace(",", " ").split() if token in ACT_WORDS]
-    if len(set(acts)) < 2:
-        return text
-    own = acts[0]
-
-    def capital(token: re.Match[str]) -> str:
-        if "=" in token[0]:
-            return token[0]
-        return re.sub(r"[^,]+", lambda p: p[0].capitalize() if p[0] in ACT_WORDS and p[0] != own else p[0], token[0])
-
-    return re.sub(r"\S+", capital, text)
-
-
 def _sent(history: list[Message], agent_id: str, recipient: str, text: str) -> bool:
-    text = _plain(text)
+    text = protocol.plain(text)
     return any(
         row.sender == agent_id and row.recipient == recipient and row.text == text
         for row in history

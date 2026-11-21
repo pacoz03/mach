@@ -17,7 +17,7 @@ LOG=$(mktemp -d "${TMPDIR:-/tmp}/check.XXXXXX")
 PY=~/.local/share/uv/tools/city-cli/bin/python
 AGENTS="booking_centre gp hospital specialist_care family_counseling"   # come shared/sync.sh
 FACILITIES="hospital specialist_care family_counseling"
-MACH="booking_centre hospital specialist_care family_counseling"   # come shared/sync.sh
+MACH="booking_centre gp hospital specialist_care family_counseling"   # come shared/sync.sh
 
 # run <nome> <comando...>: in background, output in $LOG/<nome>.log, exit code in $LOG/<nome>.rc
 run() { local name=$1; shift; ( "$@" >"$LOG/$name.log" 2>&1; echo $? >"$LOG/$name.rc" ) & }
