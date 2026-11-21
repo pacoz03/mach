@@ -554,13 +554,25 @@ _RECALLED = False
 
 async def _recall_clock() -> None:
     """Cold start: the clock anchor another of our pods noted, unless a Ledger reply came first.
-    One _city_now cannot read (missing field, paused) leaves us cold, as before."""
+    One _city_now cannot read (missing field, paused) leaves us cold, as before. Also the world
+    answers our facilities noted (city:world, _keep_world): a deploy no longer starts with an
+    empty _WORLD (7-10 min without offers); a fresher read of our own wins (setdefault)."""
 
-    anchor = tools.fact(await tools.context(), "city:clock", "anchor")
+    ctx = await tools.context()
+    anchor = tools.fact(ctx, "city:clock", "anchor")
     if not _CLOCK and isinstance(anchor, dict):
         _CLOCK.update({key: str(anchor.get(key, "")) for key in _ANCHOR})
         if _city_now() is None:
             _CLOCK.clear()
+    for predicate, fact in (ctx.get("facts", {}).get("city:world") or {}).items():
+        procedure, _, key = predicate.partition(":")
+        value = fact.get("value") if isinstance(fact, dict) else None
+        if not key or not isinstance(value, dict) or not isinstance(value.get("text"), str):
+            continue
+        age = time.time() - value["at"] if isinstance(value.get("at"), (int, float)) else _WORLD_FRESH
+        if 0 <= age < _WORLD_FRESH:
+            _WORLD.setdefault((procedure, int(key) if key.isdigit() else key),
+                              (time.monotonic() - age, value["text"]))
 
 
 def _city_now() -> datetime | None:
@@ -2174,6 +2186,16 @@ def _keep_world(procedure: str, rows: list[Message], asks: set[int | str] = froz
         world = _latest_slots([row])
         if world is not None and (key := _world_key(world, asks)) is not None:
             _WORLD[(procedure, key)] = (time.monotonic(), world)
+            # Team memory (utente, 21/11 15:00): the Relay delivers every message ~14 min late, a
+            # memory read is immediate. The booking centre offers from city:world without its own
+            # Ledger round trip; a restarted pod starts warm (_recall_clock). Dated by the Ledger's
+            # sent_at, so a reply read again from the chat is "unchanged", never younger.
+            sent = protocol.when(row.sent_at or "")
+            at = sent.timestamp() if sent else time.time()
+            life = int(_WORLD_FRESH - (time.time() - at))
+            if life > 0:
+                tools.note("city:world", f"{procedure}:{key}",
+                           {"text": world, "at": at, "sent_at": row.sent_at or ""}, ttl_seconds=life)
 
 
 def _day_reads(
