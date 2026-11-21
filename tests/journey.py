@@ -1955,14 +1955,15 @@ def offered_on_turn(cid: str, seconds: float):
 
 
 def red_flag_after_prefs(text: str):
-    """Dopo il passaggio del gp il cittadino risponde alle preferenze del centro e subito dopo gli
-    scrive ``text`` (una red flag), mentre la lettura di world del centro è ancora in viaggio."""
+    """Dopo il passaggio del gp (la ricetta al cittadino) il cittadino scrive al centro ``text`` (una
+    red flag), mentre la lettura di world del centro è ancora in viaggio. Il centro non chiede più
+    le preferenze prima dell'offerta: prima la red flag partiva dopo quella domanda."""
     def setup(b: Bus) -> None:
         react, said = b.citizen.react, []
 
         def wrapped(m: Message) -> None:
             react(m)
-            if not said and m.sender == b.ids["booking_centre"] and act(m) == "data.request":
+            if not said and m.sender == b.ids["gp"] and act(m) == "prescription":
                 said.append(m.msg_id)
                 b.citizen.say(b.ids["booking_centre"], text)
         b.citizen.react = wrapped
@@ -2313,6 +2314,81 @@ SCENARIOS.update({
     # (c) Numero che il Ledger non conosce (refused prescription code=NOT_FOUND).
     "gp_rinnovo_inesistente": dict(start=("gp", "need.request prescription_number=RX-NONE"), expect=[
         no_write("prescribe", "AGENT.md 9"), told_text("gp", "non risulta a suo nome", cite="AGENT.md 9")]),
+})
+
+# --- Centro prenotazioni: percorso più corto (città 21/11 04:00: `prescription` risponde in 5-7
+# minuti, `world` in ~5 per pagina, una pagina dopo l'altra).
+
+
+def slow_rx_read(seconds: float):
+    """La risposta del Ledger a `prescription` arriva dopo ``seconds`` s (le altre letture no)."""
+    def setup(b: Bus) -> None:
+        late = b.ledger.late
+        b.ledger.late = lambda text: seconds if text.split()[:1] == ["prescription"] else late(text)
+    return setup
+
+
+def offered_after_handoff(seconds: float):
+    """La prima offerta del centro al cittadino parte entro ``seconds`` s dal passaggio del gp."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        hand = next((m for m in b.log if m.sender == b.ids["gp"] and m.recipient == bc
+                     and "handoff=gp" in m.text.split()), None)
+        offer = next((m for m in b.log if m.sender == bc and m.recipient == CIT and act(m) == "offer"), None)
+        if hand is None or offer is None:
+            return "nessun passaggio del gp al centro o nessuna offerta al cittadino"
+        took = b.stamp[offer.msg_id] - b.stamp[hand.msg_id]
+        if took >= seconds:
+            return (f"prima offerta {took:.1f} s dopo il passaggio del gp (attesa entro {seconds} s: "
+                    "procedura e priorità sono nel passaggio, la verifica di prescription va in parallelo)")
+    return check
+
+
+def offer_first(b: Bus) -> str | None:
+    """Dal passaggio del gp, il primo messaggio del centro al cittadino è l'offerta (fino a 3 slot
+    con offer_id= e slot_id=, giorni diversi), senza un data.request di preferenze prima."""
+    bc = b.ids["booking_centre"]
+    first = next((m for m in b.log if m.sender == bc and m.recipient == CIT), None)
+    if first is None or act(first) != "offer":
+        return f"primo messaggio del centro al cittadino: «{first.text[:60] if first else ''}», attesa l'offerta"
+    offers = parse_offers(first.text)
+    if not offers or any(not o.get("offer_id") or not o.get("slot_id") for o in offers):
+        return "offerta senza offer_id= o slot_id="
+    # B: S sono due giorni (lun, mar), quindi tre offerte toccano due giorni e due medici.
+    days = {o.get("agenda_day") or o.get("day") for o in offers}
+    doctors = {o.get("doctor_id") for o in offers}
+    if len(offers) > 1 and (len(days) < 2 or len(doctors) < 2):
+        return f"offerte poco diverse (giorni {sorted(map(str, days))}, medici {sorted(map(str, doctors))})"
+
+
+def pages_together(b: Bus) -> str | None:
+    """Le pagine di world oltre la prima partono insieme: la richiesta di page=3 precede la risposta
+    a page=2. Formato sdk: gli slot presi non sono elencati, basta la pagina 1 (niente da misurare)."""
+    bc = b.ids["booking_centre"]
+    ask3 = next((i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == LEDGER
+                 and m.text.startswith("world ") and "page=3" in m.text.split()), None)
+    if ask3 is None:
+        return None if REPLY["slots"] == SDK_REPLY["slots"] else "il centro non ha mai chiesto world page=3"
+    ans2 = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == bc
+                 and fields(m.text.split("\n", 1)[0]).get("page", "").startswith("2/")), None)
+    if ans2 is not None and ans2 < ask3:
+        return "world page=3 chiesta solo dopo la risposta a page=2: pagine una dopo l'altra"
+
+
+SCENARIOS.update({
+    # 0. Passaggio del gp con procedure= e priority=: preferenze e world partono subito, la risposta a
+    # prescription (qui 3 s) arriva dopo e non ferma la prima offerta.
+    "booking_passaggio_subito": dict(start=BACK, handoff=True, setup=slow_rx_read(3.0),
+                                     expect=[offered_after_handoff(2.0), wrote("checkin", "R:234")]),
+    # 0b. Nessun giro di domande sulle preferenze prima della prima offerta (dal vivo 4-6 minuti).
+    "booking_offerta_senza_domande": dict(start=BACK, handoff=True, expect=[offer_first, wrote("checkin", "R:234")]),
+    # 1. Le prime due pagine sono piene (free=0): le pagine 2..4 partono nello stesso turno. Solo con
+    # --ledger-turns: world in ritardo riapre il caso solo con la sua risposta come turno.
+    "booking_pagine_insieme": dict(start=BACK, handoff=True, full_days=9, slow_world=1.0, ledger_turns=True,
+                                   expect=[pages_together, wrote("checkin", "R:234")]),
+    # 3. La say di `rules` del centro va oltre 10 s (httpx.ReadTimeout): il turno non muore, l'offerta parte.
+    "booking_relay_timeout": dict(start=BACK, handoff=True, say_timeout_on="rules",
+                                  expect=[wrote("checkin", "R:234")]),
 })
 
 

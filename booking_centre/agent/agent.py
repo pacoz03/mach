@@ -112,9 +112,8 @@ _PHRASES: dict[str, dict[str, str]] = {
             "stesso numero. Appena mi manda il numero nuovo, prenotiamo insieme."
         ),
         "offers": (
-            "Quale preferisce? Mi basta il numero dell'opzione e procedo io. Se nessuna va bene, mi "
-            "dica giorni o orari più comodi, o se preferisce un medico donna o uomo, e cerco subito "
-            "altro."
+            "Quale preferisce? Mi basta il numero dell'opzione e procedo io. Se nessuno le va bene, "
+            "mi dica giorni e preferenze sul medico (donna o uomo, lingua) e cerco altre date."
         ),
         "offers_again": (
             "Capisco, tolgo quell'opzione. Quale di queste preferisce? Se il problema era il "
@@ -122,7 +121,6 @@ _PHRASES: dict[str, dict[str, str]] = {
         ),
         "found": "Ho trovato questi posti per lei:",
         "listen": "Capisco la sua preoccupazione, me ne occupo subito.",
-        "verified": "Ho verificato la sua ricetta: {what}.",
         "booked": "Riepilogo: {what}.",
         "more": "Posso aiutarla in altro?",
         "bring": (
@@ -179,10 +177,6 @@ _PHRASES: dict[str, dict[str, str]] = {
         "cancelled": "Mi dispiace, la struttura ha annullato questo posto: cerco subito un'alternativa per lei.",
         "expired": "Mi dispiace, la struttura segnala che la ricetta è scaduta.",
         "receipt": "La prenotazione è confermata: conservi questa ricevuta per il check-in in struttura.",
-        "prefs": (
-            "Per proporle i posti più comodi: ha giorni preferiti (lunedì-venerdì) o preferisce un "
-            "medico donna o uomo? Se non ha preferenze, me lo dica pure e procedo."
-        ),
         "hello": (
             "Buongiorno, sono il centro prenotazioni: il suo medico di base mi ha inoltrato la "
             "ricetta, così posso cercarle subito un posto."
@@ -211,8 +205,8 @@ _PHRASES: dict[str, dict[str, str]] = {
         ),
         "offers": (
             "Which one do you prefer? The option number is enough and I will take care of it. If "
-            "none works, tell me the days or times that suit you, or whether you prefer a female or "
-            "male doctor, and I will look again."
+            "none suits you, tell me your days and doctor preferences (female or male, language) "
+            "and I will look for other dates."
         ),
         "offers_again": (
             "Understood, I am dropping that option. Which of these do you prefer? If the problem "
@@ -220,7 +214,6 @@ _PHRASES: dict[str, dict[str, str]] = {
         ),
         "found": "I found these slots for you:",
         "listen": "I understand your concern, I am taking care of it right away.",
-        "verified": "I have checked your prescription: {what}.",
         "booked": "Summary: {what}.",
         "more": "Can I help you with anything else?",
         "bring": (
@@ -274,10 +267,6 @@ _PHRASES: dict[str, dict[str, str]] = {
         "cancelled": "I am sorry, the facility withdrew this slot: I am looking for an alternative for you.",
         "expired": "I am sorry, the facility reports that the prescription has expired.",
         "receipt": "Your booking is confirmed: please keep this receipt for check-in at the facility.",
-        "prefs": (
-            "To offer you the most convenient slots: do you prefer particular days (Monday-Friday) "
-            "or a female or male doctor? If you have no preference, just tell me and I will proceed."
-        ),
         "hello": (
             "Good morning, this is the booking centre: your GP forwarded me your prescription, so I "
             "can look for a slot for you right away."
@@ -631,11 +620,16 @@ async def _advance_alone(
             return
         # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
         refresh = refresh or bool(sent.mark) or _ledger(chat, "agenda") is not None
-    if known is None and _prescription(_after(chat, since), number) is None:
+    # Our GP's handoff names procedure and priority of the prescription it just wrote: the search
+    # starts at once and the Ledger's check runs beside it (21/11: 5-7 minutes for that answer).
+    # The Ledger's answer prevails when it comes (expired, used: the renewal below). P1 in force,
+    # or the citizen writing the number themselves (maybe days later): only the Ledger's answer.
+    handed = None if since or (rules is not None and "P1" in rules) else _handed(chat, number)
+    if known is None and handed is None and _prescription(_after(chat, since), number) is None:
         chat = await _until(
             city, need_id, chat, lambda rows: _prescription(_after(rows, since), number) is not None
         )
-    reply = known or _prescription(_after(chat, since), number)
+    reply = known or _prescription(_after(chat, since), number) or handed
     if reply is None:
         # Not answered yet (21/11: 4-7 minutes): its answer opens a turn. Never "not found" for an
         # answer still on its way; only a real one (no procedure, or refused) says so, below.
@@ -661,12 +655,10 @@ async def _advance_alone(
             sent.offers.add(offer_id)
         return
 
+    # No round of questions before the first offer (21/11: 4-6 minutes per journey): up to three
+    # slots as different as can be (_spread: days, then doctors), with the preferences already
+    # known; the offer's closing asks for days and doctor if none fits (R:95, R:253).
     days, gender = _days(chat), _gender(chat)
-    if not replacing and not sent.offers and not _offered(chat, agent):
-        missing = [name for name, value in (("days", days), ("gender", gender)) if not value]
-        checked = _phrases(chat)["verified"].format(what=_visit(chat, procedure, priority))
-        if missing and not await _preferences_ready(city, chat, citizen, missing, checked):
-            return
 
     def page_of(rows: list[Message], page: int) -> str | None:
         """The page from _PAGES while fresh (the latest answer any case saw), else the case's own."""
@@ -713,7 +705,8 @@ async def _advance_alone(
     if replacing:
         taken = _withdrawn(chat, agent) | sent.again
     else:
-        taken = _offered(chat, agent) | sent.offers
+        # Offers we cancelled are not held (an expired prescription renewed: the new number books).
+        taken = (_offered(chat, agent) | sent.offers) - _withdrawn(chat, agent)
         # A Ledger turn does not add offers to the ones the citizen already holds.
         if taken and not again:
             return
@@ -775,10 +768,16 @@ async def _advance_alone(
             break
         next_page = page + 1
         if page_of(recent, next_page) is None:
-            if not _asked(recent, agent, procedure, next_page) and not await _say(
-                city, LEDGER, f"world procedure={procedure} page={next_page}"
-            ):
-                return
+            # Every missing page in one go, never one after the other (21/11: ~5 minutes a Ledger
+            # round, up to _MAX_PAGE rounds in a row). The answers land in history as they come.
+            for later in range(next_page, min(pages, _MAX_PAGE) + 1):
+                if (
+                    page_of(recent, later) is None
+                    and not _asked(recent, agent, procedure, later)
+                    and not await _say(city, LEDGER, f"world procedure={procedure} page={later}")
+                    and later == next_page
+                ):
+                    return
             if quick and replacing:
                 # One look, no wait: offer what fits so far, else say we are on it. The Ledger's
                 # answer opens a turn of its own, which resumes the search (pending).
@@ -970,6 +969,15 @@ async def _on_confirm(
         # Not one of our live offers: nothing goes to a facility on the citizen's word.
         ask = f"data.request purpose=booking fields=offer_id {_phrase(chat, 'which')}"
         await _tell(city, chat, citizen, ask, again=True)
+        return
+    number = offer.get("prescription_number") or _number(chat)
+    rx = _prescription(chat, number) if number else None
+    if rx is not None and rx.get("state") not in (None, "issued"):
+        # P1: the Ledger's latest answer says the prescription expired after our offer (the offer
+        # now leaves before any question): the offer goes, the GP renews it. Never a doomed commit.
+        for live in _live_offers(chat, agent, citizen):
+            await _say(city, citizen, f"cancel offer_id={live['offer_id']} reason=prescription_expired")
+        await _renewal(city, chat, citizen, again=False)
         return
     consent = fields.get("consent_ref", "")
     if not consent:
@@ -1430,7 +1438,7 @@ async def _ask_partners(
             try:
                 await city.say(partner, text)
                 reached += 1
-            except CapError:
+            except Exception:  # noqa: BLE001 - CapError or an httpx timeout: the next partner still gets it
                 _DOWN[partner] = time.monotonic()  # never the same message again
         if not reached:
             return chat, False
@@ -1581,16 +1589,6 @@ def _when_words(at: str, lang: str) -> str:
     day, month = _DAY_WORDS[lang][when.weekday()], _MONTH_WORDS[lang][when.month - 1]
     joint = "at" if lang == "en" else "alle"
     return f"{day} {when.day} {month} {joint} {when:%H:%M}"
-
-
-def _visit(chat: list[Message], procedure: str, priority: str | None) -> str:
-    """What the Ledger says the prescription is for, in the citizen's language."""
-
-    lang = _talk(chat)
-    name = _PROCEDURES.get(procedure, {}).get(lang, procedure)
-    if not priority:
-        return name
-    return f"{name}, priority {priority}" if lang == "en" else f"{name}, priorità {priority}"
 
 
 def _refused(chat: list[Message], agent: str) -> tuple[set[str], set[str]]:
@@ -1926,6 +1924,21 @@ def _when(value: str) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+_GP = "agent:ck9w60ejwnvw"
+
+
+def _handed(chat: list[Message], number: str) -> dict[str, str] | None:
+    """Procedure and priority from our GP's handoff of ``number`` (it wrote it on the Ledger just
+    before), as an issued prescription; None without one."""
+
+    for row in reversed(chat):
+        if row.sender == _GP and _from_gp(row):
+            fields = _fields(row)
+            if fields.get("prescription_number") == number and fields.get("procedure") and fields.get("priority"):
+                return {"procedure": fields["procedure"], "priority": fields["priority"], "state": "issued"}
+    return None
+
+
 def _from_gp(row: Message) -> bool:
     """The GP's handoff: ``need.request handoff=gp citizen=... prescription_number=...``."""
 
@@ -1969,8 +1982,9 @@ async def _say(city: City, to: str, text: str) -> str:
 
     try:
         msg_id = await city.say(to, text) or "sent"
-    except CapError as exc:
-        tools.said(to, text, "", error=getattr(exc, "code", "cap_error"))
+    except Exception as exc:  # noqa: BLE001 - CapError, and the Relay's httpx timeouts (ReadTimeout):
+        # out of the brain the turn goes back retryable, the Relay delivers it again and we send twice.
+        tools.said(to, text, "", error=getattr(exc, "code", None) or type(exc).__name__)
         return ""
     tools.said(to, text, msg_id)
     if to.startswith("citizen:") and city.inbound is not None:
@@ -2319,26 +2333,6 @@ def _number(chat: list[Message]) -> str | None:
 
 
 _WEEKDAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri"}
-
-
-async def _preferences_ready(
-    city: City, chat: list[Message], citizen: str, missing: list[str], checked: str = ""
-) -> bool:
-    for index, row in enumerate(chat):
-        if row.sender != city.agent_id or row.recipient != citizen or first_word(row.text) != "data.request":
-            continue
-        fields = fields_of(row.text)
-        if fields.get("purpose") == "booking" and fields.get("fields") in {"days", "gender"}:
-            # A plain-language refusal also ends the preference request.
-            return any(reply.sender == citizen for reply in chat[index + 1:])
-    # Work first, then the question: what we verified, and what would help us choose.
-    opening = _phrase(chat, "prefs")
-    if checked:
-        question = _phrases(chat)["prefs"]
-        opening = opening.replace(question, f"{checked} {question}")
-    text = f"data.request purpose=booking fields={','.join(missing)} {opening}"
-    await _say(city, citizen, text)
-    return False
 
 
 def _lang(chat: list[Message]) -> str:

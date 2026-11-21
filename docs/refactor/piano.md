@@ -1,0 +1,76 @@
+# Piano di refactoring: fondamenta allineate al kit
+
+> Scritto il 2026-11-21 alle 05:00 (sessione orchestratore). Gli agenti in città restano operativi durante tutto il lavoro.
+> Lo stato vive in `HANDOFF.md`; qui c'è solo il piano.
+
+## Perché
+
+Il codice è cresciuto a forza di correzioni sui percorsi veri. Funziona, ma è fragile e poco leggibile.
+
+| Cosa | Oggi |
+|---|---|
+| Dimensioni | booking 2.798 righe, `shared/facility.py` 3.785, gp 1.049, `shared/tools.py` 499 |
+| Helper duplicati | 13, copiati dal brain di esempio del kit e poi divergenti tra booking e strutture: `first_word`, `fields_of`, `words`, `_say`, `_until`, `_when`, `_ledger`, `_we`, `_exact`, `_citizen`, `_page`, `_offer_line`, `_asked` |
+| Stato in memoria a livello di modulo | booking: `_CLOCK`, `_OFFERED`, `_PAGES`, `_GONE`, `_DOWN`, `_GATES`, `_SENT`<br>strutture: `_WORLD`, `_OFFERED`, `_HELD`, `_BOUNCED`, `_CLOCK`, `_NOTED`, `_GATES`, `_SENT`, `_TASKS`<br>gp: `CASE_LOCKS` |
+| Dati del mondo scritti nel codice | `_DOCTORS` e `_DEADLINE_DAYS` sono duplicati in booking e strutture, mentre il registry sta sul Ledger (AGENT.md, regola 5) |
+| Orologio di agenda | due implementazioni diverse |
+
+**I guasti di stanotte vengono quasi tutti da qui:**
+- l'orologio perso al riavvio del pod (ospedale 1.0.9: `no_availability` 22 su 22);
+- la risposta del Ledger ignorata perché arrivata «prima» del messaggio del cittadino nella history (booking 1.0.14, «non trovo una ricetta»);
+- attese dentro i lock;
+- cache diverse da un pod all'altro.
+
+## Principi: come lo prevede il kit
+
+1. **La history è la verità.** Lo stato di un caso si ricava da `city.history(need_id=…)` con funzioni senza stato, come nel brain di esempio (`templates/examples/agent.py`: `_booking_of`, `_our_commit`, `_offered`). La memoria del processo è solo una cache dichiarata: ha una scadenza, un limite di dimensione e un modo per ricostruirla.
+2. **Un solo modo di leggere i messaggi:** `understood()` dell'SDK (`city_sdk/city.py:139`), lo stesso che usano Ledger, cittadino e giudice. Si aggiunge la regola della prima parola d'atto (`tests/journey.py:113`), perché `understood` prende l'ultima.
+3. **Un solo modo di parlare:** un `say` che gestisce tutti gli errori della città. Su `TARGET_NOT_VISIBLE` e sui 4xx non si ritenta. I timeout di rete non devono mai uscire dal brain: se escono, l'harness riconsegna il messaggio e manda tutto due volte (`harness.py:455-480`).
+4. **Smistamento per atto:** una tabella (chi scrive, parola d'atto) → funzione, con il riferimento alla regola del kit (`e19-rules.md` R:180-200 e `docs/kit/<ruolo>.md`). `agent.py` resta corto: controllo clinico, `start_turn`, smistamento.
+5. **I tipi e le costanti dell'SDK:** `Message`, `Need` (`is_emergency`), `role_for`, `ROLES`, `LEDGER`, `agenda_time`, `clinical`, `OutOfScope`. Niente copie nostre.
+6. **Il turno non aspetta il Ledger.** Le letture lente vanno in background e la risposta del Ledger apre un turno suo. L'ACK parte a fine turno (`boot.py:265`, `harness.py:505`).
+
+## Vincoli che non cambiano
+
+- `city deploy` impacchetta solo `<agente>/agent/`. I moduli comuni stanno in `shared/` e li copia `shared/sync.sh`, come oggi `tools.py` e `facility.py`. Solo stdlib più `city_sdk`: il Dockerfile non installa pacchetti.
+- Conformità:
+  - la sonda (`agent:t05/osp-x`, `service=lab`) non riceve risposta;
+  - `/health` p99 sotto 0,3 s, quindi niente lavoro CPU lungo nel turno;
+  - firma e ack li gestisce l'harness.
+- Il comportamento visto da fuori non cambia: stesse parole d'atto, stessi token, stesse frasi, salvo correzioni dichiarate.
+- Il gp fa quasi tutti i punti: si tocca per ultimo.
+- giuseppesica può pushare sul booking. Prima di ogni step: `git fetch` e merge.
+
+## Metodo
+
+- **Su master a piccoli passi, niente branch lungo.** Un branch che resta aperto per ore andrebbe in conflitto con i fix dal vivo. Ogni step è un commit che non cambia il comportamento: ha i test verdi prima e dopo e si deploya da solo.
+- **Ordine dei deploy per ogni step:** consultorio → specialista → ospedale → booking → gp. Si deploya l'agente successivo solo dopo 10 minuti senza errori in `episodes` sul precedente.
+- **Ritorno indietro:** `city rollback agent:<id> --to <versione>` e `git revert` del commit. Mai `city retire`.
+- **Controllo unico** (step 0): un solo comando che lancia tutto in parallelo.
+- **I subagent lavorano in worktree**, uno per file. Per `tests/journey.py`: `git merge-file` con la base, perché i blocchi aggiunti in coda vanno in conflitto e vanno tenuti entrambi.
+
+## Gli step
+
+| Step | Cosa | File | Fatto quando |
+|---|---|---|---|
+| **0. Rete di sicurezza** | `tests/check.sh`: le 4 modalità di `journey.py`, le 3 suite pytest, `card validate` dei 5 agenti, `cmp` delle copie, tutto in parallelo. Fixture vere da `episodes` (risposte del Ledger `world`, `prescription`, `held`, `refused`, `agenda`, `rules`) in `tests/fixtures/`, senza dati personali. Nella procedura di deploy si aggiunge `city conform --url` dopo il `promoted`. | `tests/check.sh`, `tests/fixtures/*.txt`, `HANDOFF.md` | `check.sh` verde su master; i conteggi di oggi (~97/101 PASS) fissati come baseline |
+| **1. Protocollo comune** | `shared/protocol.py`:<br>• `act(msg)` = prima parola d'atto, altrimenti `understood().type`<br>• `fields(msg)`<br>• i costruttori dei messaggi (`offer_line`, `data_request`, `cancel`, …)<br>• `say(city, to, text) -> msg_id \| ""`, con la gestione degli errori sopra e la registrazione in `tools.said`<br>• `ledger_answer(chat, ask)`: abbina la risposta alla domanda con `sent_at` e non con l'ordine della history, che è la causa del bug delle 02:25 | `shared/protocol.py`, `shared/sync.sh`, `tests/unit/test_protocol.py` | unit test sulle fixture; booking e strutture importano `protocol` e cancellano i 13 helper duplicati; `check.sh` verde |
+| **2. Stato del caso** | `shared/case.py`: funzioni sulla history:<br>• ricetta (numero, procedura, priorità, stato, rinnovi)<br>• offerte fatte e ritirate<br>• hold e commit<br>• consensi<br>• preferenze e lingua del cittadino<br>• il passaggio dal gp<br>• l'ultima risposta del Ledger per atto<br>Stessi nomi del brain di esempio. | `shared/case.py`, `tests/unit/test_case.py` | booking e strutture leggono lo stato del caso solo da `case`; `check.sh` verde |
+| **3. Orologio e mondo** | `shared/clock.py`: un solo orologio di agenda (`epoch_real`, `epoch_agenda`, `rate`, salto del weekend, margine) con l'àncora in `city:clock` su Supabase.<br>`shared/world.py`: le pagine di `world` come cache dichiarata (procedura e pagina, 4 minuti, ricostruibile dalla history) e il registry dei medici letto dal Ledger (`world`) invece di `_DOCTORS` scritto nel codice, che resta solo come ripiego | `shared/clock.py`, `shared/world.py`, unit test | una sola definizione di orologio e di medici; un pod nuovo ha l'orologio al primo turno |
+| **4. Smistamento per atto** | Ogni ruolo ha una tabella `HANDLERS[(chi_scrive, atto)]` e funzioni corte con il riferimento R:. `shared/facility.py` diventa:<br>• `facility_common.py`: ricevuta, check-in, cross-ASST, sonda<br>• i rami `hospital`, `specialist` e `family` | `booking_centre/agent/agent.py`, `shared/facility*.py`, `gp/agent/agent.py` (per ultimo) | nessuna funzione sopra le ~80 righe nel percorso caldo; `check.sh` verde |
+| **5. Igiene dello stato e dei lock** | Ogni variabile a livello di modulo diventa una di tre cose:<br>• (a) ricavata dalla history<br>• (b) cache dichiarata con scadenza e limite di dimensione<br>• (c) fatto su Supabase<br>Il lock del caso protegge solo le scritture e non si aspetta mai il Ledger dentro un lock (è la direzione del fix 1.0.16 di giuseppesica). | tutti | elenco delle variabili in testa a ogni file con la categoria; uno scenario di «riavvio del pod a metà caso» in `journey.py` |
+| **6. Misure** | Il gp scrive su `episodes` (oggi no, quindi i suoi tempi non si vedono). `episodes` salva anche il `sent_at` delle risposte del Ledger, per separare il ritardo del Ledger da quello del Relay. | `gp/agent/agent.py`, `shared/tools.py`, `shared/schema.sql` | query in `HANDOFF.md` per il tempo del turno e i ritardi per agente |
+| **7. Pulizia** | Codice morto (per esempio il ramo `purpose=alternative` in `_family`), frasi duplicate, test che non testano più quello per cui sono nati (`booking_ricetta_riscritta`). | tutti | grep a zero per i simboli rimossi; `check.sh` verde |
+
+## Rischi
+
+- **Una regressione in città mentre i punti contano.** Si mitiga con step piccoli, un agente alla volta, il gp per ultimo e il rollback pronto.
+- **Conformità rotta da un modulo nuovo** (import a livello di pacchetto, sonda). `city deploy` si ferma alla conformità e resta in città la versione precedente. Si guarda lo stage nell'output.
+- **Comportamento che i test non coprono.** Si mitiga con le fixture vere dello step 0 e con il confronto in `episodes` prima e dopo, per atto e per agente.
+- **Il tempo della gara.** Ogni step vale da solo: ci si può fermare dopo qualunque step con un sistema migliore di prima.
+
+## Fuori dal piano
+
+- Agent framework, cioè gli adapter ADK, LangChain e MCP del kit: nominano solo i verbi e nel pod non ci sono i pacchetti.
+- `remember`/`recall` del Ledger come memoria: oggi risponde in 5 minuti, quindi si resta su Supabase.
+- Riscrivere da zero: si sposta e si consolida, non si reinventa.
