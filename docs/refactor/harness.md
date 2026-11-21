@@ -18,6 +18,15 @@
 | Dove gira | pod della città: immagine `city-sdk`, Dockerfile del kit intoccabile, **solo stdlib + `city_sdk`** |
 | Modello | `city.llm` = alias fisso `city-default` (Gemma), **solo testo, senza tool calling nativo**, nessun retry. Dal laptop il Gateway compatibile OpenAI ammette anche `city-glm` e `city-qwen` (`e19-rules.md:508, 557`). Budget uguale per tutte le squadre |
 
+## Decisioni prese (06:15, approvate dall'utente)
+
+- **Harness nostro con API in stile Strands.** Un decoratore `@tool` su funzioni con argomenti pydantic, `Agent(tools=[...], memory=...)`, hook prima e dopo ogni tool per i guardrail. Sotto c'è il tool calling col JSON nel testo. La forma permette di passare a Strands se un giorno il Gateway passerà `tools`.
+- **Verificato sul Gateway (4 alias):** il campo `tools` viene scartato e la risposta è solo `{model, content, token}`. Il tool calling col JSON nel testo invece regge: 4/4 per gemma, glm e qwen e 3/4 per `city-default` su 4 casi, latenze da 0,4 a 15,7 s. `city-default` si comporta diversamente da `city-gemma`: da verificare.
+- **Nel pod ci sono anche pydantic e httpx** (dipendenze di `city-sdk`, `pyproject.toml`). I tool possono essere tipizzati con pydantic.
+- **Memoria breve:** la history del caso. **Memoria lunga:** Supabase (`facts`, `lessons`), letta in background.
+- **Niente A2A:** in città si parla solo con `city.say`, il vocabolario è `mhm/1.0` e la scoperta degli agenti passa da `city.find`.
+- **L'LLM guida solo i turni del cittadino.** Si parte dal booking. Tetto di circa 200k token per giro di eval: la squadra ha usato 216k token in tutto, per $0,15.
+
 ## 2. Framework
 
 **Scelta: un harness nostro, piccolo e con la forma di un framework**, in `shared/mach/harness.py`: registro dei tool tipizzati, ciclo con budget, validazione, ripiego, traccia. Gli altri hanno perso per vincoli, non per gusto:
@@ -124,4 +133,4 @@ Il debole è dove una metrica dice WEAK. Ogni caso che fallisce diventa una riga
 - **(b)** tetto di budget per un giro di eval E3 sui 3 modelli;
 - **(c)** partire dal booking (proposta).
 
-**Gate:** in attesa dell'approvazione. Fino ad allora si continua solo con i lavori già avviati (`case`, pulizia, banco di guasti), che servono comunque: sono i tool e i guardrail che l'LLM userà.
+**Gate:** approvato alle 06:15. In corso: H0 (misura) e H1 (nucleo dell'harness) in parallelo, insieme al modulo del calendario.
