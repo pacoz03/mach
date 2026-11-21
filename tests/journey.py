@@ -343,7 +343,9 @@ class Agent:
         self.id = re.search(r"^agent_id:\s*(\S+)", card, re.M).group(1)
         self.role = (re.search(r"^role:\s*(\w+)", card, re.M) or [None, ""])[1]
         self.caps = tuple(re.findall(r"^\s+-\s+([\w.]+)\s*$", card.split("capabilities:", 1)[-1].split("\n\n")[0], re.M))
-        self.sibs = {p.stem for p in self.dir.glob("*.py")} - {"agent"}
+        # Moduli fratelli e pacchetto mach/ (mach, mach.protocol): ognuno con le sue copie e il suo tools.
+        self.sibs = {".".join(p.relative_to(self.dir).with_suffix("").parts).removesuffix(".__init__")
+                     for p in self.dir.rglob("*.py")} - {"agent"}
         self.mods: dict[str, object] = {}
         self.main, self.error = None, ""
         try:

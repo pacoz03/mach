@@ -113,7 +113,7 @@ def brain(monkeypatch):
 
     for key in ("CITY_ENV", "TEAM_MEMORY"):
         monkeypatch.delenv(key, raising=False)
-    for name in ("facility", "tools", "_secrets"):
+    for name in [n for n in sys.modules if n in ("facility", "tools", "_secrets", "mach") or n.startswith("mach.")]:
         sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location("specialist_agent", AGENT_DIR / "agent.py")
     module = importlib.util.module_from_spec(spec)

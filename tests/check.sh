@@ -10,6 +10,7 @@ LOG=$(mktemp -d "${TMPDIR:-/tmp}/check.XXXXXX")
 PY=~/.local/share/uv/tools/city-cli/bin/python
 AGENTS="booking_centre gp hospital specialist_care family_counseling"   # come shared/sync.sh
 FACILITIES="hospital specialist_care family_counseling"
+MACH="booking_centre hospital specialist_care family_counseling"   # come shared/sync.sh
 
 # run <nome> <comando...>: in background, output in $LOG/<nome>.log, exit code in $LOG/<nome>.rc
 run() { local name=$1; shift; ( "$@" >"$LOG/$name.log" 2>&1; echo $? >"$LOG/$name.rc" ) & }
@@ -18,11 +19,12 @@ run journey-plain     "$PY" -B tests/journey.py ${K[@]+"${K[@]}"}
 run journey-turns     "$PY" -B tests/journey.py --ledger-turns ${K[@]+"${K[@]}"}
 run journey-sdk       "$PY" -B tests/journey.py --ledger-format sdk ${K[@]+"${K[@]}"}
 run journey-turns-sdk "$PY" -B tests/journey.py --ledger-turns --ledger-format sdk ${K[@]+"${K[@]}"}
-# Tre invocazioni: conftest.py separati e moduli omonimi (test_level5.py).
+# Invocazioni separate: conftest.py separati e moduli omonimi (test_level5.py).
 PYTEST=(uv run --no-project --with city-sdk==0.9.202 --with pytest python -m pytest -q -p no:cacheprovider)
 run pytest-specialist        "${PYTEST[@]}" tests/specialist
 run pytest-consultorio       "${PYTEST[@]}" tests/consultorio
 run pytest-family_counseling "${PYTEST[@]}" family_counseling/tests
+run pytest-unit              "${PYTEST[@]}" tests/unit
 for a in $AGENTS; do run "card-$a" city card validate "$a"; done
 wait
 
@@ -47,6 +49,10 @@ done
 files=0 diff=()
 for a in $AGENTS; do files=$((files+1)); cmp -s shared/tools.py "$a/agent/tools.py" || diff+=("$a/agent/tools.py"); done
 for a in $FACILITIES; do files=$((files+1)); cmp -s shared/facility.py "$a/agent/facility.py" || diff+=("$a/agent/facility.py"); done
+for a in $MACH; do
+  for f in shared/mach/*.py; do files=$((files+1)); cmp -s "$f" "$a/agent/mach/${f##*/}" || diff+=("$a/agent/mach/${f##*/}"); done
+  diff -rq -x __pycache__ shared/mach "$a/agent/mach" >/dev/null 2>&1 || diff+=("$a/agent/mach/")  # un modulo in più
+done
 if [ ${#diff[@]} = 0 ]; then echo "cmp OK ($files files)"; else echo "cmp DIFF: ${diff[*]}"; fails+=(cmp); fi
 
 echo "time ${SECONDS}s  logs $LOG"

@@ -28,6 +28,8 @@ from pathlib import Path
 
 import tools
 from city_sdk.city import LEDGER, CapError, City, Message, Need
+from mach import protocol
+from mach.protocol import fields_of, first_word, words
 
 _MAX_PAGE = 8
 # Four agenda hours is about half a minute of real time at 480x, so a slot is still
@@ -334,27 +336,6 @@ async def handle(role: str, need: Need, city: City) -> None:
 # --- shared ------------------------------------------------------------------------------------
 
 
-def words(text: str) -> set[str]:
-    return {token.strip(".,;:!?()\"'").lower() for token in text.split() if token.strip()}
-
-
-def first_word(text: str) -> str:
-    parts = text.split()
-    return parts[0].strip(".,;:!?()\"'").lower() if parts else ""
-
-
-def fields_of(text: str) -> dict[str, str]:
-    found: dict[str, str] = {}
-    for token in text.replace(",", " ").split():
-        key, eq, value = token.partition("=")
-        if not eq or not key or not value:
-            continue
-        value = value.strip(".,;:!?")
-        if key not in found and value:
-            found[key] = value
-    return found
-
-
 _IT_DAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri", "sab": "sat", "dom": "sun"}
 
 
@@ -380,42 +361,6 @@ def _fields(row: Message) -> dict[str, str]:
     return fields
 
 
-def _when(value: str) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed
-
-
-def _citizen(chat: list[Message]) -> str | None:
-    for row in chat:
-        if row.sender.startswith("citizen:"):
-            return row.sender
-    for row in chat:
-        fields = fields_of(row.text)
-        for key in ("patient", "citizen"):
-            party = fields.get(key, "")
-            if party.startswith("citizen:"):
-                return party
-    return None
-
-
-def _we(chat: list[Message], agent: str, token: str, *, to: str, word: str) -> bool:
-    for row in chat:
-        if row.sender != agent or row.recipient != to:
-            continue
-        if token in row.text.split() and word in words(row.text):
-            return True
-    return False
-
-
-def _exact(chat: list[Message], agent: str, text: str) -> bool:
-    return any(row.sender == agent and row.text.strip() == text for row in chat)
-
-
 # True only inside a hospital turn (handle): the booking lifecycle fixes gated on it (one commit,
 # re-hold, duplicate confirm, Ledger cancel, no resend after TARGET_NOT_VISIBLE) leave the
 # specialist and the consultorio as they were. ponytail: a ContextVar, not a flag threaded
@@ -423,10 +368,9 @@ def _exact(chat: list[Message], agent: str, text: str) -> bool:
 _HOSPITAL: ContextVar[bool] = ContextVar("hospital", default=False)
 # Hospital: (need_id, to, text) -> time.monotonic() of a TARGET_NOT_VISIBLE. The held or committed
 # push turns of the same case must not send the same message again within seconds (R:701). Keyed
-# by case and forgotten after _BOUNCE_TTL: a set kept forever blocked agenda, world and checkin
+# by case and forgotten after protocol._BOUNCE_TTL: a set kept forever blocked agenda, world and checkin
 # for the life of the process after a down window (every partner then got no_availability).
 _BOUNCED: dict[tuple[str, str, str], float] = {}
-_BOUNCE_TTL = 60.0
 # Hospital: the confirm turn stops waiting for held and committed this many seconds after the turn
 # began, then ends. The harness acks a push only when the turn ends and the fast reply (+1, R:246)
 # is scored on that ack (< 10 s); live writes take ~30 s each (21/11 00:36: hold -> held 30 s,
@@ -438,37 +382,11 @@ _BOOK_BY: ContextVar[float | None] = ContextVar("book_by", default=None)
 
 
 async def _say(city: City, to: str, text: str) -> bool:
-    key = (getattr(city.inbound, "need_id", None) or "", to, text)
-    # Only a citizen can stay invisible (another ASST's): the Ledger and agents bounce only while
-    # the hospital is down, and messages to us bounce then too, so a later turn means it is back.
-    citizen = to.startswith("citizen:")
-    if _HOSPITAL.get() and citizen and time.monotonic() - _BOUNCED.get(key, float("-inf")) < _BOUNCE_TTL:
-        return False
-    try:
-        try:
-            msg_id = await city.say(to, text)
-        except CapError:
-            raise
-        except Exception:  # noqa: BLE001 - hospital: one retry on a timeout (only a 4xx is final)
-            if not _HOSPITAL.get():
-                raise
-            msg_id = await city.say(to, text)
-    except CapError as exc:
-        if _HOSPITAL.get() and citizen and exc.code == "TARGET_NOT_VISIBLE":
-            now = time.monotonic()
-            for old in [k for k, at in _BOUNCED.items() if now - at >= _BOUNCE_TTL]:
-                del _BOUNCED[old]
-            _BOUNCED[key] = now
-        tools.said(to, text, error=exc.code)
-        return False
-    except Exception as exc:  # noqa: BLE001 - hospital: a Relay timeout must not end the turn
-        if not _HOSPITAL.get():
-            raise
-        _LOG.info("care.say.failed", extra={"error": type(exc).__name__})
-        tools.said(to, text, error=type(exc).__name__)
-        return False
-    tools.said(to, text, msg_id)
-    return True
+    """protocol.say, never raising. Hospital: one retry on a network error, and no resend to a
+    citizen it could not see (_BOUNCED)."""
+
+    hospital = _HOSPITAL.get()
+    return bool(await protocol.say(city, to, text, retry=hospital, bounced=_BOUNCED if hospital else None))
 
 
 def _latest(chat: list[Message], head: str, token: str) -> Message | None:
@@ -487,20 +405,9 @@ async def _until(
     tries: int = _PULL_TRIES,
     deadline: float | None = None,
 ) -> list[Message]:
-    """Re-read the case until ``ready`` or the short wait ends: ``tries`` reads, or until
-    ``deadline`` (time.monotonic()) when given. The push may never arrive."""
+    """protocol.until with this module's _PULL_PAUSE."""
 
-    fresh = chat
-    attempt = 0
-    while True:
-        try:
-            fresh = await city.history(need_id=need_id)
-        except CapError:
-            fresh = chat
-        attempt += 1
-        if ready(fresh) or (attempt >= tries if deadline is None else time.monotonic() >= deadline):
-            return fresh
-        await asyncio.sleep(_PULL_PAUSE)
+    return await protocol.until(city, need_id, chat, ready, tries, deadline, pause=_PULL_PAUSE)
 
 
 async def _await_line(
@@ -543,7 +450,7 @@ async def _await_line(
 
 def _has_agenda(chat: list[Message]) -> bool:
     agenda = _ledger(chat, "agenda")
-    return _when("" if agenda is None else agenda.get("agenda_now", "")) is not None
+    return protocol.when("" if agenda is None else agenda.get("agenda_now", "")) is not None
 
 
 def _has_procedure(chat: list[Message]) -> bool:
@@ -583,7 +490,7 @@ def fitting(
         slot = _slot(line)
         slot_id = slot.get("slot_id")
         doctor = slot.get("doctor_id")
-        at = _when(slot.get("at", ""))
+        at = protocol.when(slot.get("at", ""))
         if not slot_id or not doctor or at is None:
             continue
         if procedure and slot.get("procedure") not in (None, procedure):
@@ -614,13 +521,11 @@ def fitting(
 
 
 def _ledger(chat: list[Message], head: str) -> dict[str, str] | None:
-    found: dict[str, str] | None = None
-    for row in chat:
-        if row.sender == LEDGER and first_word(row.text) == head:
-            found = fields_of(row.text)
+    """protocol.ledger; an ``agenda`` answer also moves the city clock (_CLOCK, city:clock)."""
+
+    found = protocol.ledger(chat, head)
     if found is not None and head == "agenda":
-        found.setdefault("agenda_now", found.get("agenda_date", ""))
-        new, old = _when(found["agenda_now"]), _when(_CLOCK.get("agenda_now", ""))
+        new, old = protocol.when(found["agenda_now"]), protocol.when(_CLOCK.get("agenda_now", ""))
         if new is not None and (old is None or new >= old):
             _CLOCK.clear()
             _CLOCK.update(found)
@@ -663,7 +568,7 @@ def _city_now() -> datetime | None:
     """Agenda now from _CLOCK, without asking: ``epoch_agenda`` + (real now - ``epoch_real``) x
     ``rate``, on weekdays only (no agenda weekends, R:85). None if paused or a field is missing."""
 
-    real, base = _when(_CLOCK.get("epoch_real", "")), _when(_CLOCK.get("epoch_agenda", ""))
+    real, base = protocol.when(_CLOCK.get("epoch_real", "")), protocol.when(_CLOCK.get("epoch_agenda", ""))
     try:
         rate = float(_CLOCK.get("rate", ""))
     except ValueError:
@@ -683,7 +588,7 @@ def _day_after(world: str) -> datetime | None:
     day = fields_of(world).get("from") or min(
         (_slot(line).get("at", "") for line in world.splitlines() if "slot_id=" in line), default=""
     )
-    start = _when(f"{day[:10]}T00:00:00+00:00")
+    start = protocol.when(f"{day[:10]}T00:00:00+00:00")
     return None if start is None else start + timedelta(days=1)
 
 
@@ -699,23 +604,6 @@ def _latest_slots(chat: list[Message]) -> str | None:
         )):
             found = row.text
     return found
-
-
-def _page(text: str) -> tuple[int, int]:
-    raw = fields_of(text.splitlines()[0] if text else "").get("page", "")
-    left, _, right = raw.partition("/")
-    if left.isdigit() and right.isdigit():
-        return int(left), int(right)
-    return 1, 1
-
-
-def _asked(chat: list[Message], agent: str, procedure: str, page: int) -> bool:
-    token = f"page={page}"
-    proc = f"procedure={procedure}"
-    for row in chat:
-        if row.sender == agent and token in row.text.split() and proc in row.text.split():
-            return True
-    return False
 
 
 def _our_offers(chat: list[Message], agent: str) -> list[dict[str, str]]:
@@ -789,7 +677,7 @@ def _slot_when(chat: list[Message], agent: str, slot_id: str) -> str:
 
     offers = _our_offers(chat, agent) if slot_id else []
     offer = next((o for o in offers if o.get("slot_id") == slot_id), {})
-    at = _when(offer.get("agenda_date", ""))
+    at = protocol.when(offer.get("agenda_date", ""))
     return "" if at is None else _in_words(at, _en(chat))
 
 
@@ -828,25 +716,6 @@ def _gender(chat: list[Message]) -> str | None:
         if raw in {"m", "f"}:
             return raw
     return None
-
-
-def _offer_line(slot: dict[str, str], number: str | None, priority: str | None) -> str:
-    parts = [
-        "offer",
-        f"offer_id=of-{slot['slot_id']}",
-        f"slot_id={slot['slot_id']}",
-        f"doctor_id={slot['doctor_id']}",
-        f"facility={slot['facility']}",
-        f"procedure={slot['procedure']}",
-        f"agenda_date={slot['at']}",
-        f"agenda_day={slot['day']}",
-        f"expiry={slot['at']}",
-    ]
-    if priority:
-        parts.append(f"priority={priority}")
-    if number:
-        parts.append(f"prescription_number={number}")
-    return " ".join(parts)
 
 
 def _our_offer(chat: list[Message], agent: str, offer_id: str) -> dict[str, str]:
@@ -964,7 +833,7 @@ async def _advance_alone(
     replacing: bool,
 ) -> None:
     agent = city.agent_id
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if citizen is None:
         return
     reply = None if fixed == "CONS-GIN" else _ledger(chat, "prescription")
@@ -972,7 +841,7 @@ async def _advance_alone(
     procedure = fixed or (None if reply is None else reply.get("procedure"))
     number = None if fixed == "CONS-GIN" else _number(chat)
     agenda = _ledger(chat, "agenda")
-    now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+    now = protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
     world = _latest_slots(chat)
     # Ask, then read the reply from history: the push of a ledger message does not open a turn.
     for _pass in range(3):
@@ -984,7 +853,7 @@ async def _advance_alone(
             sent = _sent(key)
             if offer_id in sent.offers:
                 return
-            if not _we(chat, agent, token, to=citizen, word="offer"):
+            if not protocol.we(chat, agent, token, to=citizen, word="offer"):
                 note = (
                     "I can put you on the waiting list for this visit: let me know if that "
                     "works for you."
@@ -1006,7 +875,7 @@ async def _advance_alone(
                 for row in chat
             ):
                 await _say(city, LEDGER, f"prescription prescription_number={number}")
-            if not _exact(chat, agent, "agenda"):
+            if not protocol.exact(chat, agent, "agenda"):
                 await _say(city, LEDGER, "agenda")
             chat = await _until(
                 city,
@@ -1021,15 +890,15 @@ async def _advance_alone(
         if fixed is None and state not in (None, "issued"):
             return
         agenda = _ledger(chat, "agenda")
-        now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+        now = protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
         world = _latest_slots(chat)
         if now is not None and world is not None:
             break
         if _pass == 2:
             return
-        if now is None and not _exact(chat, agent, "agenda"):
+        if now is None and not protocol.exact(chat, agent, "agenda"):
             await _say(city, LEDGER, "agenda")
-        if world is None and not _asked(chat, agent, procedure, 1):
+        if world is None and not protocol.asked(chat, agent, procedure, 1):
             await _say(city, LEDGER, f"world procedure={procedure} page=1")
         chat = await _until(
             city,
@@ -1083,13 +952,13 @@ async def _advance_alone(
                                     if slot.get("day") in _FAMILY_DAYS and slot["day"] not in days)
         if chosen:
             # Every offer in one message: the citizen chooses from that message only (R:95).
-            lines = [_offer_line(slot, number, priority) for slot in chosen]
+            lines = [protocol.offer_line(slot, number, priority) for slot in chosen]
             pick = _PICK_EN if en else _PICK
             if fixed == "CONS-GIN":
                 options = [
                     f"{index}. {_family_date(at, en)}"
                     for index, slot in enumerate(chosen, 1)
-                    if (at := _when(slot["at"])) is not None
+                    if (at := protocol.when(slot["at"])) is not None
                 ]
                 pick = " ".join([*options, pick])
             if await _say(city, citizen, "\n".join([*lines, pick])):
@@ -1100,24 +969,24 @@ async def _advance_alone(
             return
         if taken and not replacing:
             return
-        page, pages = _page(world)
+        page, pages = protocol.page(world)
         if page >= pages or page >= _MAX_PAGE:
             break
-        if not _asked(chat, agent, procedure, page + 1):
+        if not protocol.asked(chat, agent, procedure, page + 1):
             await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
         # The next page's reply may never open a turn: read it back here.
         chat = await _until(
             city,
             message.need_id,
             chat,
-            lambda rows, seen=page: _page(_latest_slots(rows) or "")[0] > seen,
+            lambda rows, seen=page: protocol.page(_latest_slots(rows) or "")[0] > seen,
         )
         world = _latest_slots(chat) or ""
-        if _page(world)[0] <= page:
+        if protocol.page(world)[0] <= page:
             return
     # No fitting slot on any page: say so, never silence (R:248). Once per case, unless the
     # citizen writes again.
-    if message.sender.startswith("citizen:") or not _we(
+    if message.sender.startswith("citizen:") or not protocol.we(
         chat, agent, "reason=no_slots", to=citizen, word="cancel"
     ):
         if fixed == "CONS-GIN" and alternative_days:
@@ -1140,7 +1009,7 @@ async def _advance_alone(
             # purpose it accepts (R:124, R:188).
             spec = _DOCTORS[family_alternative["doctor_id"].rsplit("-", 1)[-1]]
             langs = "/".join(sorted(spec[0]))
-            at = _when(family_alternative["at"])
+            at = protocol.when(family_alternative["at"])
             when = _family_date(at, en) if at else family_alternative.get("day", "")
             note = (f"No appointment meets all your preferences. The closest free one is {when}, with a "
                     f"{'female' if spec[1] == 'f' else 'male'} doctor (languages: {langs}). I have not "
@@ -1149,7 +1018,7 @@ async def _advance_alone(
                     f"vicino è {when}, con {'una dottoressa' if spec[1] == 'f' else 'un medico uomo'} "
                     f"(lingue: {langs}). Non ho prenotato nulla: se le va bene, mi risponda con il "
                     "riferimento del consenso e lo prenoto.")
-            if await _say(city, citizen, f"{_offer_line(family_alternative, None, priority)}\n{note}"):
+            if await _say(city, citizen, f"{protocol.offer_line(family_alternative, None, priority)}\n{note}"):
                 sent.offers.add(family_alternative["slot_id"])
         else:
             await _say(city, citizen, _NO_SLOTS_EN if en else _NO_SLOTS)
@@ -1220,7 +1089,7 @@ async def _confirm_alone(
             since = _since_hold(chat, agent, slot)
             held = since is not None and not any(_drops_hold(row) for row in since)
         else:
-            held = slot in sent.holds or _we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
+            held = slot in sent.holds or protocol.we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
         if not held:
             parts = ["hold", f"slot_id={slot}"]
             if citizen:
@@ -1241,7 +1110,7 @@ async def _confirm_alone(
         return
     if not facility or not citizen:
         return
-    if _we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
+    if protocol.we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
         return
     parts = [
         "confirm",
@@ -1260,11 +1129,11 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     fields = fields_of(message.text)
     booking_id = fields.get("booking_id", "")
     ledger_ref = fields.get("ledger_ref", "")
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if not booking_id or not ledger_ref or not citizen:
         return
     token = f"booking_id={booking_id}"
-    if _we(chat, city.agent_id, token, to=citizen, word="booking.receipt"):
+    if protocol.we(chat, city.agent_id, token, to=citizen, word="booking.receipt"):
         return
     note = _receipt_note(chat, city.agent_id, fields.get("slot_id", ""), booking_id)
     await _say(
@@ -1277,11 +1146,11 @@ async def _partner_cancel(
 ) -> None:
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if (
         offer_id
         and citizen
-        and not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel")
+        and not protocol.we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel")
     ):
         note = (
             "I'm sorry, the facility has called off this appointment. I am looking for other "
@@ -1419,7 +1288,7 @@ def _family_pick(plain: str, offers: list[dict[str, str]]) -> str:
     if hour := re.search(r"\b(?:alle|ore|at)\s+(\d{1,2})(?::(\d{2}))?\b", plain):
         matches &= {
             i for i, offer in enumerate(offers)
-            if (at := _when(offer.get("agenda_date", ""))) is not None
+            if (at := protocol.when(offer.get("agenda_date", ""))) is not None
             and at.hour == int(hour[1]) and (hour[2] is None or at.minute == int(hour[2]))
         }
         criteria = True
@@ -1766,7 +1635,7 @@ async def _redirect(
             f"Grazie per il messaggio. {tools.redirect()} Se ha già un appuntamento qui, al suo "
             "arrivo faccia il check-in con il codice di prenotazione e penso io al resto."
         )
-    if not _exact(chat, city.agent_id, text):
+    if not protocol.exact(chat, city.agent_id, text):
         await _say(city, message.sender, text)
 
 
@@ -1989,11 +1858,11 @@ async def _cross_asst(
             def clock(rows: list[Message]) -> datetime | None:
                 agenda = _ledger(fresh(rows), "agenda")  # a fresh reply also refreshes _CLOCK
                 cached = _city_now() if use_cache else None
-                return cached or _when("" if agenda is None else agenda.get("agenda_now", ""))
+                return cached or protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
 
             def page_of(rows: list[Message], page: int) -> str | None:
                 world = _latest_slots(fresh(rows))
-                return world if world is not None and _page(world)[0] >= page else None
+                return world if world is not None and protocol.page(world)[0] >= page else None
 
             def warm(page: int) -> str | None:
                 # Hospital, specialist: a fresh cached page and a known city clock answer at once.
@@ -2055,14 +1924,14 @@ async def _cross_asst(
                              and fields.get("lang", "it") in spec[0]
                              and (not fields.get("gender_preference") or fields["gender_preference"] == spec[1])
                              and (not wanted_days or slot.get("day") in wanted_days)]
-                    if not found and page < min(_page(world)[1], _MAX_PAGE) and time.monotonic() < deadline:
+                    if not found and page < min(protocol.page(world)[1], _MAX_PAGE) and time.monotonic() < deadline:
                         page += 1
                         continue
                 if not rich:
                     break
                 # ponytail: read as priority P, so a U request's relaxed slots skip the U reserve.
                 every = fitting(lines, now=now, priority="P", lang="it", procedure=procedure)
-                if every or page >= min(_page(world)[1], 2) or time.monotonic() >= deadline:
+                if every or page >= min(protocol.page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
             if hospital:
@@ -2095,7 +1964,7 @@ async def _cross_asst(
                 # the most of them first; time order within a tie. Only Ledger attributes go out.
                 chosen = _by_constraints(pool, fields)[:3]
         if chosen:
-            lines = [f"{_offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
+            lines = [f"{protocol.offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
             beyond = (
                 f"Entro i tempi della priorità {priority or 'richiesta'} non abbiamo posti liberi: "
                 "queste sono le prime date libere subito dopo. "
@@ -2197,7 +2066,7 @@ def _keep_world(procedure: str, rows: list[Message]) -> None:
     for row in rows:
         world = _latest_slots([row])
         if world is not None:
-            _WORLD[(procedure, _page(world)[0])] = (time.monotonic(), world)
+            _WORLD[(procedure, protocol.page(world)[0])] = (time.monotonic(), world)
 
 
 def _spread(slots: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -2272,7 +2141,7 @@ async def _agenda_now(
         city, message.need_id, chat, lambda rows: fresh(rows) is not None, tries=_SHORT_TRIES
     )
     reply = fresh(rows)
-    return (None if reply is None else _when(reply["agenda_now"])), rows
+    return (None if reply is None else protocol.when(reply["agenda_now"])), rows
 
 
 def _timing(at: datetime, now: datetime | None, en: bool, *, inside: bool = True) -> str:
@@ -2496,7 +2365,7 @@ def _released(chat: list[Message], agent: str, row: Message) -> bool:
 
     fields = fields_of(row.text)
     ref = fields.get("hold_id") or fields.get("booking_id", "")
-    return bool(ref) and _we(chat, agent, f"hold_id={ref}", to=LEDGER, word="cancel")
+    return bool(ref) and protocol.we(chat, agent, f"hold_id={ref}", to=LEDGER, word="cancel")
 
 
 async def _release(city: City, message: Message, chat: list[Message]) -> None:
@@ -2518,7 +2387,7 @@ async def _release(city: City, message: Message, chat: list[Message]) -> None:
     hold_id = fields_of(held.text).get("hold_id", "") if held else ""
     token = f"hold_id={hold_id}"
     ids = " ".join(f"{k}={v}" for k, v in (("offer_id", offer_id), ("slot_id", slot)) if v)
-    asked = bool(hold_id) and _we(chat, agent, token, to=LEDGER, word="cancel")
+    asked = bool(hold_id) and protocol.we(chat, agent, token, to=LEDGER, word="cancel")
     since = _since_hold(chat, agent, slot) if slot else None
     if not asked and (not hold_id or since is None or any(_drops_hold(row) for row in since)):
         if not _answered(chat, agent, message.msg_id, sender):
@@ -2670,7 +2539,7 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
     state = _checkin_state(chat, agent, token)
     if state == "done":
         line = _latest(chat, "checked_in", token)
-        if line is not None and not _we(chat, agent, token, to=citizen, word="checkin"):
+        if line is not None and not protocol.we(chat, agent, token, to=citizen, word="checkin"):
             await _on_checked_in(city, line, chat, reports=False, en=en)
         elif not _answered(chat, agent, message.msg_id, citizen):
             await _say(
@@ -2733,14 +2602,14 @@ async def _refused_alone(
         for row in chat:
             if not booking_id and row.sender == agent and first_word(row.text) == "checkin":
                 booking_id = fields_of(row.text).get("booking_id", "")
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if not booking_id or not citizen or _answered(chat, agent, message.msg_id, citizen):
         return
     code = fields.get("code") or "refused"
     slot = _bookings(chat, agent).get(booking_id, {}).get("slot") or _hold_slot(
         chat, agent, booking_id
     )
-    at = _when(_slot_facts(chat, agent, slot).get("at", ""))
+    at = protocol.when(_slot_facts(chat, agent, slot).get("at", ""))
     if _WINDOW_CODE.search(code):
         timing = ""
         if at:
@@ -2818,7 +2687,7 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
         return
     (booking_id, entry), = ours.items()
     en = _english(chat, message.text)
-    at = _when(_slot_facts(chat, agent, entry["slot"]).get("at", ""))
+    at = protocol.when(_slot_facts(chat, agent, entry["slot"]).get("at", ""))
     timing = ""
     if at:
         now, chat = await _agenda_now(city, message, chat)
@@ -2877,7 +2746,7 @@ async def _welcome(
         agent = city.agent_id
         for booking_id, entry in _bookings(chat, agent).items():
             token = f"booking_id={booking_id}"
-            citizen = _holder(chat, agent, entry["slot"]) or _citizen(chat) or ""
+            citizen = _holder(chat, agent, entry["slot"]) or protocol.citizen(chat) or ""
             receipt = any(
                 row.sender == agent
                 and row.recipient != citizen
@@ -2888,7 +2757,7 @@ async def _welcome(
             if (
                 not citizen.startswith("citizen:")
                 or not receipt
-                or _we(chat, agent, token, to=citizen, word="booking.receipt")
+                or protocol.we(chat, agent, token, to=citizen, word="booking.receipt")
             ):
                 continue
             if _latest_slots(chat) is None and any(
@@ -2904,7 +2773,7 @@ async def _welcome(
                     tries=_SHORT_TRIES,
                 )
             facts = _slot_facts(chat, agent, entry["slot"])
-            at = _when(facts.get("at", ""))
+            at = protocol.when(facts.get("at", ""))
             en = _english(chat)
             parts = ["booking.receipt", token]
             if entry["ledger_ref"]:
@@ -2971,7 +2840,7 @@ async def _tell_gp(
     (over-disclosure, R:243). Best effort: only if the Index lists our GP, no retry, never raises."""
 
     sender, _, number = _booking_of(chat, city.agent_id, slot) if slot else ("", "", None)
-    if sender != _OUR_BOOKING or not number or _we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
+    if sender != _OUR_BOOKING or not number or protocol.we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
         return
     try:
         if not any(peer.agent_id == _OUR_GP for peer in await city.find("gp")):
@@ -3053,12 +2922,12 @@ def _latest_hold(chat: list[Message], agent: str) -> tuple[str, str | None]:
 
 
 async def _family_wait(city: City, chat: list[Message]) -> None:
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if citizen:
         en = _family_preferences(chat, citizen).get("lang") == "en"
         text = ("Your booking is still being verified. It is not confirmed yet."
                 if en else "La prenotazione è ancora in verifica. Non è ancora confermata.")
-        if not _exact(chat, city.agent_id, text):
+        if not protocol.exact(chat, city.agent_id, text):
             await _say(city, citizen, text)
 
 
@@ -3164,11 +3033,11 @@ async def _on_committed(
     hold_id = fields.get("hold_id") or (booking_id if direct else "")
     slot = fields.get("slot_id") or _hold_slot(chat, city.agent_id, hold_id)
     sender, _, _ = _booking_of(chat, city.agent_id, slot) if slot else ("", "", None)
-    target = sender or _citizen(chat)
+    target = sender or protocol.citizen(chat)
     if not target:
         return
     token = f"booking_id={booking_id}"
-    if _we(chat, city.agent_id, token, to=target, word="booking.receipt"):
+    if protocol.we(chat, city.agent_id, token, to=target, word="booking.receipt"):
         return
     text = f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}"
     if target.startswith("citizen:"):
@@ -3176,7 +3045,7 @@ async def _on_committed(
             en = _family_preferences(chat, target).get("lang") == "en"
             offer = next((o for o in _our_offers(chat, city.agent_id)
                           if o.get("slot_id") == slot), {})
-            at = _when(offer.get("agenda_date", ""))
+            at = protocol.when(offer.get("agenda_date", ""))
             when = _family_date(at, en) if at else ""
             address = getattr(city, "address", "").strip()
             # Avoid letting punctuation in a civic address change the chat's protocol tokens.
@@ -3236,7 +3105,7 @@ async def _on_refused(
     if (
         target
         and offer_id
-        and not _we(seen, agent, f"offer_id={offer_id}", to=target, word="cancel")
+        and not protocol.we(seen, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
         text = f"cancel offer_id={offer_id} reason={code}"
         if target.startswith("citizen:"):
@@ -3261,14 +3130,14 @@ async def _on_refused(
             target != _OUR_BOOKING
         ):
             await _alternatives(city, chat, target, slot)
-    citizen = (_holder(chat, agent, slot) or _citizen(chat) or "") if hospital else ""
+    citizen = (_holder(chat, agent, slot) or protocol.citizen(chat) or "") if hospital else ""
     if (
         offer_id
         and citizen.startswith("citizen:")
         and citizen != target
         # Only a citizen we already wrote to (the welcome): the booking party tells the rest.
         and any(row.sender == agent and row.recipient == citizen for row in chat)
-        and not _we(seen, agent, f"offer_id={offer_id}", to=citizen, word="cancel")
+        and not protocol.we(seen, agent, f"offer_id={offer_id}", to=citizen, word="cancel")
     ):
         note = (
             "I'm sorry, your booking with us has been cancelled. The booking centre can find "
@@ -3328,7 +3197,7 @@ async def _alternatives(city: City, chat: list[Message], partner: str, slot: str
     if not chosen:
         return
     await _say(city, partner, "\n".join([
-        *(f"{_offer_line(found, None, priority)} request_id={rid}" for found in chosen[:3]),
+        *(f"{protocol.offer_line(found, None, priority)} request_id={rid}" for found in chosen[:3]),
         "Ci dispiace, il posto scelto non è più disponibile. Per la stessa richiesta abbiamo "
         "ancora queste disponibilità del nostro ospedale. Per prenotarne una inviateci il confirm "
         "con offer_id, slot_id, citizen, prescription_number e consent_ref, più "
@@ -3339,12 +3208,12 @@ async def _alternatives(city: City, chat: list[Message], partner: str, slot: str
 
 async def _on_checkin(city: City, message: Message, chat: list[Message], *, reports: bool) -> None:
     booking_id = _fields(message).get("booking_id", "")
-    citizen = message.sender if message.sender.startswith("citizen:") else _citizen(chat)
+    citizen = message.sender if message.sender.startswith("citizen:") else protocol.citizen(chat)
     if not booking_id or not citizen:
         return
     token = f"booking_id={booking_id}"
     asked = False
-    if not _we(chat, city.agent_id, token, to=LEDGER, word="checkin"):
+    if not protocol.we(chat, city.agent_id, token, to=LEDGER, word="checkin"):
         if not await _say(city, LEDGER, f"checkin booking_id={booking_id} citizen={citizen}"):
             return
         asked = True
@@ -3398,12 +3267,12 @@ async def _on_checked_in(
     city: City, message: Message, chat: list[Message], *, reports: bool, en: bool | None = None
 ) -> None:
     booking_id = fields_of(message.text).get("booking_id", "")
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     en = _en(chat) if en is None else en
     if not booking_id:
         return
     token = f"booking_id={booking_id}"
-    if citizen and not _we(chat, city.agent_id, token, to=citizen, word="checkin"):
+    if citizen and not protocol.we(chat, city.agent_id, token, to=citizen, word="checkin"):
         if reports:
             note = _specialist_arrival(chat, city.agent_id, booking_id, citizen, en)
         else:
@@ -3452,7 +3321,7 @@ def _specialist_arrival(
 
     entry = _bookings(chat, agent).get(booking_id, {})
     slot = entry.get("slot") or _hold_slot(chat, agent, booking_id)
-    at = _when(_slot_facts(chat, agent, slot).get("at", "")) if slot else None
+    at = protocol.when(_slot_facts(chat, agent, slot).get("at", "")) if slot else None
     said = " ".join(row.text for row in chat if row.sender == citizen)
     worried = bool(_WORRIED.search(said))
     if en:
@@ -3484,7 +3353,7 @@ def _specialist_arrival(
 def _reported(chat: list[Message], agent: str, booking_id: str) -> bool:
     """We already wrote the report for ``booking_id`` to the Ledger."""
 
-    return _we(chat, agent, f"booking_id={booking_id}", to=LEDGER, word="report")
+    return protocol.we(chat, agent, f"booking_id={booking_id}", to=LEDGER, word="report")
 
 
 async def _after_report(
@@ -3658,7 +3527,7 @@ async def _prescribe_follow_up(
     suffix = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in booking_id.upper())
     number = f"prescription_number-FU-{suffix.strip('-')[:37]}"
     token = f"prescription_number={number}"
-    if not _we(chat, city.agent_id, token, to=LEDGER, word="prescribe"):
+    if not protocol.we(chat, city.agent_id, token, to=LEDGER, word="prescribe"):
         # No priority: the kit gives none for a control visit and we do not invent one.
         text = (
             f"prescribe patient={citizen} procedure={procedure} "
@@ -3688,7 +3557,7 @@ async def _file_report(
     the citizen hears it after ``reported`` (_on_reported). Once per booking."""
 
     token = f"booking_id={booking_id}"
-    if not _we(chat, city.agent_id, token, to=LEDGER, word="report"):
+    if not protocol.we(chat, city.agent_id, token, to=LEDGER, word="report"):
         number = ""
         procedure = _follow_up(chat)
         if procedure and citizen:
@@ -3714,7 +3583,7 @@ async def _file_report(
 async def _on_reported(city: City, message: Message, chat: list[Message]) -> None:
     fields = fields_of(message.text)
     booking_id = fields.get("booking_id", "")
-    citizen = _citizen(chat)
+    citizen = protocol.citizen(chat)
     if not booking_id or not citizen:
         return
     agent = city.agent_id
@@ -3728,7 +3597,7 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
             and token in row.text.split()
         ):
             ours = fields_of(row.text)
-    if not _we(chat, agent, token, to=citizen, word="report"):
+    if not protocol.we(chat, agent, token, to=citizen, word="report"):
         outcome = fields.get("outcome_code") or ours.get("outcome_code") or _OUTCOME
         shared = fields.get("consent_ref") or ours.get("consent_ref")
         if _en(chat):
@@ -3756,7 +3625,7 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
         await _say(city, citizen, f"report {token} outcome_code={outcome} {note}")
     number = ours.get("follow_up_prescription_number", "")
     rx = f"prescription_number={number}"
-    if not number or _we(chat, agent, rx, to=citizen, word="prescription"):
+    if not number or protocol.we(chat, agent, rx, to=citizen, word="prescription"):
         return
     # The control visit's prescription, as we asked it and as the Ledger wrote it.
     known: dict[str, str] = {}
