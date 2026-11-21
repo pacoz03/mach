@@ -381,8 +381,9 @@ class Llm:
         self.bus, self.script = bus, script
 
     async def complete(self, sent, *, need_id=None):
+        system = next((m["content"] for m in sent if m["role"] == "system"), "")
         user = next((m["content"] for m in reversed(sent) if m["role"] == "user"), "")
-        self.bus.llm_calls.append(user)
+        self.bus.llm_calls.append((system, user))
         content = next((v for k, v in self.script.items() if k in user), "{}")
         if content == "timeout":
             await asyncio.sleep(30)
@@ -435,7 +436,8 @@ class Citizen:
                 return
             self.say(b.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={self.rx} lang=it")
         elif kind == "offer" and self.chosen is None:  # sceglie dal PRIMO messaggio di offerte (R:95)
-            offers = parse_offers(m.text)
+            # In città, un'offerta di lista d'attesa chiude il percorso senza prenotazione.
+            offers = [offer for offer in parse_offers(m.text) if offer.get("waiting_list") != "true"]
             if not offers:
                 return
             o = self.chosen = offers[min(self.sc.get("pick", 0), len(offers) - 1)]
@@ -485,7 +487,7 @@ class Bus:
         self.crashes: list[str] = []
         self.turn, self.ledger_turns = 0, ledger_turns
         self.llm = Llm(self, sc["llm"]) if "llm" in sc else None
-        self.llm_calls: list[str] = []
+        self.llm_calls: list[tuple[str, str]] = []
         self.confirmed = False  # il centro dell'altra ASST ha già confermato
         self.stamp: dict[str, float] = {}  # msg_id -> time.monotonic() dell'invio
         self.race, self.tasks = sc.get("race", False), []  # turni concorrenti (push di held)
@@ -674,9 +676,46 @@ def told_text(folder: str, sub: str, cite: str):
 def llm_read(text: str, times: int):
     """Quante volte il modello ha letto ``text``: 0 = le regole bastavano (regole prima, R:LLM)."""
     def check(b: Bus) -> str | None:
-        n = sum(text in call for call in b.llm_calls)
+        n = sum(text in user for _, user in b.llm_calls)
         if n != times:
             return f"city.llm ha letto «{text[:40]}» {n} volte invece di {times}"
+    return check
+
+
+def requested_translation(lang: str):
+    target = re.compile(rf"\b{re.escape(lang)}\b", re.IGNORECASE)
+
+    def check(b: Bus) -> str | None:
+        # Il modello finto non traduce: la prosa che riceve deve essere quella consegnata al cittadino.
+        replies = [m.text for m in b.log if m.sender == b.ids["gp"] and m.recipient == CIT and act(m) == "prescription"]
+        if not any(user and target.search(system) and any(reply.endswith(f" {user}") for reply in replies)
+                   for system, user in b.llm_calls):
+            return f"nessuna traduzione richiesta al modello per la lingua {lang}"
+    return check
+
+
+def gp_prescription(*, after_followup: bool = False):
+    """Il GP comunica una ricetta del Ledger al cittadino, anche quando questo riscrive."""
+    def check(b: Bus) -> str | None:
+        gp = b.ids["gp"]
+        messages = b.log
+        if after_followup:
+            requests = [i for i, m in enumerate(messages) if m.sender == CIT and m.recipient == gp]
+            if len(requests) < 2:
+                return "il cittadino non ha riscritto al gp"
+            messages = messages[requests[-1] + 1:]
+        for m in messages:
+            if m.sender != gp or m.recipient != CIT or act(m) != "prescription":
+                continue
+            f = fields(m.text)
+            rx = b.ledger.rx.get(f.get("prescription_number", ""))
+            if not rx or rx["patient"] != CIT or any(f.get(k) != rx[k] for k in ("procedure", "priority")):
+                continue
+            prose = re.sub(r"\S+=\S+", "", m.text.partition(" ")[2])
+            if any(ch.isalpha() for ch in prose):
+                return None
+        when = " dopo il secondo messaggio del cittadino" if after_followup else ""
+        return f"il gp non ha comunicato la ricetta del Ledger{when} (R:248)"
     return check
 
 
@@ -742,6 +781,40 @@ def handed_over(b: Bus) -> str | None:
     offers = [m for m in b.log if m.sender == bc and m.recipient == CIT and act(m) == "offer"]
     if len(offers) != 1:
         return f"offerte al cittadino in {len(offers)} messaggi invece di uno (R:95)"
+
+
+def emergency_to_citizen(b: Bus) -> str | None:
+    if not any(
+        m.sender == b.ids["gp"] and m.recipient == CIT and act(m) == "escalate.emergency"
+        and fields(m.text).get("reason") == "red_flag" and re.search(r"\b112\b", m.text)
+        for m in b.log
+    ):
+        return "il gp non ha inviato l'escalation di emergenza con il numero 112 (R:242)"
+
+
+def no_slots_followup(b: Bus) -> str | None:
+    gp, bc = b.ids["gp"], b.ids["booking_centre"]
+    number = next(iter(b.ledger.rx), "")
+    notice = ("data.response", "purpose=booking_follow_up", "outcome=no_slots", f"prescription_number={number}")
+    updates = [i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == gp and has(m.text, notice)]
+    followups = [i for i, m in enumerate(b.log) if m.sender == gp and m.recipient == CIT and has(m.text, notice)]
+    if len(updates) != 1 or len(followups) != 1 or updates[0] >= followups[0]:
+        return "dopo la ricerca serve un esito dal centro e un solo seguito del gp per la stessa ricetta"
+
+
+def earliest_relaxed_offer(b: Bus) -> str | None:
+    prescription = next(iter(b.ledger.rx.values()), None)
+    if prescription is None:
+        return "nessuna ricetta per cercare un'alternativa sul Ledger"
+    earliest = min(
+        slot["at"] for slot in b.ledger.slots.values()
+        if slot["procedure"] == prescription["procedure"] and datetime.fromisoformat(slot["at"]) >= b.ledger.full
+    )
+    first = b.citizen.chosen
+    if not first or b.ledger.slots.get(first.get("slot_id", ""), {}).get("at") != earliest:
+        return f"la prima alternativa non è il posto più vicino del Ledger ({earliest})"
+    if any("waiting_list=true" in m.text.split() for m in b.log if m.sender == b.ids["booking_centre"]):
+        return "offerta una lista d'attesa mentre il Ledger contiene un'alternativa"
 
 
 def answered_time(b: Bus) -> str | None:
@@ -920,8 +993,7 @@ SCENARIOS: dict[str, dict] = {
         # answered the report_sharing ask (judge: report_missing 3/3 in wave 1).
         wrote("report", "R:208/236")]),
     "red_flag": dict(start=("gp", "Ho un forte dolore al petto da stamattina."), expect=[
-        told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442"),
-        told_text("gp", "Passata l'urgenza mi riscriva", cite="proattività")]),
+        emergency_to_citizen, no_write("prescribe", "R:442")]),
     "richiesta_clinica": dict(start=("gp", "Che dose di ibuprofene devo prendere? 400 mg vanno bene?"),
                               expect=[refused_silently("gp")]),
     "consultorio_senza_ricetta": dict(start=("family_counseling", "Buongiorno, vorrei una visita ginecologica. lang=it"), expect=[
@@ -939,6 +1011,14 @@ SCENARIOS: dict[str, dict] = {
     "gp_handoff": dict(start=BACK, handoff=True, expect=[
         handed_over, told_text("gp", "mi scriva e gliela rinnovo io", cite="proattività: P1"),
         told_text("gp", "Se ha preferenze sui giorni, sul genere o sulla lingua del medico", cite="proattività"), wrote("commit", "R:241"), told("booking_centre", "booking.receipt", cite="R:241")]),
+    "gp_nessun_posto": dict(start=BACK, handoff=True, full_days=15, after=[GRAZIE], llm={GRAZIE: NONE_IT}, expect=[
+        handoff_tokens("notify_if=no_slots"), writes("prescribe", 1, "una sola ricetta"),
+        told("booking_centre", "offer", "waiting_list=true", cite="lista d'attesa"),
+        no_slots_followup, gp_prescription(after_followup=True),
+        told("gp", "prescription", "booking_status=no_slots", cite="esito del centro"),
+        no_write("commit", "nessuno slot")]),
+    "gp_alternativa_primo_posto": dict(start=BACK, handoff=True, full_days=2, expect=[
+        earliest_relaxed_offer, wrote("commit", "scelta del cittadino")]),
     "checkin_body": dict(start=BACK, checkin="body", expect=[*CHECKED_IN, hospital_to_gp(True)]),
     "checkin_libero": dict(start=BACK, checkin="libero", expect=CHECKED_IN),
     "domanda_orario": dict(start=BACK, checkin="orario", expect=[answered_time, *CHECKED_IN]),
@@ -955,13 +1035,13 @@ SCENARIOS: dict[str, dict] = {
                                     wrote("checkin", "R:234"), llm_read(LOMBARE, 1)]),
     "gp_testo_libero_en": dict(start=("gp", KNEE_EN), llm={KNEE_EN: '<think>knee</think> {"code":"SYM-KNEE","red_flag":false,"lang":"en"}'},
                                expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
-                                       told_text("gp", "I understand your concern", cite="lang en")]),
+                                       gp_prescription(), requested_translation("en")]),
     # Le regole decidono il protocollo (VIS-FIS/B anche se il modello direbbe SYM-KNEE); il modello
     # viene chiamato una volta sola, per la lingua del cittadino (tools.language).
     "gp_regole_prima": dict(start=BACK, llm={BACK[1]: '{"code": "SYM-KNEE"}'}, expect=[
         wrote("prescribe", "R:228", procedure="VIS-FIS", priority="B"), llm_read(BACK[1], 1)]),
     "gp_red_flag_modello": dict(start=("gp", PECHO), llm={PECHO: '{"code": "NONE", "red_flag": true, "lang": "es"}'},
-                                expect=[told("gp", "escalate.emergency", cite="R:242"), no_write("prescribe", "R:442")]),
+                                expect=[emergency_to_citizen, no_write("prescribe", "R:442")]),
     # Codice inventato dal modello o Gateway giù: nessuna ricetta, il gp chiede il motivo (mai muto).
     "gp_modello_inventa": dict(start=("gp", LOMBARE), llm={LOMBARE: '{"code": "SYM-HEAD", "red_flag": "no"}'},
                                expect=[no_write("prescribe", "AGENT.md 9"), told_text("gp", "disturbo", cite="R:248")]),
@@ -971,10 +1051,9 @@ SCENARIOS: dict[str, dict] = {
                                                              told_text("gp", "disturbo", cite="R:248")]),
     # Livello 3, dopo la ricetta: il cittadino riscrive al gp. Mai muto, mai una ricetta di troppo.
     "gp_dopo_grazie": dict(start=BACK, handoff=True, after=[GRAZIE], llm={GRAZIE: NONE_IT}, expect=[
-        writes("prescribe", 1, "una sola ricetta"), told_text("gp", "già pronta", cite="R:248"),
-        told_text("gp", "centro prenotazioni l'ha già ricevuta", cite="handoff")]),
+        writes("prescribe", 1, "una sola ricetta"), gp_prescription(after_followup=True), handed_over]),
     "gp_stesso_sintomo": dict(start=BACK, after=["Il mal di schiena non passa, quando mi chiamano?"], expect=[
-        writes("prescribe", 1, "stesso motivo"), told_text("gp", "già pronta", cite="R:248")]),
+        writes("prescribe", 1, "stesso motivo"), gp_prescription(after_followup=True)]),
     "gp_secondo_sintomo": dict(start=BACK, handoff=True, after=["Ho anche male al ginocchio, serve un'altra ricetta?"],
                                expect=[writes("prescribe", 2, "motivo nuovo"),
                                        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D")]),
@@ -982,13 +1061,12 @@ SCENARIOS: dict[str, dict] = {
         writes("prescribe", 2, "P1 a parole"), asked_ledger("gp", "prescription", "prescription_number=")]),
     "gp_lingua_es": dict(start=("gp", RODILLA), llm={RODILLA: '{"code": "SYM-KNEE", "red_flag": false, "lang": "es"}'},
                          expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
-                                 told_text("gp", "I understand your concern", cite="lingua")]),
+                                 gp_prescription(), requested_translation("es")]),
     "gp_red_flag_en": dict(start=("gp", "I have a crushing chest pain since this morning"), expect=[
-        told_text("gp", "Call 112", cite="R:242"), no_write("prescribe", "R:442")]),
-    # Preferenze dette al gp (console, percorsi 0071/0093/0094): confermate e passate al centro.
+        emergency_to_citizen, no_write("prescribe", "R:442")]),
+    # Preferenze dette al gp (console, percorsi 0071/0093/0094): passate al centro con la ricetta.
     "gp_preferenze": dict(start=("gp", PREF_EN), handoff=True, expect=[
-        handoff_tokens("lang=en", "doctor_lang=en", "days=mon"),
-        told_text("gp", "I have noted your preferences (a doctor who speaks English; Monday)", cite="proattività"),
+        handoff_tokens("lang=en", "doctor_lang=en", "days=mon"), gp_prescription(),
         wrote("commit", "R:241")]),
     # "Gentile Dottoressa" e "da lunedì" non sono preferenze: niente token inventati (AGENT.md 9).
     "gp_preferenze_falsi": dict(start=("gp", "Gentile Dottoressa, ho mal di schiena da lunedì."), handoff=True, expect=[

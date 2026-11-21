@@ -584,19 +584,19 @@ async def _advance_alone(
             sent.mark, sent.before = mark, frozenset(row.msg_id for row in chat)
         await _say(city, LEDGER, "rules")
     recent = _recent(chat, sent)
-    if _latest_slots(recent) is None and not _asked(recent, agent, procedure, 1):
+    if _world_page(recent, 1) is None and not _asked(recent, agent, procedure, 1):
         await _say(city, LEDGER, f"world procedure={procedure} page=1")
 
     def fresh(rows: list[Message]) -> bool:
         rows = _recent(rows, sent)
-        return _has_agenda(rows) and _latest_slots(rows) is not None
+        return _has_agenda(rows) and _world_page(rows, 1) is not None
 
     if not fresh(chat):
         chat = await _until(city, need_id, chat, fresh)
     recent = _recent(chat, sent)
     now = _when((_ledger(recent, "agenda") or {}).get("agenda_now", ""))
     born = _born(recent, chat)
-    world = _latest_slots(recent)
+    world = _world_page(recent, 1)
     if now is None or world is None:
         return
     rules = _rules(chat, now)
@@ -618,8 +618,8 @@ async def _advance_alone(
         # The urgent reserve is closed to B, D and P while P3 is in force, or if unknown.
         "reserve": rules is None or "P3" in rules,
     }
-    blocked = False
     fallback: list[dict[str, str]] = []
+    all_lines: dict[str, str] = {}
     # A language one of our doctors speaks is a hard need (the citizen refuses anyone else,
     # journey 0071): only those doctors, on every page, then past the deadline. A language none
     # of ours speaks cannot be met here, so it does not filter.
@@ -636,15 +636,17 @@ async def _advance_alone(
     ring = False  # the partners were asked in this turn
     while True:
         lines = [line for line in world.splitlines() if "slot_id=" in line]
-        fit = [
+        for line in lines:
+            if slot_id := fields_of(line).get("slot_id"):
+                all_lines[slot_id] = line
+        chosen = [
             slot
             for slot in fitting(lines, **pick)
             if slot.get("slot_id") not in taken
             and slot.get("doctor_id") not in refused_doctors
             and (not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
+            and not _down(slot.get("facility", ""))
         ]
-        chosen = [slot for slot in fit if not _down(slot.get("facility", ""))]
-        blocked = blocked or len(chosen) < len(fit)
         if chosen:
             preferred = [slot for slot in chosen if _preferred(slot, _lang(chat), gender, days)]
             if preferred or not (days or gender):
@@ -668,23 +670,21 @@ async def _advance_alone(
             ring = True
             if await _try_partners(*cross):
                 return
-        if not _asked(recent, agent, procedure, page + 1):
-            if not await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}"):
+        next_page = page + 1
+        if _world_page(recent, next_page) is None:
+            if not _asked(recent, agent, procedure, next_page) and not await _say(
+                city, LEDGER, f"world procedure={procedure} page={next_page}"
+            ):
                 return
-
-        def turned(rows: list[Message], page: int = page) -> bool:
-            return _page(_latest_slots(_recent(rows, sent)) or "")[0] > page
-
-        chat = await _until(city, need_id, chat, turned)
-        if not turned(chat):
-            return  # The Ledger is slow: its answer opens a turn of its own.
-        recent = _recent(chat, sent)
-        world = _latest_slots(recent) or ""
+            chat = await _until(
+                city, need_id, chat, lambda rows: _world_page(_recent(rows, sent), next_page) is not None
+            )
+            recent = _recent(chat, sent)
+        world = _world_page(recent, next_page)
+        if world is None:
+            return  # On the Ledger's next turn, start with the pages already in history.
     if fallback:
         await _offer(city, citizen, fallback, number, priority, sent, replacing, chat, opening)
-        return
-    if blocked:
-        # Only a facility that is down had room: the citizen already has our cancel and reason.
         return
     # S is empty on every page: a partner ASST first (the ring), then a relaxed alternative
     # (past the priority deadline), else the waiting list. Never silence.
@@ -697,14 +697,15 @@ async def _advance_alone(
     )
     relaxed = [] if late else [
         slot
-        for slot in fitting(lines, **pick, relaxed=True)
+        for slot in fitting(list(all_lines.values()), **pick, relaxed=True)
         if slot.get("slot_id") not in taken
         and slot.get("doctor_id") not in refused_doctors
         and (not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
         and not _down(slot.get("facility", ""))
     ]
     if relaxed:
-        picked = relaxed[:_MAX_OFFERS]
+        # The relaxed offer gives the closest real dates, even when they were on earlier pages.
+        picked = sorted(relaxed, key=lambda slot: datetime.fromisoformat(slot["at"]))[:_MAX_OFFERS]
         await _offer(city, citizen, picked, number, priority, sent, replacing, chat, "relaxed")
         return
     offer_id = f"wl-{key}"
@@ -712,6 +713,22 @@ async def _advance_alone(
         return
     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true {_phrase(chat, 'waiting')}"):
         sent.offers.add(offer_id)
+        await _notify_gp_no_slots(city, chat, citizen, number)
+
+
+async def _notify_gp_no_slots(city: City, chat: list[Message], citizen: str, number: str) -> None:
+    for row in reversed(chat):
+        if row.recipient != city.agent_id or not _from_gp(row):
+            continue
+        fields = _fields(row)
+        if fields.get("citizen") == citizen and fields.get("prescription_number") == number:
+            if fields.get("notify_if") == "no_slots":
+                await _say(
+                    city, row.sender,
+                    f"data.response purpose=booking_follow_up outcome=no_slots prescription_number={number} "
+                    "Non ho trovato un posto disponibile e ho proposto la lista d'attesa.",
+                )
+            return
 
 
 async def _accept_handoff(city: City, message: Message, chat: list[Message]) -> None:
@@ -1768,18 +1785,18 @@ def _ledger(chat: list[Message], head: str) -> dict[str, str] | None:
     return found
 
 
-def _latest_slots(chat: list[Message]) -> str | None:
-    """The latest ``world`` answer: ``slots page=N/M`` (kit example) or ``world slots=N``
-    (Ledger schema, city_sdk ports.py), then one ``slot_id=`` row per slot."""
-
-    found: str | None = None
-    for row in chat:
+def _world_page(chat: list[Message], page: int) -> str | None:
+    """The latest answer for a page, in either Ledger world format."""
+    for row in reversed(chat):
         head = first_word(row.text)
-        if row.sender == LEDGER and (head == "slots" or head == "world" and (
-            "slots" in fields_of(row.text.split("\n", 1)[0]) or "slot_id=" in row.text
-        )):
-            found = row.text
-    return found
+        if (
+            row.sender == LEDGER and _page(row.text)[0] == page
+            and (head == "slots" or head == "world" and (
+                "slots" in fields_of(row.text.split("\n", 1)[0]) or "slot_id=" in row.text
+            ))
+        ):
+            return row.text
+    return None
 
 
 def _has_agenda(chat: list[Message]) -> bool:
