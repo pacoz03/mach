@@ -139,13 +139,19 @@ _NO_SLOTS_EN = (
 )
 # Consultorio: the Ledger did not answer within _LEDGER_WAIT. No date, no act word: the citizen's next
 # message asks again (a late reply sends nothing, _advance_alone).
+# Review (R:248): what we already did and exactly what the citizen's next message gets, so the wait
+# does not read as work handed back. No act word in the prose (protocol.plain, understood()).
 _BUSY = (
-    "Mi dispiace, in questo momento non riesco a verificare le disponibilità in agenda, quindi per "
-    "ora non posso prenotare la visita. Mi riscriva più tardi e ricontrollo subito."
+    "Mi dispiace, il registro delle agende sta rispondendo con molto ritardo e non vedo ancora i "
+    "posti liberi, quindi per ora non posso prenotare la visita. Ho già chiesto le date al "
+    "registro e non deve rifare la richiesta: mi riscriva più tardi, tra qualche minuto, anche "
+    "solo con un «ok» in questa chat, e le propongo subito le date libere, senza bisogno di ricetta."
 )
 _BUSY_EN = (
-    "I'm sorry, right now I can't check the agenda for free appointments, so I can't book your "
-    "visit yet. Please write to me again later and I will check straight away."
+    "I'm sorry, the appointment register is answering very slowly and I can't see the free slots "
+    "yet, so I can't book your visit right now. I have already asked the register for the dates and "
+    "you don't need to start over: write to me again in a few minutes, even just \"ok\" in this "
+    "chat, and I will send you the free dates straight away, with no referral needed."
 )
 
 
@@ -2005,11 +2011,17 @@ async def _cross_asst(
                 + " Mi dispiace, in questo momento non riusciamo a consultare la nostra agenda sul registro."
             )
         else:
+            # Review (R:248): no "write again later" (work handed back); the first free slot past
+            # the window in words, the same Ledger value as next_free=.
+            free_at = protocol.when(free_after + "Z") if free_after else None
             text = (
                 "cancel reason=no_availability" + _tail(sender, rid)
                 + (f" next_free={free_after}" if free_after else "")
-                + " Mi dispiace, al momento non abbiamo disponibilità adatte a questa richiesta. "
-                "Riscriveteci pure più avanti: ricontrolliamo subito l'agenda."
+                + " Mi dispiace, abbiamo controllato la nostra agenda: al momento non abbiamo posti "
+                "liberi adatti a questa richiesta"
+                + (f" (il primo libero dopo la vostra finestra è {_in_words(free_at, False)})"
+                   if free_at else "")
+                + ". Ve lo diciamo subito, così il cittadino non resta in attesa di una nostra risposta."
             )
         # Marked even if the say fails: a redelivery is not a retry after a 4xx.
         sent.offers.add(key)
@@ -3170,8 +3182,13 @@ async def _family_wait(city: City, chat: list[Message]) -> None:
     citizen = protocol.citizen(chat)
     if citizen:
         en = _family_preferences(chat, citizen).get("lang") == "en"
-        text = ("Your booking is still being verified. It is not confirmed yet."
-                if en else "La prenotazione è ancora in verifica. Non è ancora confermata.")
+        # Review (R:248): warm, and what happens next (the held/committed push or _on_refused writes).
+        text = ("Your booking is being registered: the register is answering a few minutes late, so "
+                "it is not confirmed yet. For now there is nothing you need to do: as soon as the "
+                "register answers, I will write to you here."
+                if en else "La sua prenotazione è in corso di registrazione: il registro sta "
+                "rispondendo con qualche minuto di ritardo, quindi non è ancora confermata. Per ora "
+                "non deve fare nulla: appena il registro risponde, le scrivo io qui.")
         if not protocol.exact(chat, city.agent_id, text):
             await _say(city, citizen, text)
 
@@ -3379,6 +3396,10 @@ async def _on_refused(
                     if hold_self
                     else " Il centro prenotazioni può trovarle un'altra data."
                 )
+        else:
+            # Review (R:248): a partner's citizen reads this too; never a bare code line.
+            text += (" Ci dispiace: questo posto non si è potuto prenotare (il motivo è in reason), "
+                     "quindi non risulta prenotato per il vostro cittadino.")
         await _say(city, target, text)
         # Proactive: a lost slot (taken, or expired) comes with other free ones. Only to another
         # ASST's booking centre: ours drops a facility's offer lines (its _desk has no branch for
