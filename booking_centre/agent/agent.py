@@ -37,8 +37,23 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tools  # noqa: E402  (shared/tools.py, copied by shared/sync.sh; best effort, never raises)
-from mach import protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
+from mach import case, protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
 from mach.protocol import fields_of, first_word, words  # noqa: E402
+
+# Module state (plan step 5: a = from history, b = declared cache with TTL and size, c = fact).
+# The case itself (prescription, offers, consents, preferences, hand-off) is read from history
+# by mach.case on every turn and kept nowhere. ponytail: the b's without a TTL or a cap are
+# listed as such; step 3 (clock, calendar) and step 5 give them one.
+#   _CLOCK    b  freshest agenda answer of any case; replaced by a newer one, no TTL (c: city:clock)
+#   _RTT      b  latest Ledger round trip, one value
+#   _OFFERED  b  slot -> (citizen, when): 900 s, pruned on each offer, no cap
+#   _PAGES    b  (procedure, page) -> world page: fresh 240 s on read, never evicted (~4x8 keys)
+#   _GONE     b  slots lost or booked: no TTL, no cap
+#   _DOWN     b  facility -> refusal time: 600 s on read, never evicted
+#   _RULES    b  rules of the latest answer of any case, no TTL (c: city:rules)
+#   _GATES       per-need lock, dropped when its last turn ends
+#   _SENT     b  per-need sends history may not show yet (read-your-writes), LRU 4096
+#   _HEARD    b  msg_id -> the model's reading of a citizen message, LRU 4096
 
 _MAX_PAGE = 8
 _MAX_OFFERS = 3
@@ -86,7 +101,6 @@ _DEADLINE_DAYS = {"B": 2, "D": 5}
 _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
 _SENT_NEEDS = 4096
-_GP_RX = re.compile(r"(?<![\w-])prescription_number-([0-9a-f]{24})(?![\w-])", re.IGNORECASE)
 # A facility whose mailbox refused our confirm (TARGET_NOT_VISIBLE, partner_down) is left out
 # of new offers for a while; the city does not say when it is back.
 # ponytail: fixed pause per process, a probe or a city signal if outages get shorter.
@@ -380,11 +394,10 @@ async def main(need: Need, city: City) -> None:
 
 def _phrase(chat: list[Message], key: str) -> str:
     phrases = _PHRASES[_talk(chat)]
-    # A case the GP handed over: our first word to the citizen says who we are and why we write.
     if key == "handoff" or any(row.recipient.startswith("citizen:") for row in chat):
         return phrases[key]
     # Our first word to the citizen. A case the GP handed over: say who we are and why we write.
-    if key != "redirect" and any(_from_gp(row) for row in chat):
+    if key != "redirect" and case.handoff(chat) is not None:
         return f"{phrases['hello']} {phrases[key]}"
     # A citizen who wrote to us worried is heard before anything else.
     if any(row.sender.startswith("citizen:") and _WORRIED.search(_plain(row.text or "")) for row in chat):
@@ -427,7 +440,7 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
         or "offer_id" in picked
         or "consent_ref" in picked
         or heard.get("offer_id")
-        or _consent_offer(chat, city.agent_id, sender)
+        or case.consent_offer(chat, city.agent_id, sender)
     ):
         await _on_confirm(city, message, chat, heard)
         return
@@ -574,7 +587,7 @@ async def _advance_alone(
     # A citizen message we already answered (it crossed ours) is not the citizen asking again.
     again = message.sender.startswith("citizen:") and not _answered(chat, agent, message)
     sent = _sent(key)
-    number = _number(chat)
+    number = case.number(chat)
     if not number:
         if again:
             ask = f"data.request purpose=booking fields=prescription_number {_phrase(chat, 'number')}"
@@ -597,27 +610,20 @@ async def _advance_alone(
             return
     if replacing:
         sent.pending = True  # cleared by the next message the citizen gets from us
-    # Once the citizen names the number, only a Ledger answer after their message counts. The
-    # GP's handoff read it at issue, and a prescription can expire in between (P1).
-    since = next(
-        (
-            row.msg_id
-            for row in reversed(chat)
-            if row.sender.startswith("citizen:") and protocol.fields(row).get("prescription_number") == number
-        ),
-        "",
-    )
+    # Once the citizen names the number, only a Ledger answer sent after their message counts: the
+    # GP's handoff read it at issue, and a prescription can expire in between (P1). By sent_at, not
+    # by place in history (case.prescription): live N-2026-11-02-890924000260, the citizen wrote the
+    # number again while our read was in flight and the Relay listed the issued answer before it.
+    since = case.named(chat, number)
     # With no rule that expires prescriptions (P1 off: 21/11 rules count=0), an issued answer from
-    # earlier in the case counts too. Live N-2026-11-02-890924000260: the citizen wrote the number
-    # again while our re-read was in flight, the Relay sorted it before that read, and the issued
-    # answer was ignored for half an hour. Rules unknown or P1 on: only an answer after them.
+    # earlier in the case counts too. Rules unknown or P1 on: only an answer after the citizen's.
     now = _now(chat)
     rules = None if now is None else _rules(chat, now)
-    known = _prescription(chat, number) if rules is not None and "P1" not in rules else None
+    known = case.prescription(chat, agent, number) if rules is not None and "P1" not in rules else None
     if known is not None and (not known.get("procedure") or known.get("state") not in (None, "issued")):
         known = None
-    asked = protocol.we(_after(chat, since), agent, f"prescription_number={number}", to=LEDGER, word="prescription")
-    if known is None and _prescription(_after(chat, since), number) is None and not asked:
+    fresh = case.prescription(chat, agent, number, since)
+    if known is None and fresh is None and not case.asked(chat, agent, number, since):
         if not await _say(city, LEDGER, f"prescription prescription_number={number}"):
             return
         # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
@@ -626,12 +632,13 @@ async def _advance_alone(
     # starts at once and the Ledger's check runs beside it (21/11: 5-7 minutes for that answer).
     # The Ledger's answer prevails when it comes (expired, used: the renewal below). P1 in force,
     # or the citizen writing the number themselves (maybe days later): only the Ledger's answer.
-    handed = None if since or (rules is not None and "P1" in rules) else _handed(chat, number)
-    if known is None and handed is None and _prescription(_after(chat, since), number) is None:
+    handed = None if since or (rules is not None and "P1" in rules) else case.handed(chat, number, _GP)
+    if known is None and handed is None and fresh is None:
         chat = await _until(
-            city, need_id, chat, lambda rows: _prescription(_after(rows, since), number) is not None
+            city, need_id, chat, lambda rows: case.prescription(rows, agent, number, since) is not None
         )
-    reply = known or _prescription(_after(chat, since), number) or handed
+        fresh = case.prescription(chat, agent, number, since)
+    reply = known or fresh or handed
     if reply is None:
         # Not answered yet (21/11: 4-7 minutes): its answer opens a turn. Never "not found" for an
         # answer still on its way; only a real one (no procedure, or refused) says so, below.
@@ -660,7 +667,7 @@ async def _advance_alone(
     # No round of questions before the first offer (21/11: 4-6 minutes per journey): up to three
     # slots as different as can be (_spread: days, then doctors), with the preferences already
     # known; the offer's closing asks for days and doctor if none fits (R:95, R:253).
-    days, gender = _days(chat), _gender(chat)
+    days, gender = case.days(chat, _heard), case.gender(chat, _heard)
 
     def page_of(rows: list[Message], page: int) -> str | None:
         """The page from _PAGES while fresh (the latest answer any case saw), else the case's own."""
@@ -670,7 +677,7 @@ async def _advance_alone(
     # already holds and the clock run forward (21/11: re-reading agenda, rules and world first
     # left the citizen 4-5 minutes in silence). So is a new case, from the pages another case
     # read (_PAGES): every new citizen waited minutes for world. The reads go out after the answer.
-    first = not replacing and not sent.offers and not _offered(chat, agent) and _fresh_page(procedure, 1) is not None
+    first = not replacing and not sent.offers and not case.offered(chat, agent) and _fresh_page(procedure, 1) is not None
     quick = _now(chat) is not None and (first or (replacing and not resumed and page_of(chat, 1) is not None))
     if quick:
         recent = chat
@@ -705,10 +712,10 @@ async def _advance_alone(
         return
     rules = _rules(chat, now)
     if replacing:
-        taken = _withdrawn(chat, agent) | sent.again
+        taken = case.withdrawn(chat, agent) | sent.again
     else:
         # Offers we cancelled are not held (an expired prescription renewed: the new number books).
-        taken = (_offered(chat, agent) | sent.offers) - _withdrawn(chat, agent)
+        taken = (case.offered(chat, agent) | sent.offers) - case.withdrawn(chat, agent)
         # A Ledger turn does not add offers to the ones the citizen already holds.
         if taken and not again:
             return
@@ -716,7 +723,7 @@ async def _advance_alone(
         "now": now,
         "born": born,
         "priority": priority,
-        "lang": _lang(chat),
+        "lang": case.lang(chat, _heard, doctor=True),
         "gender": gender,
         "days": days,
         "procedure": procedure,
@@ -754,7 +761,7 @@ async def _advance_alone(
             and not _down(slot.get("facility", ""))
         ]
         if chosen:
-            preferred = [slot for slot in chosen if _preferred(slot, _lang(chat), gender, days)]
+            preferred = [slot for slot in chosen if _preferred(slot, pick["lang"], gender, days)]
             if preferred or not (days or gender):
                 picked = _spread(preferred or chosen, _MAX_OFFERS, citizen)
                 await _offer(city, citizen, picked, number, priority, sent, replacing, chat, opening)
@@ -842,18 +849,14 @@ async def _advance_alone(
 
 
 async def _notify_gp_no_slots(city: City, chat: list[Message], citizen: str, number: str) -> None:
-    for row in reversed(chat):
-        if row.recipient != city.agent_id or not _from_gp(row):
-            continue
-        fields = protocol.fields(row)
-        if fields.get("citizen") == citizen and fields.get("prescription_number") == number:
-            if fields.get("notify_if") == "no_slots":
-                await _say(
-                    city, row.sender,
-                    f"data.response purpose=booking_follow_up outcome=no_slots prescription_number={number} "
-                    "Non ho trovato un posto disponibile e ho proposto la lista d'attesa.",
-                )
-            return
+    row = case.handoff(chat, number)
+    fields = protocol.fields(row) if row is not None else {}
+    if row is not None and fields.get("citizen") == citizen and fields.get("notify_if") == "no_slots":
+        await _say(
+            city, row.sender,
+            f"data.response purpose=booking_follow_up outcome=no_slots prescription_number={number} "
+            "Non ho trovato un posto disponibile e ho proposto la lista d'attesa.",
+        )
 
 
 async def _accept_handoff(city: City, message: Message, chat: list[Message]) -> None:
@@ -959,10 +962,10 @@ async def _on_confirm(
     # The offer named in free text is one of OUR offers (``_hear`` only picks from them).
     offer_id = (
         fields.get("offer_id")
-        or _consent_offer(chat, agent, citizen)
+        or case.consent_offer(chat, agent, citizen)
         or str(heard.get("offer_id") or "")
     )
-    offer = _our_offer(chat, agent, offer_id) if offer_id else {}
+    offer = case.our_offer(chat, agent, offer_id) if offer_id else {}
     if offer.get("waiting_list") == "true":
         return  # The waiting list ends the case here: nothing to book.
     slot = offer.get("slot_id", "")
@@ -972,8 +975,8 @@ async def _on_confirm(
         ask = f"data.request purpose=booking fields=offer_id {_phrase(chat, 'which')}"
         await _tell(city, chat, citizen, ask, again=True)
         return
-    number = offer.get("prescription_number") or _number(chat)
-    rx = _prescription(chat, number) if number else None
+    number = offer.get("prescription_number") or case.number(chat)
+    rx = case.prescription(chat, agent, number) if number else None
     if rx is not None and rx.get("state") not in (None, "issued"):
         # P1: the Ledger's latest answer says the prescription expired after our offer (the offer
         # now leaves before any question): the offer goes, the GP renews it. Never a doomed commit.
@@ -993,7 +996,7 @@ async def _on_confirm(
         # consent with purpose cross_asst. Its reference is the one the partner's hold needs.
         ask = f"consent purpose=cross_asst offer_id={offer_id} {_phrase(chat, 'cross_consent')}"
         given = consent if consent and (fields.get("purpose") == "cross_asst" or protocol.exact(chat, agent, ask)) else ""
-        cross_consent = given or _cross_ref(chat, citizen)
+        cross_consent = given or case.cross_consent(chat, citizen)
         consent = cross_consent
         if not consent:
             if not protocol.exact(chat, agent, ask):
@@ -1032,7 +1035,7 @@ async def _on_confirm(
     booking_consent = consent
     if facility not in _OUR_FACILITIES:
         # As the teams agreed: the booking consent in consent_ref, the cross-ASST one beside it.
-        booking_consent = _booking_ref(chat, citizen, offer_id) or consent
+        booking_consent = case.booking_consent(chat, citizen, offer_id) or consent
     parts = [
         "confirm",
         f"offer_id={theirs or offer_id}",
@@ -1049,8 +1052,9 @@ async def _on_confirm(
         parts.append(f"prescription_number={offer['prescription_number']}")
     # The citizen's language, so the facility writes to them in it. It leaves only now, with
     # the citizen's consent in hand (for a partner ASST, the cross-ASST one).
-    if re.fullmatch(r"[a-z]{2}", _lang(chat)):
-        parts.append(f"lang={_lang(chat)}")
+    lang = case.lang(chat, _heard)
+    if re.fullmatch(r"[a-z]{2}", lang):
+        parts.append(f"lang={lang}")
     try:
         await city.say(facility, " ".join(parts))
     except CapError:
@@ -1130,11 +1134,11 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
 
         if booked(chat) or booked(await _until(city, message.need_id, chat, booked, tries=8)):
             return
-    if offer_id and not _our_offer(chat, city.agent_id, offer_id):
+    if offer_id and not case.our_offer(chat, city.agent_id, offer_id):
         offer_id = ""  # not one of our offers: nothing the citizen holds was cancelled
     if offer_id and fields_of(message.text).get("reason", "").upper() in _GONE_CODES:
         # Taken by someone else, or its hold expired: no citizen of ours gets it again.
-        _GONE.add(_our_offer(chat, city.agent_id, offer_id).get("slot_id", ""))
+        _GONE.add(case.our_offer(chat, city.agent_id, offer_id).get("slot_id", ""))
     if not offer_id and not fields_of(message.text).get("booking_id"):
         # Names neither an offer of ours nor a booking: a partner's "no availability" goes to
         # the ring, anything else is not ours to tell the citizen about.
@@ -1276,7 +1280,7 @@ def _partner_slots(chat: list[Message], agent: str) -> list[dict[str, str]]:
     for row in _partner_rows(chat, agent):
         if "offer" not in words(row.text):
             continue
-        for offer in _offers_in(row.text):
+        for offer in case.offers_in(row.text):
             slot = dict(offer)
             for key, alias in (("at", "agenda_date"), ("day", "agenda_day")):
                 if key not in slot and alias in slot:
@@ -1353,30 +1357,6 @@ def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) 
         if slot["facility"] == facility and slot["slot_id"] == slot_id:
             return slot.get("offer_id", ""), request
     return "", request
-
-
-def _booking_ref(chat: list[Message], citizen: str, offer_id: str) -> str:
-    """The consent reference the citizen gave when choosing ``offer_id`` (not the cross-ASST one)."""
-
-    found = ""
-    for row in chat:
-        if row.sender == citizen:
-            fields = protocol.fields(row)
-            if fields.get("offer_id") == offer_id and fields.get("consent_ref") and fields.get("purpose") != "cross_asst":
-                found = fields["consent_ref"]
-    return found
-
-
-def _cross_ref(chat: list[Message], citizen: str) -> str:
-    """The citizen's latest consent reference with purpose cross_asst."""
-
-    found = ""
-    for row in chat:
-        if row.sender == citizen:
-            fields = protocol.fields(row)
-            if fields.get("purpose") == "cross_asst" and fields.get("consent_ref"):
-                found = fields["consent_ref"]
-    return found
 
 
 async def _ask_partners(
@@ -1500,11 +1480,11 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     if citizen is None or _booking_stage(chat, agent, citizen):
         return
     sent = _sent(key)
-    offered = _offered(chat, agent) | sent.offers
+    offered = case.offered(chat, agent) | sent.offers
     if any(slot["slot_id"] in offered for slot in _partner_slots(chat, agent)):
         return
-    number = _number(chat)
-    reply = _prescription(chat, number) if number else None
+    number = case.number(chat)
+    reply = case.prescription(chat, agent, number) if number else None
     _round_trip(chat, agent)
     now = _now(chat)
     if not number or reply is None or not reply.get("procedure") or now is None:
@@ -1514,9 +1494,9 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
         "now": now,
         "born": _born(chat),
         "priority": reply.get("priority"),
-        "lang": _lang(chat),
-        "gender": _gender(chat),
-        "days": _days(chat),
+        "lang": case.lang(chat, _heard, doctor=True),
+        "gender": case.gender(chat, _heard),
+        "days": case.days(chat, _heard),
         "procedure": reply["procedure"],
         "reserve": rules is None or "P3" in rules,
     }
@@ -1571,7 +1551,7 @@ def _talk(chat: list[Message]) -> str:
     writes to us in English (journeys 0141, 0172), so anything but Italian is answered in
     English, unless their own words are Italian."""
 
-    lang = _lang(chat)
+    lang = case.lang(chat, _heard)
     if lang in ("it", "en"):
         return lang
     text = " ".join(row.text or "" for row in chat if row.sender.startswith("citizen:"))
@@ -1601,7 +1581,7 @@ def _refused(chat: list[Message], agent: str) -> tuple[set[str], set[str]]:
         if not row.sender.startswith("citizen:") or "cancel" not in words(row.text):
             continue
         fields = fields_of(row.text)
-        offer = _our_offer(chat, agent, fields.get("offer_id", ""))
+        offer = case.our_offer(chat, agent, fields.get("offer_id", ""))
         if not offer.get("slot_id"):
             continue
         slots.add(offer["slot_id"])
@@ -1625,7 +1605,7 @@ def _offer_source(chat: list[Message], agent: str, offer_id: str) -> str:
 
     for row in chat:
         if row.sender == agent and "offer" in words(row.text):
-            if any(offer.get("offer_id") == offer_id for offer in _offers_in(row.text)):
+            if any(offer.get("offer_id") == offer_id for offer in case.offers_in(row.text)):
                 return row.msg_id
     return ""
 
@@ -1636,7 +1616,7 @@ def _names_ours(chat: list[Message], agent: str, fields: dict[str, str]) -> bool
 
     citizen = protocol.citizen(chat)
     offer_id = fields.get("offer_id", "")
-    if offer_id and _our_offer(chat, agent, offer_id):
+    if offer_id and case.our_offer(chat, agent, offer_id):
         return True
     return bool(citizen and _offer_of_booking(chat, agent, citizen, fields.get("booking_id", "")))
 
@@ -1664,7 +1644,7 @@ def _booked_offer(chat: list[Message], agent: str, facility: str, citizen: str) 
             if fields.get("citizen") == citizen:
                 # A partner's confirm carries the partner's offer_id: ours is by slot.
                 offer_id = f"of-{fields['slot_id']}" if fields.get("slot_id") else fields.get("offer_id", "")
-    return _our_offer(chat, agent, offer_id) if offer_id else {}
+    return case.our_offer(chat, agent, offer_id) if offer_id else {}
 
 
 async def _citizen_cancel(city: City, message: Message, chat: list[Message]) -> None:
@@ -1769,16 +1749,6 @@ def _born(chat: list[Message]) -> datetime | None:
     return None if born is None else born - _BORN_MARGIN
 
 
-def _past_window(lines: list[str], now: datetime, priority: str | None) -> bool:
-    """Whether this agenda page reaches past the priority deadline (B and D only)."""
-
-    days = _DEADLINE_DAYS.get(priority or "")
-    if not days:
-        return False
-    horizon = now + timedelta(days=days)
-    return any((at := protocol.when(_slot(line).get("at", ""))) is not None and at >= horizon for line in lines)
-
-
 def _preferred(slot: dict[str, str], lang: str, gender: str | None, days: frozenset[str]) -> bool:
     doctor = slot.get("doctor_id", "")
     spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
@@ -1867,24 +1837,6 @@ def _slot(line: str) -> dict[str, str]:
 _GP = "agent:ck9w60ejwnvw"
 
 
-def _handed(chat: list[Message], number: str) -> dict[str, str] | None:
-    """Procedure and priority from our GP's handoff of ``number`` (it wrote it on the Ledger just
-    before), as an issued prescription; None without one."""
-
-    for row in reversed(chat):
-        if row.sender == _GP and _from_gp(row):
-            fields = protocol.fields(row)
-            if fields.get("prescription_number") == number and fields.get("procedure") and fields.get("priority"):
-                return {"procedure": fields["procedure"], "priority": fields["priority"], "state": "issued"}
-    return None
-
-
-def _from_gp(row: Message) -> bool:
-    """The GP's handoff: ``need.request handoff=gp citizen=... prescription_number=...``."""
-
-    return row.sender.startswith("agent:") and protocol.fields(row).get("handoff") == "gp"
-
-
 async def _say(city: City, to: str, text: str) -> str:
     """protocol.say: the msg_id, or "". A citizen who heard from us is owed no replacement."""
 
@@ -1953,8 +1905,7 @@ def _read_clock(chat: list[Message]) -> None:
         if row.sender != LEDGER or first_word(row.text) != "agenda":
             continue
         found = fields_of(row.text)
-        found.setdefault("agenda_now", found.get("agenda_date", ""))
-        new, old = protocol.when(found["agenda_now"]), protocol.when(_CLOCK.get("agenda_now", ""))
+        new, old = protocol.when(found.get("agenda_now", "")), protocol.when(_CLOCK.get("agenda_now", ""))
         if new is not None and (old is None or new >= old):
             _CLOCK.clear()
             _CLOCK.update(found, sent_at=row.sent_at or "")
@@ -2013,30 +1964,6 @@ def _has_agenda(chat: list[Message]) -> bool:
     return protocol.when("" if agenda is None else agenda.get("agenda_now", "")) is not None
 
 
-def _prescription(chat: list[Message], number: str) -> dict[str, str] | None:
-    """The Ledger's latest answer about prescription ``number``; None before it answers."""
-
-    found: dict[str, str] | None = None
-    for row in chat:
-        head = first_word(row.text)
-        # "refused prescription code=NOT_FOUND ...": an answer too, with no procedure.
-        if row.sender == LEDGER and (head == "prescription" or head == "refused" and "prescription" in words(row.text)):
-            fields = fields_of(row.text)
-            if fields.get("prescription_number", number) == number:
-                found = fields
-    return found
-
-
-def _after(chat: list[Message], mark: str) -> list[Message]:
-    """Rows after our message ``mark``, the answers to a fresh ask. No mark, or a mark history
-    does not show: the whole case, as before marks existed."""
-
-    for index, row in enumerate(chat):
-        if mark and row.msg_id == mark:
-            return chat[index + 1 :]
-    return chat
-
-
 def _recent(chat: list[Message], sent: "_Sent") -> list[Message]:
     """Rows that answer our latest ``agenda`` ask. A history read before the ask shows neither
     the mark nor its answers: then nothing is recent, never the old agenda (journey 0099: slots
@@ -2092,15 +2019,6 @@ async def _until(
     )
 
 
-def _offered(chat: list[Message], agent: str) -> set[str]:
-    found: set[str] = set()
-    for row in chat:
-        if row.sender != agent or "offer" not in words(row.text):
-            continue
-        found |= {offer["slot_id"] for offer in _offers_in(row.text) if offer.get("slot_id")}
-    return found
-
-
 def _answered(chat: list[Message], agent: str, message: Message) -> bool:
     """True when we already wrote to the sender of ``message`` after it in the case."""
 
@@ -2111,151 +2029,9 @@ def _answered(chat: list[Message], agent: str, message: Message) -> bool:
     return any(row.sender == agent and row.recipient == message.sender for row in later)
 
 
-def _withdrawn(chat: list[Message], agent: str) -> set[str]:
-    """Slots we cancelled. The citizen drops the rest, so those are offered again."""
-
-    by_offer: dict[str, str] = {}
-    for row in chat:
-        if row.sender != agent or "offer" not in words(row.text):
-            continue
-        for offer in _offers_in(row.text):
-            if offer.get("offer_id") and offer.get("slot_id"):
-                by_offer[offer["offer_id"]] = offer["slot_id"]
-    dropped: set[str] = set()
-    for row in chat:
-        if "cancel" not in words(row.text):
-            continue
-        slot = by_offer.get(fields_of(row.text).get("offer_id", ""))
-        if slot:
-            dropped.add(slot)
-    return dropped
-
-
-def _our_offer(chat: list[Message], agent: str, offer_id: str) -> dict[str, str]:
-    for row in chat:
-        if row.sender == agent and "offer" in words(row.text):
-            for offer in _offers_in(row.text):
-                if offer.get("offer_id") == offer_id:
-                    return offer
-    return {}
-
-
-def _offers_in(text: str) -> list[dict[str, str]]:
-    """The offers of one message: each ``offer_id=`` starts the next one."""
-
-    found: list[dict[str, str]] = []
-    for token in text.replace(",", " ").split():
-        key, eq, value = token.partition("=")
-        value = value.strip(".,;:!?")
-        if not eq or not key or not value:
-            continue
-        if key == "offer_id":
-            found.append({})
-        if found and key not in found[-1]:
-            found[-1][key] = value
-    return found
-
-
-def _consent_offer(chat: list[Message], agent: str, citizen: str) -> str:
-    """The offer of our booking consent request, while it is our latest word to the citizen."""
-
-    found = ""
-    for row in chat:
-        if row.sender == agent and row.recipient == citizen:
-            found = fields_of(row.text).get("offer_id", "") if first_word(row.text) == "consent" else ""
-    if found and any(
-        row.sender == agent and first_word(row.text) == "confirm"
-        and fields_of(row.text).get("offer_id") == found
-        for row in chat
-    ):
-        return ""  # the consent arrived: the booking is on its way to the facility
-    return found
-
-
 def _down(facility: str) -> bool:
     since = _DOWN.get(facility)
     return since is not None and time.monotonic() - since < _DOWN_SECONDS
-
-
-def _number(chat: list[Message]) -> str | None:
-    for row in reversed(chat):
-        if row.sender.startswith("citizen:"):
-            number = protocol.fields(row).get("prescription_number")
-            if number and not any(character.isspace() for character in number):
-                return number
-            mentions = {match.upper() for match in _GP_RX.findall(row.text)}
-            if len(mentions) == 1:
-                return f"prescription_number-{next(iter(mentions))}"
-            if mentions:
-                return None
-        elif _from_gp(row) and protocol.fields(row).get("prescription_number"):
-            return protocol.fields(row)["prescription_number"]
-    return None
-
-
-_WEEKDAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri"}
-
-
-def _lang(chat: list[Message]) -> str:
-    """The case's language: a ``lang=`` token, else what the citizen's own words show."""
-
-    for row in chat:
-        if row.sender.startswith("citizen:"):
-            lang = protocol.fields(row).get("lang", "")
-            if lang:
-                return lang
-    for row in chat:
-        if row.sender.startswith("citizen:"):
-            lang = _heard(row).get("lang")
-            if isinstance(lang, str) and lang:
-                return lang
-    # The GP's handoff carries a default when the citizen gave it none: the last resort.
-    for row in chat:
-        if _from_gp(row) and protocol.fields(row).get("lang"):
-            return protocol.fields(row)["lang"]
-    return "it"
-
-
-def _days(chat: list[Message]) -> frozenset[str]:
-    """Agenda days the citizen prefers as mon..fri (token ``days=`` or free text, latest
-    message first); empty when not said."""
-
-    for row in reversed(chat):
-        if not row.sender.startswith("citizen:"):
-            continue
-        raw = row.body.get("days")
-        provided = row.body.get("provided")
-        if isinstance(provided, dict):
-            raw = provided.get("days", raw)
-        if not isinstance(raw, (str, list)):
-            match = re.search(r"(?<!\S)days=([a-z]+(?:\s*[/,|;]\s*[a-z]+)*)", row.text, re.IGNORECASE)
-            raw = match.group(1) if match else None
-        if raw:
-            names = raw if isinstance(raw, list) else re.split(r"[/,|;]", raw)
-            short = {str(name).strip().lower()[:3] for name in names}
-            return frozenset({_WEEKDAYS.get(day, day) for day in short} & set(_WEEKDAYS.values()))
-        said = _heard(row).get("days")
-        if isinstance(said, frozenset) and said:
-            return said
-    return frozenset()
-
-
-def _gender(chat: list[Message]) -> str | None:
-    """Doctor gender the citizen asked for: a token first, else free text (latest first)."""
-
-    for row in chat:
-        if not row.sender.startswith("citizen:"):
-            continue
-        fields = protocol.fields(row)
-        raw = fields.get("gender_preference") or fields.get("gender")
-        if raw in {"m", "f"}:
-            return raw
-    for row in reversed(chat):
-        if row.sender.startswith("citizen:"):
-            said = _heard(row).get("gender")
-            if said in {"m", "f"}:
-                return str(said)
-    return None
 
 
 # --- free text (level 3) -----------------------------------------------------------------------
@@ -2445,7 +2221,7 @@ def _live_offers(chat: list[Message], agent: str, citizen: str) -> list[dict[str
             continue
         head = first_word(row.text)
         if row.recipient == citizen and head == "offer":
-            latest = [offer for offer in _offers_in(row.text) if offer.get("slot_id")]
+            latest = [offer for offer in case.offers_in(row.text) if offer.get("slot_id")]
         elif row.recipient == citizen and head == "cancel":
             cancelled.add(fields_of(row.text).get("offer_id", ""))
         elif head in ("confirm", "booking.receipt") and f"citizen={citizen}" in row.text.split():
@@ -2498,17 +2274,6 @@ def _pick_by_rules(plain: str, offers: list[dict[str, str]]) -> str | None:
     return offers[chosen.pop()]["offer_id"] if len(chosen) == 1 else None
 
 
-def _asked_preferences(chat: list[Message], agent: str, citizen: str) -> bool:
-    """Our latest word to the citizen asks for days or gender."""
-
-    latest = ""
-    for row in chat:
-        if row.sender == agent and row.recipient == citizen:
-            latest = row.text
-    fields = fields_of(latest)
-    return first_word(latest) == "data.request" and fields.get("fields") in {"days", "gender"}
-
-
 async def _hear(city: City, message: Message, chat: list[Message]) -> dict[str, object]:
     """What a citizen's free-text message means for the desk.
 
@@ -2523,7 +2288,7 @@ async def _hear(city: City, message: Message, chat: list[Message]) -> dict[str, 
         plain = _plain(text)
         heard: dict[str, object] = dict(_heard(message))
         offers = _live_offers(chat, agent, citizen)
-        pending = _consent_offer(chat, agent, citizen)
+        pending = case.consent_offer(chat, agent, citizen)
         if offers and not pending:
             chosen = _pick_by_rules(plain, offers)
             if chosen:
@@ -2541,11 +2306,6 @@ async def _hear(city: City, message: Message, chat: list[Message]) -> dict[str, 
         needs = (
             (offers and not pending and "offer_id" not in heard)
             or (pending and "consent" not in heard)
-            or (
-                _asked_preferences(chat, agent, citizen)
-                and "days" not in heard
-                and "gender" not in heard
-            )
             or not lang_known
         )
         if not needs:

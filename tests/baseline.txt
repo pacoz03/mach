@@ -15,6 +15,6 @@ card gp OK
 card hospital OK
 card specialist_care OK
 card family_counseling OK
-pytest-unit               274 passed  0 failed  0 errors
-cmp OK (20 files)
+pytest-unit               303 passed  0 failed  0 errors
+cmp OK (24 files)
 ALL GREEN
