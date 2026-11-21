@@ -237,6 +237,37 @@ class Prescription:
             )
         return f"{self.head} {text}"
 
+    def holding(self, lang: str, prefs: dict[str, object]) -> str:
+        """To the person while the Ledger writes the prescription (live 21/11: minutes): their
+        reason, what we are doing and what comes next. No number and no act word: the Ledger first.
+        English says "referral": a bare "prescription" is the act word a citizen reads."""
+
+        reason = _REASON[lang].get(_code_of(self))
+        visit = _VISIT[lang].get(self.procedure, self.procedure)
+        noted, missing = _describe(prefs, lang), _missing(prefs, lang)
+        if lang == "en":
+            return (
+                (f"Thank you for telling me about {reason}" if reason else "Thank you for writing")
+                + f": I am taking care of it right away. I am registering your referral for a {visit}, "
+                "which can take a few minutes. As soon as it is confirmed I will send it to you here "
+                "with its number and pass it on to our booking centre, which will contact you to "
+                "arrange the visit: you do not need to repeat anything. "
+                + (f"I have noted your preferences ({noted}) and will pass them on. " if noted else "")
+                + (f"If you have a preference for {missing}, have it ready: the booking centre will "
+                   "ask you. " if missing else "")
+                + "If you feel worse or something new comes up in the meantime, write to me straight away."
+            )
+        return (
+            (f"Grazie per avermi descritto {reason}" if reason else "Grazie per avermi scritto")
+            + f": me ne occupo subito. Sto registrando la sua ricetta per una {visit} e può volerci "
+            "qualche minuto. Appena è confermata gliela mando qui con il numero e la passo al nostro "
+            "centro prenotazioni, che la contatterà per fissare la visita: non deve ripetere nulla. "
+            + (f"Ho preso nota delle sue preferenze ({noted}) e le passerò al centro. " if noted else "")
+            + (f"Se ha preferenze {missing}, le tenga pronte: il centro prenotazioni gliele chiederà. "
+               if missing else "")
+            + "Se nel frattempo si sente peggio o compare qualcosa di nuovo, mi scriva subito."
+        )
+
 
 # The reason in the citizen's own words (the protocol's symptom, never a diagnosis) and the visit.
 _REASON = {
@@ -760,7 +791,8 @@ async def _issue(
     """Ledger first: ``prescribe``, then the prescription to the citizen once it is written."""
 
     history = await city.history(need_id=need_id)
-    if _previous_prescription(history, city.agent_id, number=request.number) is None:
+    asked = _previous_prescription(history, city.agent_id, number=request.number) is None
+    if asked:
         try:
             await city.say(
                 LEDGER,
@@ -770,14 +802,16 @@ async def _issue(
         except CapError:
             await city.say(request.patient, LEDGER_REFUSAL)
             return
+        history = await city.history(need_id=need_id)  # a quick Ledger has already answered
 
-    # In some runs a Ledger reply is visible in history before it opens an agent turn.
-    for _ in range(LEDGER_WAIT_ATTEMPTS):
-        if await _notify(city, history, request, lang, prefs):
-            return
-        await asyncio.sleep(LEDGER_WAIT_SECONDS)
-        history = await city.history(need_id=need_id)
-    await _notify(city, history, request, lang, prefs)
+    if await _notify(city, history, request, lang, prefs):
+        return
+    # Live 21/11 the Ledger answered in 4-6 minutes. Its reply opens a turn of its own (main), which
+    # sends the prescription and the handoff; polling here (24 reads, ~6 s) never saw it and left
+    # the citizen without a word. They hear from us now, once: only the turn that wrote prescribe.
+    if asked:
+        prefs = {**_case_preferences(history, request.patient), **(prefs or {})}
+        await _tell(city, request.patient, request.holding(_reply_lang(lang), prefs), history)
 
 
 def _previous_prescription(

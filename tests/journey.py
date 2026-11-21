@@ -168,6 +168,7 @@ class Ledger:
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
         self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
+        self.slow_prescribe = sc.get("slow_prescribe", 0)  # secondi, risposta a prescribe (21/11: minuti)
         self.push_expired = sc.get("push_expired", 0)  # commit che arrivano a hold già scaduto
         self.steal = sc.get("steal")  # slot preso da un'altra ASST subito dopo la prima risposta a world
         self.flipped: set[str] = set()  # regole accese a metà scenario (sc["rule_at"]): i loro rifiuti sono iniettati
@@ -184,6 +185,8 @@ class Ledger:
     def late(self, text: str) -> float:
         if (text.split() or [""])[0] in ("hold", "commit"):
             return self.slow_writes
+        if (text.split() or [""])[0] == "prescribe":
+            return self.slow_prescribe
         if (text.split() or [""])[0] == "world":
             return self.slow_world
         if (text.split() or [""])[0] != "agenda":
@@ -1716,6 +1719,43 @@ SCENARIOS.update({
         start=("hospital", XFIS.format(rid="R-40", extra="")), foreign=True, steal="S-h3-01-10",
         foreign_after=[XFIS.format(rid="R-41", extra="")],
         expect=[cancel_told(FOREIGN, "SLOT_TAKEN", 1), cross_reply("R-41", "B"), not_offered("R-41", "S-h3-01-10")]),
+})
+
+
+# --- H: gp con il Ledger lento (live 21/11: ricetta dopo 6-10 minuti, cittadino senza notizie)
+
+
+def gp_answers_at_once(within: float, *subs: str):
+    """Il gp risponde al cittadino nel turno del suo messaggio, entro ``within`` s, una volta sola
+    prima della ricetta, senza numero né parola d'atto (prima il Ledger, R:219); ``subs`` nel testo.
+    La ricetta arriva poi con la risposta del Ledger."""
+    def check(b: Bus) -> str | None:
+        gp = b.ids["gp"]
+        asked = next(m for m in b.log if m.sender == CIT and m.recipient == gp)
+        said = [m for m in b.log if m.sender == gp and m.recipient == CIT]
+        rx = next((i for i, m in enumerate(said) if act(m) == "prescription" and "prescription_number=" in m.text), None)
+        if not said or rx is None:
+            return "il gp non ha mandato la ricetta dopo la risposta lenta del Ledger"
+        first, took = said[0], b.stamp[said[0].msg_id] - b.stamp[asked.msg_id]
+        if b.opened.get(b.turn_of[first.msg_id]) is not asked or took >= within:
+            return f"primo messaggio del gp al cittadino dopo {took:.1f} s e non nel turno del suo messaggio (atteso < {within} s)"
+        if rx != 1 or "=" in first.text or act(first) not in ("need.request", "chat"):
+            return f"prima della ricetta {rx} messaggi del gp invece di uno senza token: «{first.text[:80]}»"
+        missing = [s for s in subs if s not in first.text]
+        if missing:
+            return f"messaggio d'attesa senza {missing}: «{first.text[:120]}»"
+    return check
+
+
+SCENARIOS.update({
+    # Il Ledger risponde a prescribe dopo 3 s (città 21/11: minuti). Solo con --ledger-turns: in
+    # città la risposta apre un turno suo, ed è lì che parte la ricetta.
+    "gp_ledger_lento": dict(start=BACK, handoff=True, slow_prescribe=3.0, ledger_turns=True, expect=[
+        gp_answers_at_once(1.5, "mal di schiena", "visita fisiatrica", "centro prenotazioni", "giorni"),
+        gp_prescription(), writes("prescribe", 1, "una sola ricetta"), handed_over, wrote("commit", "R:241")]),
+    "gp_ledger_lento_en": dict(start=("gp", PREF_EN), handoff=True, slow_prescribe=3.0, ledger_turns=True, expect=[
+        gp_answers_at_once(1.5, "back pain", "physiatry visit", "booking centre", "Monday"),
+        gp_prescription(), handoff_tokens("lang=en", "doctor_lang=en", "days=mon"), handed_over]),
 })
 
 
