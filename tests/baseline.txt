@@ -1,0 +1,17 @@
+# Baseline di tests/check.sh (step 0 di docs/refactor/piano.md): ogni step deve dare conteggi uguali o migliori.
+# 2026-11-21 04:57 CET  master c07fcd4  durata 159s  uscita 0
+# XPASS in sdk: p1_rinnovo_prenota_cittadino passa con --ledger-format sdk (xfail resta per kit).
+journey plain      PASS 100  FAIL 0  XFAIL 2  XPASS 0  SKIP 5
+journey turns      PASS 105  FAIL 0  XFAIL 2  XPASS 0  SKIP 0
+journey sdk        PASS 100  FAIL 0  XFAIL 1  XPASS 1  SKIP 5
+journey turns-sdk  PASS 105  FAIL 0  XFAIL 1  XPASS 1  SKIP 0
+pytest-consultorio          2 passed  0 failed  0 errors
+pytest-family_counseling    9 passed  0 failed  0 errors
+pytest-specialist          36 passed  0 failed  0 errors
+card booking_centre OK
+card gp OK
+card hospital OK
+card specialist_care OK
+card family_counseling OK
+cmp OK (8 files)
+ALL GREEN
