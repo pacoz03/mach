@@ -256,6 +256,10 @@ async def handle(role: str, need: Need, city: City) -> None:
         finally:
             _HOSPITAL.reset(flag)
     elif role == "specialist_care":
+        if message.sender == LEDGER and first_word(message.text) == "agenda":
+            _ledger([message], "agenda")  # refreshes the city clock (_CLOCK) for the cache
+        if message.sender == LEDGER and _keep_world_reply(message):
+            return  # a late world answer: cached for the next partner request
         kind = words(message.text)
         if (
             message.sender.startswith("agent:")
@@ -289,6 +293,12 @@ async def handle(role: str, need: Need, city: City) -> None:
                     place_en="the cardiology clinic where your visit will take place",
                 )
     elif role == "family_counseling":
+        # As the specialist: a late agenda/world answer, as its own Ledger turn, refreshes the
+        # city clock and the CONS-GIN cache that partner requests are answered from.
+        if message.sender == LEDGER and first_word(message.text) == "agenda":
+            _ledger([message], "agenda")
+        if message.sender == LEDGER and _keep_world_reply(message):
+            return
         await _family(city, message, chat)
 
 
@@ -1955,6 +1965,13 @@ async def _cross_asst(
                       "elapsed_seconds": round(time.monotonic() - start, 3),
                       "delivered": delivered, "cached": bool(later),
                       "result": "offer" if chosen else "no_availability"})
+        if owed and not hospital:
+            # Specialist: the fast reply (+1, R:246) is measured on the ack, sent at the end of
+            # the turn: end it now. The late reads go out in the background, and the Ledger's
+            # world answer refreshes the cache as a turn of its own (handle -> _keep_world_reply).
+            if later:
+                _background(_say_later(city, list(later)))
+            return
     if owed:
         for read in later:
             await _say(city, LEDGER, read)
@@ -1968,6 +1985,40 @@ async def _cross_asst(
         )
         _keep_world(procedure, fresh(rows))
 
+
+# Background work of this process (late Ledger reads): kept referenced until it is done.
+_TASKS: set[asyncio.Task] = set()
+
+
+def _background(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
+
+
+async def _say_later(city: City, reads: list[str]) -> None:
+    """Ledger reads sent after the turn's answer; their replies come back as Ledger turns."""
+
+    for read in reads:
+        try:
+            await _say(city, LEDGER, read)
+        except Exception:  # best effort: the answer already went out
+            return
+
+
+def _keep_world_reply(message: Message) -> bool:
+    """A Ledger ``world`` answer arriving as its own turn refreshes the cache of its procedure
+    (every slot line names it). True if it was a world answer."""
+
+    world = _latest_slots([message])
+    if world is None:
+        return False
+    procedures = {
+        _slot(line).get("procedure") for line in world.splitlines() if "slot_id=" in line
+    } - {None, ""}
+    if len(procedures) == 1:
+        _keep_world(procedures.pop(), [message])
+    return True
 
 def _keep_world(procedure: str, rows: list[Message]) -> None:
     """Hospital, specialist: every ``world`` page in ``rows`` becomes the cached page of

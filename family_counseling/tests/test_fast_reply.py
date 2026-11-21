@@ -33,9 +33,13 @@ class FastReply(unittest.IsolatedAsyncioTestCase):
                 raise asyncio.CancelledError()
             return True
         with patch.object(f,'_city_now',return_value=self.now),patch.object(f,'_say',side_effect=say):
-            with self.assertRaises(asyncio.CancelledError):
-                await f._cross_asst(self.city,self.message('warm-fast'),procedures=('CONS-GIN',))
+            # The turn ends right after the answer (the fast reply is measured on the ack, sent
+            # at the end of the turn): the slow Ledger refresh runs in the background.
+            await f._cross_asst(self.city,self.message('warm-fast'),procedures=('CONS-GIN',))
+            for _ in range(5):
+                await asyncio.sleep(0)
         self.assertEqual(messages[0][0],'agent:partner')
+        self.assertTrue(any(to==f.LEDGER for to,_,_ in messages[1:]))  # refresh after the answer
         self.assertIn('offer offer_id=',messages[0][1]);self.assertLess(messages[0][2],10)
         self.assertIn('agenda_day=tue',messages[0][1])
 
