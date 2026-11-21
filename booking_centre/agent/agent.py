@@ -397,7 +397,12 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     if "booking.receipt" in kind and sender.startswith("agent:"):
         await _forward_receipt(city, message, chat)
         return
-    if "cancel" in kind and sender.startswith("agent:"):
+    if (kind & {"cancel", "cancelled"}) and (
+        sender.startswith("agent:")
+        # From level 6 the city cancels each citizen's first booking: whoever tells us (the
+        # facility, or the city itself naming the booking), we rebook at once.
+        or (sender.startswith("city:") and (picked.get("offer_id") or picked.get("booking_id")))
+    ):
         await _partner_cancel(city, message, chat)
         return
     if sender.startswith("citizen:") and not picked.get("prescription_number"):
@@ -949,6 +954,9 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
 async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> None:
     offer_id = fields_of(message.text).get("offer_id", "")
     citizen = _citizen(chat)
+    if not offer_id and citizen:
+        # A cancel naming the booking only: our offer behind it, from the receipt we forwarded.
+        offer_id = _offer_of_booking(chat, city.agent_id, citizen, fields_of(message.text).get("booking_id", ""))
     # P1: the Ledger refused the commit because the prescription expired. The GP renews it.
     expired = "PRESCRIPTION_EXPIRED" in message.text.upper()
     told = _sent(message.need_id or message.msg_id).cancelled
@@ -1446,6 +1454,19 @@ def _offer_source(chat: list[Message], agent: str, offer_id: str) -> str:
         if row.sender == agent and "offer" in words(row.text):
             if any(offer.get("offer_id") == offer_id for offer in _offers_in(row.text)):
                 return row.msg_id
+    return ""
+
+
+def _offer_of_booking(chat: list[Message], agent: str, citizen: str, booking_id: str) -> str:
+    """The offer_id of ours that became ``booking_id`` ("" if unknown)."""
+
+    if not booking_id:
+        return ""
+    for row in chat:
+        if row.sender.startswith("agent:") and first_word(row.text) == "booking.receipt" and (
+            fields_of(row.text).get("booking_id") == booking_id
+        ):
+            return _booked_offer(chat, agent, row.sender, citizen).get("offer_id", "")
     return ""
 
 
