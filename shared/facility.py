@@ -68,7 +68,11 @@ _SHORT_TRIES = 12
 # needs the turn's ack < 10 s.
 _LEDGER_WAIT = 5.0
 _LEDGER_PAUSE = 1.0  # one read of the case's Ledger rows per second while waiting (was 24 full reads)
-_WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
+# 30 real minutes (utente, 21/11 14:20): a Ledger round trip takes ~27 min, Ledger -> agent ~13.7 min, so a
+# 5 min cache was stale on arrival (_recover dates a page by its sent_at) and nearly every request got
+# facility_unavailable or "riscriva più tardi". Past slots still drop out by the agenda clock (fitting); a
+# taken one is the Ledger's call at the hold.
+_WORLD_FRESH = 1800.0
 # A world read of one weekday: AgendaDay of the Ledger schema (city_sdk ledger.py:52), as slot rows
 # name it (day=tue). ponytail: the format is a guess from those two; a refused ``day=`` falls back to
 # page reads for the life of the process (_BY_DAY).

@@ -748,6 +748,8 @@ class Bus:
                     await self.tasks.pop()
                     continue
                 m = self.queue.popleft()
+                if m is None:  # tests/chaos.py: add() returns None for a message the fault drops
+                    continue
                 self.turn += 1
                 self.opened[self.turn] = m
                 if m.sender != LEDGER:
