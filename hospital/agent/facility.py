@@ -28,17 +28,18 @@ from pathlib import Path
 
 import tools
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope
-from mach import protocol
+from mach import calendar, protocol
 from mach.protocol import fields_of, first_word, words
 from mach.safety import red_flag
 
 _MAX_PAGE = 8
-# Four agenda hours is about half a minute of real time at 480x, so a slot is still
-# ahead when the citizen decides. One hour was already past by then.
-_LEAD = timedelta(hours=4)
 # A hold is answered after a Ledger round trip: 5-7 real minutes, ~6 agenda hours at rate 60
 # (audit 21/11). A slot that starts sooner comes back EXPIRED (live: one hold in three): no hold.
-_HOLD_LEAD = max(_LEAD, timedelta(hours=6))
+_HOLD_LEAD = timedelta(hours=6)
+# Every offer starts past this: _HOLD_LEAD at the confirm plus the choice (live 21/11: up to 16 real
+# minutes; 4 h offers came back as our own EXPIRED cancels, 18 in 2 h). 16 h, the booking centre's
+# _OFFER_LEAD: one margin from offer to hold.
+_LEAD = _HOLD_LEAD + timedelta(hours=10)
 # Doctor key (the last segment of doctor_id) -> languages, gender, days, from the registry
 # (console team/world). The Ledger's slot line names the doctor; it does not repeat this table.
 _DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
@@ -51,7 +52,6 @@ _DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
 }
 # Our ASST's rare language: only h3 speaks it, and partners ask us for it (registry).
 _RARE = "sq"
-_DEADLINE_DAYS = {"B": 2, "D": 5}
 _LOG = logging.getLogger("care")
 # The Relay accepts a ledger reply and then the agent rejects the push, so the reply sits in
 # the case history and never opens a turn. Wait briefly and read it back from history.
@@ -451,13 +451,7 @@ def fitting(
     know them, so we neither drop the slot nor claim anything about the doctor.
     """
 
-    if priority == "U":
-        horizon: datetime | None = now.replace(hour=23, minute=59, second=59, microsecond=0)
-    elif priority == "P":
-        horizon = None
-    else:
-        horizon = now + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))
-    earliest = now + _LEAD
+    horizon = calendar.deadline(priority, now)  # the priority window (calendar.deadline)
     chosen: list[tuple[datetime, dict[str, str]]] = []
     for line in lines:
         slot = _slot(line)
@@ -474,7 +468,7 @@ def fitting(
         reserve = slot.get("urgent_reserve", "").lower() == "true"
         if reserve and priority != "U":
             continue
-        if not earliest < at or (horizon is not None and at >= horizon):
+        if not now + _HOLD_LEAD < at or (horizon is not None and at >= horizon):
             continue
         spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
         if spec is not None:
@@ -486,6 +480,10 @@ def fitting(
             if gender and spec[1] != gender:
                 continue
         chosen.append((at, slot))
+    # _LEAD ahead first. U (the same day) takes the closer ones past _HOLD_LEAD only when none is that
+    # far: a sure miss otherwise (as the booking centre's _offer_lead).
+    far = [item for item in chosen if item[0] > now + _LEAD]
+    chosen = far if far or priority != "U" else chosen
     chosen.sort(key=lambda item: (item[0], item[1].get("slot_id", "")))
     return [slot for _, slot in chosen]
 
@@ -702,7 +700,8 @@ class _Sent:
 
     ``offers`` holds every slot id sent. A cancel makes the
     citizen drop all offers, so ``again`` holds only what was re-sent for ``trigger``.
-    ``holds`` holds the slots we sent a ``hold`` for, so a duplicate confirm does not hold twice.
+    ``holds`` maps the slots we sent a ``hold`` for to its time.monotonic(), so a duplicate confirm
+    does not hold twice and another need's confirm does not hold it meanwhile (_held_elsewhere).
     """
 
     __slots__ = ("offers", "trigger", "again", "holds")
@@ -711,7 +710,7 @@ class _Sent:
         self.offers: set[str] = set()
         self.trigger = ""
         self.again: set[str] = set()
-        self.holds: set[str] = set()
+        self.holds: dict[str, float] = {}
 
 
 # Every Ledger or citizen message opens its own turn, and turns of one need run at the same
@@ -927,10 +926,19 @@ async def _confirm_alone(
     agent = city.agent_id
     fields = _fields(message)
     offer_id = fields.get("offer_id", "")
-    consent = fields.get("consent_ref", "")
+    # P2: a partner's cross-ASST consent alone is a consent too (it goes on the hold, below).
+    consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref", "")
     offer_rows = [row for row in chat if row.recipient == message.sender] if hold_self else chat
     offer = _our_offer(offer_rows, agent, offer_id) if offer_id else {}
     slot = offer.get("slot_id") or fields.get("slot_id", "")
+    if slot and message.sender.startswith("agent:") and message.sender != _OUR_BOOKING and slot not in {
+        o.get("slot_id") for o in _our_offers([row for row in chat if row.recipient == message.sender], agent)
+    }:
+        # Impostors (live 21/11, 10:00-16:00) confirm slots to make us hold them: an agent books only a
+        # slot we offered it in this case. Our booking centre reads the Ledger itself, it gets no offers.
+        if not _answered(chat, agent, message.msg_id, message.sender):
+            await _say(city, message.sender, f"cancel reason=invalid_offer slot_id={slot}")
+        return
     # We book only our own slots, never forward: a booking party's confirm (R:194), or a citizen's
     # for an offer of ours. A citizen's facility= never sends its confirm, consent and data to an
     # agent it names (injection obeyed, R:243).
@@ -983,6 +991,10 @@ async def _confirm_alone(
         # turn (the cancel, and other dates where that path gives them).
         await _on_refused(city, message, chat, hold_self=hold_self, slot=slot, code="EXPIRED")
         return
+    if not held and await _held_elsewhere(city, slot, key):
+        # Never a second hold on it: this confirm hears the slot is taken and its party offers again.
+        await _on_refused(city, message, chat, hold_self=hold_self, slot=slot, code="SLOT_TAKEN")
+        return
     if not held:
         parts = ["hold", f"slot_id={slot}"]
         if citizen:
@@ -996,7 +1008,7 @@ async def _confirm_alone(
         if not await _say(city, LEDGER, " ".join(parts)):
             _HELD.pop(slot, None)
             return
-        sent.holds.add(slot)
+        sent.holds[slot] = time.monotonic()
     await _finish_booking(
         city, message, chat, slot, hold_self=hold_self, new=_HOSPITAL.get() and not held
     )
@@ -1015,6 +1027,26 @@ def _starts_soon(slot: str, offer: dict[str, str], chat: list[Message]) -> bool:
                  if f"slot_id={slot}" in line.split())
         at = protocol.when(next((start for start in found if start), ""))
     return now is not None and at is not None and at <= now + _HOLD_LEAD
+
+
+async def _held_elsewhere(city: City, slot: str, key: str) -> bool:
+    """Our hold on ``slot`` for another need still stands: sent in the last _HOLD_SPAN s, and no refusal,
+    cancellation or expiry after it in that case (live 21/11: one slot held for 3 needs in 1.5 min, each
+    new hold made the older one's commit STALE_FENCE). Older, the Ledger answers (it may let a hold expire
+    without a row). ponytail: the needs this process sent a hold for (_SENT); a second pod, a restart or
+    a hold still being said is missed, and the Ledger answers instead."""
+
+    for need, entry in list(_SENT.items()):
+        if need == key or time.monotonic() - entry.holds.get(slot, float("-inf")) > _HOLD_SPAN:
+            continue
+        try:
+            rows = await city.history(need_id=need)
+        except CapError:
+            continue
+        since = _since_hold(rows, city.agent_id, slot)
+        if since is not None and not any(_drops_hold(row) for row in since):
+            return True
+    return False
 
 
 # --- facility ----------------------------------------------------------------------------------
@@ -1182,19 +1214,22 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
             offer = _our_offer([r for r in chat if r.recipient == message.sender],
                                city.agent_id, fields.get("offer_id", ""))
             reason = ""
-            if not fields.get("consent_ref"):
+            if not fields.get("consent_ref") and not fields.get("cross_asst_consent_ref"):
                 reason = "missing_consent_ref"
             elif not offer or fields.get("slot_id") != offer.get("slot_id"):
                 reason = "invalid_offer"
             elif not fields.get("citizen", "").startswith("citizen:"):
                 reason = "missing_citizen"
             if reason:
-                await _say(city, message.sender, f"cancel reason={reason}")
+                rid = fields.get("request_id") or offer.get("request_id")  # the partner matches on it
+                await _say(city, message.sender, f"cancel reason={reason}" + (f" request_id={rid}" if rid else ""))
                 return
-            # Direct access: discard any prescription and arbitrary partner fields.
+            # Direct access: discard any prescription and arbitrary partner fields. The consents stay:
+            # under P2 the hold carries the cross-ASST one (_confirm_alone), else CONSENT_MISSING.
+            consents = "".join(f" {k}={fields[k]}" for k in ("consent_ref", "cross_asst_consent_ref") if fields.get(k))
             clean = replace(message, body={"text":
                 f"confirm offer_id={fields['offer_id']} slot_id={offer['slot_id']} "
-                f"citizen={fields['citizen']} consent_ref={fields['consent_ref']}"})
+                f"citizen={fields['citizen']}{consents}"})
             await _on_confirm(city, clean, chat, hold_self=False)
         elif head == "need.request" or "need.request" in words(message.text) or message.type == "need.request":
             if fields.get("service_type", "family_counseling.gynecology") != "family_counseling.gynecology":
@@ -1696,7 +1731,9 @@ async def _cross_asst(
             procedures == ("CONS-GIN",) and row.sender == agent and row.recipient == sender
             and first_word(row.text) not in {"offer", "cancel", "booking.receipt"})]
         # ``pending``: a later message to the partner (another request's answer) does not answer it.
-        if sent.offers or not pending and _answered(completed_chat, agent, message.msg_id, sender) or tag and any(
+        # With a request_id only its own answer does: the Relay delivers minutes late, so the history can
+        # list this request before our answer to an earlier one (live 21/11, specialist: never answered).
+        if sent.offers or not pending and not tag and _answered(completed_chat, agent, message.msg_id, sender) or tag and any(
             row.sender == agent and row.recipient == sender and tag in row.text.split()
             for row in completed_chat
         ):
@@ -1712,9 +1749,6 @@ async def _cross_asst(
             return protocol.when(fields.get(key, "")) or protocol.when(fields.get(key, "") + "Z")
 
         after, until = agenda_at("after") or agenda_at("earliest"), agenda_at("deadline")
-        # A Sat/Sun bound (last 3 h: 26 of 224 hospital deadlines, 4 of 96 specialist) counts calendar days, the agenda has none: ignored.
-        if any(bound and bound.weekday() >= 5 for bound in (after, until)):
-            after = until = None
         seen: list[str] = []  # every slot line of the pages read: next_free after the window
         free_after = ""
         chosen: list[dict[str, str]] = []
@@ -1764,6 +1798,10 @@ async def _cross_asst(
             every: list[dict[str, str]] = []
             while True:
                 cached = warm(page)
+                # Past page 1, page 1 is read again with this one: both land fresh together (live 21/11
+                # 10:18: page 2 came 6 min after its page 1, _answer_pending found page 1 stale and the
+                # partner never had an answer).
+                reads = [f"world procedure={procedure} page={n}" for n in dict.fromkeys((1, page))]
                 if cached is not None:
                     # Answer now; the read goes out after the answer and refreshes the cache.
                     rows, world, owed = chat, cached, page
@@ -1772,11 +1810,12 @@ async def _cross_asst(
                 elif pending:
                     # Page 2 not read yet: asked once, its own push turn answers.
                     if not protocol.asked(chat, agent, procedure, page):
-                        await _say(city, LEDGER, f"world procedure={procedure} page={page}")
+                        await asyncio.gather(*(_say(city, LEDGER, read) for read in reads))
                     world = None
                     break
                 else:
-                    await _say(city, LEDGER, f"world procedure={procedure} page={page}")
+                    later = [read for read in later if read not in reads]
+                    await asyncio.gather(*(_say(city, LEDGER, read) for read in reads))
                     rows = await _until(
                         city,
                         message.need_id,
@@ -3101,7 +3140,9 @@ async def _on_refused(
         and offer_id
         and not protocol.we(seen, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        text = f"cancel offer_id={offer_id} reason={code}"
+        # A booking party matches the cancel on the slot too (partner CUPs); a citizen needs only the offer.
+        where = f" slot_id={slot}" if target.startswith("agent:") else ""
+        text = f"cancel offer_id={offer_id}{where} reason={code}"
         if target.startswith("citizen:"):
             if _en(chat):
                 text += " I'm sorry, this appointment can no longer be booked." + (

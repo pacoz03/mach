@@ -792,10 +792,10 @@ class Bus:
         if not offers or self.confirmed:
             return
         self.confirmed = True
-        o = offers[0]
-        confirm = (f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen={CIT} "
-                   "consent_ref=cons-X-1 prescription_number=RX-X-1"
-                   + (" cross_asst_consent_ref=xc-X-1" if self.citizen.sc.get("xconsent") else ""))
+        o, xc = offers[0], self.citizen.sc.get("xconsent")  # "only": senza il consent_ref della prenotazione
+        confirm = (f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen={CIT}"
+                   + ("" if xc == "only" else " consent_ref=cons-X-1") + " prescription_number=RX-X-1"
+                   + (" cross_asst_consent_ref=xc-X-1" if xc else ""))
         for text in (self.citizen.sc["start"][1], confirm):
             self.queue.append(self.add(FOREIGN, m.sender, {"text": text}))
 
@@ -1350,9 +1350,10 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_lingua_en": dict(
         start=("hospital", XFIS.format(rid="R-8", extra=" lang=en")), foreign=True,
         expect=[cross_reply("R-8", "B"), cross_doctors("R-8", "h1")]),
-    # Livello 5: lang=en e gender=f li rispetta solo h1, quindi niente h3 di rinforzo.
+    # Livello 5: lang=en e gender=f li rispetta solo h1, quindi niente h3 di rinforzo. Ore 12: con 16 h di
+    # margine la finestra B ha tre h1 (mar 10 e 15, mer 10).
     "cross_asst_vincoli": dict(
-        start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True,
+        start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True, late_hours=4,
         expect=[cross_reply("R-13", "B"), cross_only("R-13", "h1")]),
     # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo chiude il turno entro 9,5 s (ack)
     # senza risposta, perché senza pagina non sa: mai cancel no_availability (attributo falso, −2).
@@ -1835,8 +1836,9 @@ SCENARIOS.update({
                 receipt_to_foreign, *CHECKED_IN]),
     # 3. P3 si accende dopo l'offerta: l'hold sulla riserva U riceve NO_CAPACITY, il codice va al partner,
     # e la richiesta dopo non riceve slot della riserva (la pagina in cache è di prima del cambio).
+    # Martedì 08:00: con 16 h di margine il primo h1 è mer 10:00, della riserva (S-h1-02-10).
     "ospedale_regola_p3": dict(
-        start=("hospital", XFIS.format(rid="R-30", extra=" lang=en")), foreign=True, rule_at={"P3": 2},
+        start=("hospital", XFIS.format(rid="R-30", extra=" lang=en")), foreign=True, rule_at={"P3": 2}, late_hours=24,
         foreign_after=[XFIS.format(rid="R-31", extra=" lang=en")],
         expect=[cancel_told(FOREIGN, "NO_CAPACITY", 1), cross_reply("R-31", "B"), no_reserve_offer("R-31")]),
     # 4. Due pod dell'ospedale (roll out): push di held concorrente e confirm doppio, nessun lock comune.
@@ -3013,12 +3015,13 @@ SCENARIOS.update({
     "specialista_finestra_vuota": dict(
         start=("specialist_care", XCARD.format(rid="R-54", extra=" after=2026-11-23T16:00 deadline=2026-11-24T09:00")),
         foreign=True, expect=[cross_next_free("R-54", "2026-11-24T10:00", "specialist_care"), no_write("hold", "R:192")]),
-    # Finestra sab-dom (città 21/11: after sab 09:05, deadline dom 19:44): l'agenda non ha weekend, il
-    # richiedente conta giorni di calendario. Finestra ignorata: le offerte di oggi, da lun 15:00, non cancel.
+    # deadline= di sabato (B nato venerdì 08:00 in ore di calendario: sabato 08:00, o domenica): il limite è quello
+    # del richiedente, così com'è. Niente lunedì (prima: limite di sabato o domenica ignorato, offerto lun 10:00
+    # fuori dalla sua S), ma il cancel con next_free=.
     "cross_asst_finestra_weekend": dict(
-        start=("hospital", XFIS.format(rid="R-55", extra=" after=2026-11-28T09:05 deadline=2026-11-29T19:44 mach=1.3")),
-        foreign=True, expect=[cross_reply("R-55", "B"),
-                              cross_window("R-55", START.replace(hour=12), WED, must=("S-h1-00-15",))]),
+        start=("hospital", XFIS.format(rid="R-55", extra=" deadline=2026-11-28T08:00 mach=1.3")),
+        foreign=True, late_days=4,
+        expect=[cross_reply("R-55", None), cross_next_free("R-55", "2026-11-30T10:00"), no_write("hold", "R:192")]),
 })
 
 
@@ -3776,6 +3779,193 @@ SCENARIOS.update({
         start=("family_counseling", XREQ.format(svc="family_counseling.gynecology", proc="CONS-GIN", rid="R-61")),
         foreign=True, setup=late_agenda_after_confirm,
         expect=[nothing_to_citizens("family_counseling"), wrote("commit", "R:194", consent_ref="cons-X-1")]),
+})
+
+# --- Strutture (diagnosi 21/11): scadenze da mach.calendar, un solo margine tra offerta e hold, mai silenzio
+# verso i partner, un solo hold per slot tra i nostri casi, cancel correlabili (request_id=, slot_id=).
+
+
+def answered_once(rid: str, role: str):
+    """Una sola risposta di ``role`` al partner per ``rid``: offerte o un cancel con il motivo (R:192, mai silenzio)."""
+    def check(b: Bus) -> str | None:
+        got = _cross_answer(b, rid, role)
+        if len(got) != 1:
+            return f"{role} ha risposto {len(got)} volte a {rid} invece di una (R:192)"
+        if act(got[0]) not in ("offer", "cancel") or act(got[0]) == "cancel" and "reason=" not in got[0].text:
+            return f"{role} ha risposto a {rid} senza offerte né cancel col motivo: «{got[0].text[:80]}»"
+    return check
+
+
+def follows_deadline(rid: str, born: datetime, slot: str):
+    """La finestra B della risposta a ``rid`` è quella di mach.calendar.deadline (la regola sta lì, giorni di agenda
+    od ore di calendario; la struttura non la ricalcola): ``slot`` offerto come data nella finestra se inizia prima
+    della scadenza, altrimenti come data rilassata («Entro i tempi della priorità...»)."""
+    def check(b: Bus) -> str | None:
+        end = b.agents[b.ids["hospital"]].mods["mach.calendar"].deadline("B", born)
+        inside = datetime.fromisoformat(b.ledger.slots[slot]["at"]) < end
+        relaxed = any("Entro i tempi della priorità" in m.text for m in _cross_answer(b, rid, "hospital"))
+        if inside == relaxed:
+            return f"{rid}: {slot} {'dentro' if inside else 'oltre'} la scadenza B {end:%a %H:%M}, ma risposta {'rilassata' if relaxed else 'nella finestra'}"
+    return check
+
+
+def crossed(first: str, second: str, req: str):
+    """Il partner manda la richiesta ``second`` mentre la nostra risposta a ``first`` viaggia: nella history la
+    sua riga sta prima di quella risposta (città 21/11, specialista: 2 richieste su 2 così mai risposte)."""
+    def setup(b: Bus) -> None:
+        add, done = b.add, []
+
+        def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+            m = add(sender, to, body, need, conv, kind)
+            if to == FOREIGN and f"request_id={first}" in m.text.split() and not done:
+                done.append(add(FOREIGN, sender, {"text": req.format(rid=second, extra="")}, need))
+                b.log.remove(done[0])
+                b.log.insert(b.log.index(m), done[0])
+                b.queue.append(done[0])
+            return m
+        b.add = adding
+    return setup
+
+
+def fresh_for(seconds: float):
+    """La pagina di world in memoria dell'ospedale vale ``seconds`` invece di 300: con world dopo 3 s, la pagina 2
+    arriva quando la 1 è già vecchia (città 21/11 10:18: pagina 2 sei minuti dopo, richiesta mai risposta)."""
+    def setup(b: Bus) -> None:
+        b.agents[b.ids["hospital"]].mods["facility"]._WORLD_FRESH = seconds
+    return setup
+
+
+def second_confirm(rid: str):
+    """Alle prime offerte dello specialista il partner chiede anche per un secondo caso (``rid``, WALKIN) e riceve gli
+    stessi slot; appena parte l'hold del primo caso conferma lo stesso slot per il secondo (un altro cittadino), con
+    l'hold del primo ancora in volo (città 21/11: uno slot per 3 casi in 1,5 min)."""
+    def setup(b: Bus) -> None:
+        add, fac, asked, done = b.add, b.ids["specialist_care"], [], []
+
+        def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+            m = add(sender, to, body, need, conv, kind)
+            if sender == fac and to == FOREIGN and act(m) == "offer" and not asked:
+                asked.append(add(FOREIGN, fac, {"text": XCARD.format(rid=rid, extra="")}, WALKIN))
+                b.queue.append(asked[0])
+            if sender == fac and to == LEDGER and m.text.startswith("hold ") and not done:
+                slot = fields(m.text)["slot_id"]
+                done.append(add(FOREIGN, fac, {"text": f"confirm offer_id=of-{slot} slot_id={slot} citizen=citizen:T-9 "
+                                                       "consent_ref=cons-Y-1 prescription_number=RX-Y-1"}, WALKIN))
+                b.queue.append(done[0])
+            return m
+        b.add = adding
+    return setup
+
+
+def taken_told(b: Bus) -> str | None:
+    """Il secondo confirm riceve cancel reason=SLOT_TAKEN con lo slot_id (centro dell'altra ASST, EPICA), nessun hold."""
+    got = [m for m in b.log if m.sender == b.ids["specialist_care"] and m.recipient == FOREIGN and m.need_id == WALKIN
+           and act(m) != "offer"]
+    slot = next((fields(m.text)["slot_id"] for m in b.log if m.sender == FOREIGN and m.need_id == WALKIN
+                 and m.text.startswith("confirm")), "")
+    if not got or act(got[0]) != "cancel" or not has(got[0].text, ("reason=SLOT_TAKEN", f"slot_id={slot}")):
+        return f"al secondo confirm su {slot}: «{got[0].text[:90] if got else ''}», atteso cancel reason=SLOT_TAKEN slot_id={slot}"
+
+
+IMPOSTOR_CONFIRM = ("confirm offer_id=of-S-h1-01-10 slot_id=S-h1-01-10 citizen=citizen:T-1 consent_ref=cons-X-1 "
+                    "prescription_number=RX-X-1")
+
+
+def impostor_refused(folder: str, slot: str):
+    """Confirm di un agente a cui ``folder`` non ha mai offerto ``slot``: un solo cancel reason=invalid_offer con lo
+    slot_id, nessun hold sul Ledger, nessun messaggio a un cittadino."""
+    def check(b: Bus) -> str | None:
+        fac = b.ids[folder]
+        got = [m for m in b.log if m.sender == fac and m.recipient == FOREIGN]
+        if len(got) != 1 or act(got[0]) != "cancel" or not has(got[0].text, ("reason=invalid_offer", f"slot_id={slot}")):
+            return f"{folder} al confirm non offerto: {[m.text[:70] for m in got]}, atteso un cancel reason=invalid_offer slot_id={slot}"
+        if any(w["op"] == "hold" and w["by"] == folder for w in b.ledger.writes):
+            return f"{folder} ha mandato un hold per un confirm mai offerto"
+        if any(m.sender == fac and m.recipient.startswith("citizen:") for m in b.log):
+            return f"{folder} ha scritto a un cittadino per un confirm mai offerto"
+    return check
+
+
+def unconsented_confirm(b: Bus) -> None:
+    """Alla prima offerta del consultorio il partner manda un confirm senza consent_ref (prima del suo confirm buono)."""
+    add, fam, done = b.add, b.ids["family_counseling"], []
+
+    def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+        m = add(sender, to, body, need, conv, kind)
+        if sender == fam and to == FOREIGN and act(m) == "offer" and not done:
+            o = parse_offers(m.text)[0]
+            done.append(add(FOREIGN, fam, {"text": f"confirm offer_id={o['offer_id']} slot_id={o['slot_id']} citizen=citizen:T-9"}, need))
+            b.queue.append(done[0])
+        return m
+    b.add = adding
+
+
+def family_cancel_rid(rid: str):
+    """Il confirm del partner senza consent_ref: cancel col motivo e il request_id della richiesta (EPICA)."""
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender == b.ids["family_counseling"] and m.recipient == FOREIGN
+               and "reason=missing_consent_ref" in m.text.split()]
+        if len(got) != 1 or f"request_id={rid}" not in got[0].text.split():
+            return f"consultorio, confirm senza consenso: {[m.text[:80] for m in got]}, atteso un cancel con request_id={rid}"
+    return check
+
+
+FRI = START + timedelta(days=4)  # venerdì 27/11 08:00 di agenda
+XGIN = XFIS.replace("hospital.physiatry", "family_counseling.gynecology").replace("VIS-FIS", "CONS-GIN")
+
+SCENARIOS.update({
+    # B nato venerdì 08:00: la finestra è quella di calendar.deadline (giorni di agenda: fino a martedì, lunedì 10:00
+    # dentro; ore di calendario: fino a domenica, lunedì 10:00 data rilassata). Prima la struttura la ricalcolava da
+    # sé in giorni di calendario. In tutti e due i casi lunedì 10:00 è offerto.
+    "cross_asst_b_venerdi": dict(
+        start=("hospital", XFIS.format(rid="R-60", extra="")), foreign=True, late_days=4,
+        expect=[cross_window("R-60", FRI, FRI + timedelta(days=4, hours=2), must=("S-h1-07-10",)),
+                follows_deadline("R-60", FRI, "S-h1-07-10")]),
+    # Il partner conferma la prima offerta (lang=en: h1) 10 ore di agenda dopo (città: fino a 16 minuti reali):
+    # lo slot è ancora oltre _HOLD_LEAD, quindi l'hold parte, mai un cancel EXPIRED nostro (prima: 18 in 2 ore).
+    "cross_asst_scelta_lenta": dict(
+        start=("hospital", XFIS.format(rid="R-61", extra=" lang=en")), foreign=True, setup=late_confirm(10),
+        expect=[wrote("hold", "un solo margine"), cancel_told(FOREIGN, "EXPIRED", 0)]),
+    # Due richieste incrociate dello stesso partner: la seconda ha la sua risposta anche se nella history
+    # viene prima della nostra risposta alla prima.
+    "specialista_richieste_incrociate": dict(
+        start=("specialist_care", XCARD.format(rid="R-62", extra="")), foreign=True,
+        setup=crossed("R-62", "R-63", XCARD),
+        expect=[answered_once("R-62", "specialist_care"), answered_once("R-63", "specialist_care")]),
+    # Pagina 1 tutta piena: serve la 2, che arriva quando la 1 in memoria è già vecchia. Le due pagine si
+    # chiedono insieme, così arrivano fresche insieme e la richiesta ha la sua risposta.
+    "cross_asst_pagina2_tardiva": dict(
+        start=("hospital", XFIS.format(rid="R-64", extra="")), foreign=True, ledger_turns=True,
+        full_days=3, slow_world=3.0, setup=fresh_for(2.0), expect=[answered_once("R-64", "hospital")]),
+    # Lo stesso slot, offerto a due casi, confermato per il secondo mentre l'hold del primo è in volo: nessun
+    # secondo hold.
+    "specialista_slot_conteso": dict(
+        start=("specialist_care", XCARD.format(rid="R-65", extra="")), foreign=True, slow_writes=1.0,
+        setup=second_confirm("R-67"), expect=[writes("hold", 1, "uno slot, un hold"), taken_told]),
+    # Un agente conferma uno slot che non gli abbiamo mai offerto (impostori in città dalle 10 alle 16): nessun
+    # hold. Il partner a cui l'abbiamo offerto prenota (cross_asst_prenota), il nostro centro sempre (felice_fisiatria).
+    "ospedale_confirm_impostore": dict(start=("hospital", IMPOSTOR_CONFIRM), foreign=True,
+                                       expect=[impostor_refused("hospital", "S-h1-01-10")]),
+    # P2 in città: il confirm del partner al consultorio con i due consensi. L'hold porta quello cross-ASST, il
+    # commit quello della prenotazione (prima: l'hold portava cons-X-1, rifiutato CONSENT_MISSING).
+    "consultorio_consenso_p2": dict(
+        start=("family_counseling", XGIN.format(rid="R-69", extra="")), foreign=True, xconsent=True,
+        expect=[wrote("hold", "P2", consent_ref="xc-X-1"), wrote("commit", "R:194", consent_ref="cons-X-1")]),
+    # Solo il consenso cross-ASST: è un consenso, hold e prenotazione (prima: cancel reason=missing_consent_ref).
+    "consultorio_solo_consenso_cross": dict(
+        start=("family_counseling", XGIN.format(rid="R-70", extra="")), foreign=True, xconsent="only",
+        expect=[wrote("hold", "P2", consent_ref="xc-X-1"), wrote("commit", "R:194")]),
+    # U dal partner, lunedì 08:00: niente a 16 h dentro lo stesso giorno, quindi lun 15:00 (7 h, oltre _HOLD_LEAD),
+    # mai lun 10:00 (prima: nessuna offerta lunedì, solo date rilassate da martedì). Accanto, l'h3 di martedì: l'ospedale
+    # mette sempre un h3 (unico che parla sq), anche oltre la finestra.
+    "cross_asst_urgente_stesso_giorno": dict(
+        start=("hospital", XFIS.replace("priority=B", "priority=U").format(rid="R-71", extra="")), foreign=True,
+        expect=[cross_window("R-71", START + timedelta(hours=6), START + timedelta(days=1, hours=2),
+                             must=("S-h1-00-15",)), wrote("hold", "U stesso giorno", slot_id="S-h1-00-15")]),
+    # Il confirm del partner al consultorio senza consent_ref: il cancel porta il request_id (EPICA).
+    "consultorio_cancel_correlabile": dict(
+        start=("family_counseling", XGIN.format(rid="R-66", extra="")), foreign=True, setup=unconsented_confirm,
+        expect=[family_cancel_rid("R-66")]),
 })
 
 

@@ -38,7 +38,7 @@ def test_after_booking_the_citizen_hears_when_and_how_to_check_in(brain):
     assert len(welcomes) == 1
     text = welcomes[0]
     assert "booking_id=H-9" in text.split()
-    assert "agenda_date=2026-11-16T14:00:00+00:00" in text.split()
+    assert "agenda_date=2026-11-17T09:00:00+00:00" in text.split()  # S-c1 of test_level4.WORLD
     assert "cardiologia" in text and "ospedale" not in text
 
 

@@ -7,7 +7,7 @@ PARTNER = "agent:partnerbook01"
 NOW = "2026-11-16T08:00:00+00:00"  # lunedì, ora di agenda
 WORLD = "\n".join([
     "slots page=1/1 count=3",
-    "slot_id=S-c1 doctor_id=D-s1 facility=F-card procedure=VIS-CARD at=2026-11-16T14:00:00+00:00 day=mon free=1",
+    "slot_id=S-c1 doctor_id=D-s2 facility=F-card procedure=VIS-CARD at=2026-11-17T09:00:00+00:00 day=tue free=1",
     "slot_id=S-c2 doctor_id=D-s2 facility=F-card procedure=VIS-CARD at=2026-11-17T10:00:00+00:00 day=tue free=1",
     "slot_id=S-f1 doctor_id=D-h1 facility=F-osp procedure=VIS-FIS at=2026-11-16T15:00:00+00:00 day=mon free=1",
 ])
@@ -45,6 +45,12 @@ def _request(procedure: str = "VIS-CARD", rid: str = "x-1"):
 
 def _to_partner(fake: FakeCity) -> list[str]:
     return [t for to, t in fake.sent if to == PARTNER]
+
+
+def _offered() -> list:
+    """Our offer of S-c1 to the partner in this case: only an offered slot is confirmed by an agent."""
+    return [msg(AGENT, "offer offer_id=of-S-c1 slot_id=S-c1 doctor_id=D-s2 procedure=VIS-CARD request_id=x-1",
+                recipient=PARTNER, need_id="N-X")]
 
 
 def test_cardiology_request_gets_our_offers_once(brain):
@@ -85,7 +91,7 @@ def test_repeated_request_is_answered_once(brain):
 
 
 def test_partner_confirm_holds_with_their_consent_and_returns_receipt(brain):
-    fake = FakeCity([], on_post=_ledger(WORLD))
+    fake = FakeCity(_offered(), on_post=_ledger(WORLD))
     run(brain, fake, msg(
         PARTNER,
         "confirm offer_id=of-S-c1 slot_id=S-c1 citizen=citizen:T9 consent_ref=cons-x-cross "
@@ -98,7 +104,7 @@ def test_partner_confirm_holds_with_their_consent_and_returns_receipt(brain):
 
 
 def test_partner_confirm_without_consent_is_cancelled_never_held(brain):
-    fake = FakeCity([], on_post=_ledger(WORLD))
+    fake = FakeCity(_offered(), on_post=_ledger(WORLD))
     run(brain, fake, msg(PARTNER, "confirm offer_id=of-S-c1 slot_id=S-c1 citizen=citizen:T9", need_id="N-X"))
     assert not any(to == LEDGER and t.startswith("hold") for to, t in fake.sent)
     assert _to_partner(fake) and _to_partner(fake)[0].startswith("cancel offer_id=of-S-c1 reason=missing_consent_ref")
