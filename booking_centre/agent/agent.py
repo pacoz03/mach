@@ -88,6 +88,9 @@ _PAGE_FRESH = 240.0
 # Slots a facility lost on the Ledger (taken, expired), or that we asked a facility to book:
 # never offered again by this process.
 _GONE: set[str] = set()
+# need_id -> we already tried escalate.emergency on it (sent or refused): never twice (R:701).
+# ponytail: per pod and lost on restart; the history check still covers a sent one.
+_ESCALATED: set[str] = set()
 _GONE_CODES = frozenset({"NO_CAPACITY", "EXPIRED", "SLOT_TAKEN"})
 # Doctor key (the last segment of doctor_id) -> languages, gender, days. ``*`` is the ASST's
 # rare language. The Ledger's slot line names the doctor; it does not repeat this table.
@@ -381,8 +384,11 @@ async def main(need: Need, city: City) -> None:
         or red_flag(text)
     ):
         chat = await city.history(need_id=message.need_id) if message.need_id else []
-        if not protocol.we(chat, city.agent_id, "reason=red_flag", to=message.sender, word="escalate.emergency"):
+        if message.need_id not in _ESCALATED and not protocol.we(
+            chat, city.agent_id, "reason=red_flag", to=message.sender, word="escalate.emergency"
+        ):
             await _say(city, message.sender, ESCALATION)
+            _ESCALATED.add(message.need_id)
         return
     if clinical(text):
         raise OutOfScope()
@@ -410,8 +416,11 @@ async def main(need: Need, city: City) -> None:
     flagged = next((row.sender for row in chat if row.sender.startswith("citizen:") and red_flag(row.text)), None)
     if message.need_id and flagged:
         # A red flag whose own turn has not run yet (a Ledger answer's turn came first): it still
-        # goes first, before anything this turn would say.
-        await _say(city, flagged, ESCALATION)
+        # goes first, before anything this turn would say. Once per case: a TARGET_NOT_VISIBLE
+        # leaves no row in the history, and sending it again breaks R:701.
+        if message.need_id not in _ESCALATED:
+            await _say(city, flagged, ESCALATION)
+            _ESCALATED.add(message.need_id)
         return
     await _desk(city, message, chat)
 
