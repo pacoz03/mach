@@ -1537,11 +1537,16 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
 
 
 def _report_turn(message: Message) -> bool:
-    """A specialist turn that can touch the check-in note, the consent ask or the report."""
+    """A specialist turn that can touch the receipt, the check-in note or the report.
+
+    The confirm turn and the Ledger's held/committed push ran at once and both sent the
+    receipt (live, 000169): they take the same per-case lock as the check-in and the report."""
 
     if message.sender == LEDGER:
-        return first_word(message.text) in {"checked_in", "reported"}
-    return message.sender.startswith("citizen:")
+        return first_word(message.text) in {"held", "committed", "checked_in", "reported"}
+    if message.sender.startswith("citizen:"):
+        return True
+    return "confirm" in words(message.text) or message.type == "confirm"
 
 
 async def _facility(
@@ -2844,12 +2849,32 @@ async def _on_checkin(city: City, message: Message, chat: list[Message], *, repo
     if not booking_id or not citizen:
         return
     token = f"booking_id={booking_id}"
+    asked = False
     if not _we(chat, city.agent_id, token, to=LEDGER, word="checkin"):
         if not await _say(city, LEDGER, f"checkin booking_id={booking_id} citizen={citizen}"):
             return
+        asked = True
     found = await _await_line(city, message.need_id, chat, "checked_in", token, op="checkin")
     if found is None:
         _LOG.info("care.checkin.missing", extra={"need_id": (message.need_id or "")[:48]})
+        if reports and asked:
+            # Specialist: the live Ledger confirms a check-in in ~34 s; never leave the citizen
+            # in silence (review: passive). No checkin act word: it is not honoured yet. The
+            # checked_in push brings the confirmation and the report.
+            await _say(
+                city,
+                citizen,
+                f"{token} "
+                + (
+                    "Hello, thank you for coming: I am registering your arrival for your "
+                    "cardiology visit. The register takes a few moments, I will confirm as soon "
+                    "as it answers; you need do nothing else."
+                    if _en(chat)
+                    else "Buongiorno, grazie di essere qui: sto registrando il suo arrivo per la "
+                    "visita di cardiologia. Il registro impiega qualche istante, le confermo appena "
+                    "risponde; non deve fare altro."
+                ),
+            )
         return
     reply, fresh = found
     if first_word(reply.text) == "checked_in":
@@ -2886,13 +2911,7 @@ async def _on_checked_in(
     token = f"booking_id={booking_id}"
     if citizen and not _we(chat, city.agent_id, token, to=citizen, word="checkin"):
         if reports:
-            note = (
-                "Thank you, your arrival is registered. After the visit the specialist files "
-                "the visit summary and I will let you know straight away."
-                if en
-                else "Grazie, il suo arrivo è registrato. Dopo la visita lo specialista archivia "
-                "il referto e la avviso subito."
-            )
+            note = _specialist_arrival(chat, city.agent_id, booking_id, citizen, en)
         else:
             note = (
                 "Thank you, your arrival is registered: there is nothing else you need to do. "
@@ -2914,6 +2933,53 @@ async def _on_checked_in(
     # report_missing every time. R:210 allows filing it unshared, which is never an
     # over-disclosure: file the report now, in the check-in turn, without waiting.
     await _file_report(city, message, chat, booking_id, citizen, "")
+
+
+# A worry the citizen voices about the visit: acknowledged in plain words, never answered with
+# clinical content (no_clinical_advice).
+_WORRIED = re.compile(
+    r"\b(?:ansia|ansios[oa]|preoccupat[oa]|preoccupazion\w*|paura|agitat[oa]|nervos[oa]|"
+    r"spaventat[oa]|teso|tesa|worried|anxious|nervous|scared|afraid)\b",
+    re.IGNORECASE,
+)
+
+
+def _specialist_arrival(
+    chat: list[Message], agent: str, booking_id: str, citizen: str, en: bool
+) -> str:
+    """The specialist's check-in confirmation (review: acknowledge the person, be specific,
+    a clear next step): the cardiology visit and its time from the Ledger, a voiced worry
+    acknowledged, what happens next. Only facts we or the Ledger wrote."""
+
+    entry = _bookings(chat, agent).get(booking_id, {})
+    slot = entry.get("slot") or _hold_slot(chat, agent, booking_id)
+    at = _when(_slot_facts(chat, agent, slot).get("at", "")) if slot else None
+    said = " ".join(row.text for row in chat if row.sender == citizen)
+    worried = bool(_WORRIED.search(said))
+    if en:
+        when = f" on {_in_words(at, True)}" if at else ""
+        care = (
+            " I understand you may feel worried: you are in good hands now and the specialist "
+            "will see you shortly."
+            if worried
+            else ""
+        )
+        return (
+            f"Thank you, your arrival for the cardiology visit{when} is registered.{care} Right "
+            "after the visit I file the visit summary and write to you here, so you always "
+            "know where things stand."
+        )
+    when = f" di {_in_words(at, False)}" if at else ""
+    care = (
+        " Capisco la sua preoccupazione: ora è in buone mani e lo specialista la riceverà a "
+        "breve."
+        if worried
+        else ""
+    )
+    return (
+        f"Grazie, il suo arrivo per la visita di cardiologia{when} è registrato.{care} Subito "
+        "dopo la visita archivio il referto e le scrivo qui, così sa sempre a che punto è."
+    )
 
 
 def _reported(chat: list[Message], agent: str, booking_id: str) -> bool:

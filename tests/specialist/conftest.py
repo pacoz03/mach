@@ -50,7 +50,9 @@ class FakeCity:
         on_post: Callable[[str, str, FakeCity], None] | None = None,
         fail: Callable[[str, str], BaseException | None] | None = None,
         yields: bool = False,
+        auto: tuple[str, ...] = ("report", "checkin"),
     ) -> None:
+        self.auto = auto  # Ledger ops answered at once (a slow live Ledger: leave one out)
         self.chat = chat
         self.agent_id = agent_id
         self.on_post = on_post
@@ -75,7 +77,7 @@ class FakeCity:
         self.chat.append(row)
         if to == LEDGER:
             for head, reply in (("report", "reported"), ("checkin", "checked_in")):
-                if text.startswith(f"{head} booking_id="):
+                if head in self.auto and text.startswith(f"{head} booking_id="):
                     booking = text.split()[1]
                     self.chat.append(msg(LEDGER, f"{reply} {booking}", recipient=self.agent_id))
         if self.on_post is not None:
