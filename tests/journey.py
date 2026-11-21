@@ -152,7 +152,11 @@ class Ledger:
               "checkin": FACILITIES, "report": {"specialist_care"}}
 
     def __init__(self, sc: dict, ids: dict[str, str]) -> None:
-        self.now = START + timedelta(days=sc.get("late_days", 0))  # late_days: slot tutti passati
+        # late_days: slot tutti passati; late_hours: l'agenda è già avanti di qualche ora
+        self.now = START + timedelta(days=sc.get("late_days", 0), hours=sc.get("late_hours", 0))
+        # sc["agenda_lag"]: secondi reali di età della lettura di agenda quando arriva (città 21/11:
+        # una risposta di 26 minuti prima, cioè 26 ore di agenda): agenda_now ed epoch_real indietro.
+        self.agenda_lag = sc.get("agenda_lag", 0)
         self.rules = {"P1": "off", "P2": "off", "P3": "off", **sc.get("rules", {})}
         self.folder = {v: k for k, v in ids.items()}
         self.slots = {s["slot_id"]: s for s in make_slots(ids)}
@@ -164,7 +168,9 @@ class Ledger:
         self.refuse_holds = sc.get("refuse_holds", 0)
         self.refuse_code = sc.get("refuse_code", "SLOT_TAKEN")  # codice dell'hold rifiutato
         self.refuse_checkin = sc.get("refuse_checkin")
-        self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
+        # slot prima di qui: pieni. Senza late_hours: world elenca ancora gli slot di stamattina
+        # come liberi (città 21/11: from=data di oggi), come quelli già passati.
+        self.full = START + timedelta(days=sc.get("late_days", 0) + sc.get("full_days", 0))
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
         self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
@@ -292,9 +298,10 @@ class Ledger:
                 return f"{REPLY['refused'].format(op=op, code='NOT_FOUND')} prescription_number={f.get('prescription_number', '')}"
             return REPLY["prescription"].format(
                 **r, state="expired" if self.expired(r["prescription_number"]) else "issued")
-        if op == "agenda":
-            return REPLY["agenda"].format(now=self.now.isoformat(), day=DAYS[self.now.weekday()],
-                                          real=datetime.now(UTC).isoformat())
+        if op == "agenda":  # rate 60: agenda_lag secondi reali = agenda_lag minuti di agenda
+            at = self.now - timedelta(minutes=self.agenda_lag)
+            return REPLY["agenda"].format(now=at.isoformat(), day=DAYS[at.weekday()],
+                                          real=(datetime.now(UTC) - timedelta(seconds=self.agenda_lag)).isoformat())
         if op == "rules":
             return REPLY["rules"].format(**self.rules)
         if op == "world":
@@ -452,18 +459,21 @@ class Llm:
 
 
 class Citizen:
-    def __init__(self, bus: "Bus", sc: dict) -> None:
-        self.bus, self.sc = bus, sc
+    def __init__(self, bus: "Bus", sc: dict, cid: str = CIT, need: str = NEED) -> None:
+        self.bus, self.sc, self.cid, self.need = bus, sc, cid, need
         self.rx, self.chosen, self.receipts, self.waited = "", None, set(), False
+        self.refused = False  # sc["refuse_first"]: il primo messaggio di offerte è già stato rifiutato
         self.pending: tuple[str, str] | None = None  # check-in rimandato dopo la domanda d'orario
 
-    def say(self, to: str, text: str, kind: str = "chat", need: str = NEED, **body: str) -> None:
+    def say(self, to: str, text: str, kind: str = "chat", need: str | None = None, **body: str) -> None:
         if to not in self.bus.down:  # ponytail: il cittadino non riprova verso una struttura giù
-            self.bus.queue.append(self.bus.add(CIT, to, body or {"text": text}, need=need, kind=kind))
+            self.bus.queue.append(self.bus.add(self.cid, to, body or {"text": text}, need=need or self.need, kind=kind))
 
     def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
         """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
         if self.sc.get("ledger_cancel") or self.sc.get("booking_cancel"):  # annullata prima della visita (Bus.run)
+            return
+        if self.cid != CIT:  # sc["others"]: gli altri cittadini prenotano soltanto
             return
         text = f"checkin booking_id={booking_id} ledger_ref={ledger_ref}"
         mode = self.sc.get("checkin", "testo")
@@ -501,8 +511,14 @@ class Citizen:
             offers = [offer for offer in parse_offers(m.text) if offer.get("waiting_list") != "true"]
             if not offers:
                 return
+            if self.sc.get("refuse_first") and not self.refused and self.cid == CIT:
+                # Città 21/11 02:40: un cancel per offerta, tutti nello stesso istante (reason=past).
+                self.refused = True
+                for o in offers:
+                    self.say(m.sender, f"cancel offer_id={o['offer_id']} reason={self.sc['refuse_first']}")
+                return
             o = self.chosen = offers[min(self.sc.get("pick", 0), len(offers) - 1)]
-            text = f"confirm offer_id={o['offer_id']} consent_ref=cons-{NEED}-booking"
+            text = f"confirm offer_id={o['offer_id']} consent_ref=cons-{self.need}-booking"
             if self.sc.get("inject"):
                 seen = {x.get("slot_id") for x in offers}
                 bad = next((s for s in reversed(b.ledger.slots.values())
@@ -521,7 +537,7 @@ class Citizen:
             elif purpose == "prescription_renewal":
                 self.say(b.ids["gp"], f"Mi serve il rinnovo della ricetta. prescription_number={self.rx}")
             elif kind == "consent" or purpose in ("report_sharing", "cross_asst"):
-                ref = f"cons-{NEED}-{purpose}"
+                ref = f"cons-{self.need}-{purpose}"
                 b.ledger.consents.add((purpose, ref))
                 self.say(m.sender, f"consent purpose={purpose} consent_ref={ref}")
             else:
@@ -539,7 +555,18 @@ class Bus:
         self.ids = {a.folder: a.id for a in self.agents.values()}
         self.down = {self.ids[f] for f in sc.get("down", ())}
         self.ledger = Ledger(sc, self.ids)
+        self.ledger_rtt = sc.get("ledger_rtt", 0)
         self.citizen = Citizen(self, sc)
+        # sc["others"]: altri cittadini con una ricetta già emessa (VIS-FIS, B) che scrivono al
+        # centro nello stesso momento e confermano la loro prima offerta (città 21/11 02:40:
+        # lo stesso slot offerto a 5 cittadini).
+        self.others: dict[str, Citizen] = {}
+        for k in range(2, 2 + sc.get("others", 0)):
+            c = Citizen(self, sc, f"citizen:T-{k}", f"N-2026-11-23-{k:04d}")
+            c.rx = f"RX-O{k}"
+            self.ledger.rx[c.rx] = dict(prescription_number=c.rx, patient=c.cid, procedure="VIS-FIS",
+                                        priority="B", issued=self.ledger.now)
+            self.others[c.cid] = c
         self.log: list[Message] = []
         self.queue: deque[Message] = deque()
         self.turn_of: dict[str, int] = {}
@@ -582,8 +609,12 @@ class Bus:
         if (lang and sender in (self.ids["booking_centre"], FOREIGN) and to == self.ids["hospital"]
                 and str(body.get("text", "")).startswith("confirm")):
             body = {**body, "text": f"{re.sub(r' ?lang=\S+', '', body['text'])} lang={lang}"}
+        # sent_at come nella history vera; sc["ledger_rtt"]: le risposte del Ledger portano un
+        # sent_at spostato in avanti di tanti secondi (città 21/11 03:00: mediana ~270 s), senza
+        # far aspettare davvero la suite.
+        at = datetime.now(UTC) + timedelta(seconds=self.ledger_rtt if sender == LEDGER else 0)
         m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
-                    need_id=need, conversation_id=conv, body=body)
+                    need_id=need, conversation_id=conv, body=body, sent_at=at.isoformat())
         self.log.append(m)
         self.turn_of[m.msg_id] = self.turn
         self.stamp[m.msg_id] = time.monotonic()
@@ -644,6 +675,8 @@ class Bus:
                 self.add(hosp, LEDGER, {"text": text}, old)
             for text in (real_page(self.ledger), self.ledger.read("agenda", {})):
                 self.queue.append(self.add(LEDGER, hosp, {"text": text}, old))
+        for c in self.others.values():
+            c.say(self.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={c.rx} lang=it")
         cancel = (("ledger", sc["ledger_cancel"]), ("hospital", sc.get("after_cancel", ORARIO))) if "ledger_cancel" in sc else ()
         cancel += (("booking", sc["booking_cancel"]),) if "booking_cancel" in sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
@@ -680,6 +713,8 @@ class Bus:
                     self.window(m)
                 if m.recipient == CIT:
                     self.citizen.react(m)
+                elif m.recipient in self.others:
+                    self.others[m.recipient].react(m)
                 elif m.recipient == FOREIGN:
                     self.foreign(m)
                 elif m.recipient in self.agents and (m.recipient not in self.down or m.msg_id in self.inflight):
@@ -768,7 +803,7 @@ def general(b: Bus) -> list[str]:
             errs.append(f"{b.name(m.sender)}: booking.receipt booking_id={f.get('booking_id')} senza commit prima (R:241)")
         if m.recipient == FOREIGN and kind == "offer":  # offerte cross-ASST (R:192)
             offered.update(o.get("slot_id") for o in parse_offers(m.text))
-        if m.recipient != CIT:
+        if not m.recipient.startswith("citizen:"):  # CIT e gli altri cittadini (sc["others"])
             continue
         if f.get("booking_id") and f["booking_id"] not in L.holds:
             errs.append(f"{b.name(m.sender)}: booking_id={f['booking_id']} inventato al cittadino")
@@ -1747,6 +1782,60 @@ def gp_answers_at_once(within: float, *subs: str):
     return check
 
 
+# --- Centro prenotazioni con il Ledger lento (città 21/11 02:37-02:45: risposte in ~270 s, agenda
+# a 60x): orologio fermo all'ultima lettura, stesso slot a più cittadini, silenzio dopo un rifiuto.
+
+
+def offers_ahead(hours: float):
+    """Ogni offerta del centro a un cittadino cade almeno ``hours`` ore di agenda dopo l'ora vera
+    del Ledger: è ancora futura quando il suo hold arriva (città: 10 rifiuti su 14 reason=past)."""
+    def check(b: Bus) -> str | None:
+        bc, horizon = b.ids["booking_centre"], b.ledger.now + timedelta(hours=hours)
+        for m in b.log:
+            if m.sender == bc and m.recipient.startswith("citizen:") and act(m) == "offer":
+                for o in parse_offers(m.text):
+                    at = o.get("agenda_date")
+                    if at and datetime.fromisoformat(at) <= horizon:
+                        return (f"offerto {o.get('slot_id')} per le {at[5:16]} con il Ledger alle "
+                                f"{b.ledger.now.isoformat()[5:16]}: serve almeno +{hours} h di agenda")
+    return check
+
+
+def distinct_offers(b: Bus) -> str | None:
+    """Due cittadini vivi non ricevono lo stesso slot finché la finestra ne ha altri (città: lo
+    stesso slot a 5 cittadini, poi NO_CAPACITY ed EXPIRED)."""
+    bc, first = b.ids["booking_centre"], {}
+    for m in b.log:
+        if m.sender == bc and m.recipient.startswith("citizen:") and act(m) == "offer" and m.recipient not in first:
+            first[m.recipient] = {o.get("slot_id") for o in parse_offers(m.text)}
+    if len(first) < 2:
+        return f"offerte a {len(first)} cittadini invece di almeno 2"
+    seen: dict[str, str] = {}
+    for cid, slots in first.items():
+        for slot in slots:
+            if slot in seen:
+                return f"{slot} offerto sia a {seen[slot]} sia a {cid}"
+            seen[slot] = cid
+
+
+def answered_fast(seconds: float):
+    """Dopo i rifiuti del cittadino il centro risponde con offerte nuove nello stesso turno, senza
+    aspettare il Ledger (città: 4-5 minuti di silenzio dopo cancel reason=past)."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        last = max((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == bc and act(m) == "cancel"),
+                   default=None)
+        if last is None:
+            return "il cittadino non ha rifiutato nessuna offerta"
+        reply = next((m for m in b.log[last + 1:] if m.sender == bc and m.recipient == CIT), None)
+        if reply is None:
+            return "booking_centre muto dopo i rifiuti del cittadino (R:248)"
+        took = b.stamp[reply.msg_id] - b.stamp[b.log[last].msg_id]
+        if took >= seconds or act(reply) != "offer":
+            return f"dopo i rifiuti «{reply.text[:50]}» dopo {took:.1f} s, attese offerte entro {seconds} s"
+    return check
+
+
 SCENARIOS.update({
     # Il Ledger risponde a prescribe dopo 3 s (città 21/11: minuti). Solo con --ledger-turns: in
     # città la risposta apre un turno suo, ed è lì che parte la ricetta.
@@ -1756,6 +1845,19 @@ SCENARIOS.update({
     "gp_ledger_lento_en": dict(start=("gp", PREF_EN), handoff=True, slow_prescribe=3.0, ledger_turns=True, expect=[
         gp_answers_at_once(1.5, "back pain", "physiatry visit", "booking centre", "Monday"),
         gp_prescription(), handoff_tokens("lang=en", "doctor_lang=en", "days=mon"), handed_over]),
+    # 1. La lettura di agenda arriva vecchia di 4 minuti reali (4 ore di agenda): il Ledger è a
+    # lunedì 12:00, la risposta dice 08:00. Le 10:00 di lunedì sono già passate.
+    "booking_orologio_vecchio": dict(start=BACK, late_hours=4, agenda_lag=240, expect=[
+        offers_ahead(1), wrote("checkin", "R:234")]),
+    # 1. Ledger a ~270 s per giro: l'hold di un'offerta a meno di 4,5 ore di agenda arriva tardi.
+    "booking_margine_ledger_lento": dict(start=BACK, ledger_rtt=270, expect=[
+        offers_ahead(4.5), wrote("checkin", "R:234")]),
+    # 2. Due cittadini allo stesso momento: slot diversi a ciascuno, nessun hold rifiutato.
+    "booking_slot_condivisi": dict(start=BACK, others=1, expect=[distinct_offers, wrote("checkin", "R:234")]),
+    # 3. Il cittadino rifiuta le tre offerte (reason=past); agenda dal Ledger dopo 8 s: la risposta
+    # arriva subito dagli slot già letti, non dopo il Ledger.
+    "booking_rifiuto_subito": dict(start=BACK, handoff=True, refuse_first="past", slow_agenda=8.0, expect=[
+        answered_fast(2.0), wrote("checkin", "R:234")]),
 })
 
 
