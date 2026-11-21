@@ -4,8 +4,14 @@
 # Uso: bash tests/check.sh [-k <testo>]    (-k passa a tests/journey.py)
 set -u
 cd "$(dirname "$0")/.."
-K=()
-if [ "${1:-}" = "-k" ]; then K=(-k "$2"); fi
+K=() CHAOS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -k) K=(-k "$2"); shift 2 ;;
+    --chaos) CHAOS=1; shift ;;   # anche tests/chaos.py (~4 min, ~6 GB RAM): all'integrazione di codice degli agenti
+    *) shift ;;
+  esac
+done
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/check.XXXXXX")
 PY=~/.local/share/uv/tools/city-cli/bin/python
 AGENTS="booking_centre gp hospital specialist_care family_counseling"   # come shared/sync.sh
@@ -26,6 +32,7 @@ run pytest-consultorio       "${PYTEST[@]}" tests/consultorio
 run pytest-family_counseling "${PYTEST[@]}" family_counseling/tests
 run pytest-unit              "${PYTEST[@]}" tests/unit
 for a in $AGENTS; do run "card-$a" city card validate "$a"; done
+[ "$CHAOS" = 1 ] && run chaos "$PY" -B tests/chaos.py
 wait
 
 fails=()
@@ -46,6 +53,10 @@ done
 for a in $AGENTS; do
   if ok "card-$a"; then echo "card $a OK"; else echo "card $a FAIL"; fails+=("card-$a"); fi
 done
+if [ "$CHAOS" = 1 ]; then
+  tail -3 "$LOG/chaos.log" | sed 's/^/chaos: /'
+  ok chaos || fails+=(chaos)
+fi
 files=0 diff=()
 for a in $AGENTS; do files=$((files+1)); cmp -s shared/tools.py "$a/agent/tools.py" || diff+=("$a/agent/tools.py"); done
 for a in $FACILITIES; do files=$((files+1)); cmp -s shared/facility.py "$a/agent/facility.py" || diff+=("$a/agent/facility.py"); done
