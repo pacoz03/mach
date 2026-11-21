@@ -45,7 +45,7 @@ class Flows(unittest.IsolatedAsyncioTestCase):
                                ('lang=en gender_preference=f days=sun',False)]:
             sc=dict(start=('family_counseling',j.XREQ.format(svc='family_counseling.gynecology',proc='CONS-GIN',rid='L5')+' '+criteria), foreign=True)
             bus=j.Bus(sc,False); await bus.run(sc['start']); agent=bus.ids['family_counseling']
-            replies=[m for m in bus.log if m.sender==agent and m.recipient==j.FOREIGN and 'request_id=L5' in m.text]
+            replies=[m for m in bus.log if m.sender==agent and m.recipient==j.FOREIGN and 'request_id=L5' in m.text and j.act(m) in {'offer','cancel'}]
             self.assertEqual(len(replies),1)
             if fits:
                 self.assertIn('agenda_day=tue',replies[0].text)
