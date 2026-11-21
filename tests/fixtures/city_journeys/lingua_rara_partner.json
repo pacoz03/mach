@@ -1,0 +1,345 @@
+{
+ "class": "Lingua che nessun nostro medico parla: S solo presso un'ASST partner",
+ "summary": "Il token lang= (sw, es, tl, ...) è diverso dalla lingua in cui il cittadino scrive (inglese); il centro offre medici italiani, il cittadino rifiuta tutto con reason=lang, il centro tace. S = 3-52.",
+ "count": 22,
+ "roles": [
+  "booking_centre"
+ ],
+ "v1": {
+  "applies": "si",
+  "where": "booking_centre/agent/agent.py:744-747 (_try_partners solo se nessun nostro medico parla la lingua), :1445-1535 (giro dai partner); in città v1 (2130005) ha mandato prima il redirect e poi 'sto chiedendo ai partner' senza seguito"
+ },
+ "covered_by": "arena partner_lingua_rara (4), partner_giu (2), regola_p2_consenso (4); journey cross_asst_lingua_sq e cross_asst_lingua_en",
+ "cases": [
+  {
+   "id": "lr-1",
+   "need_id": "N-TEST-lr-01",
+   "source": {
+    "level": 5,
+    "state": "failed",
+    "score": 1,
+    "S_size": 3,
+    "S_pref_size": 3,
+    "era": {
+     "gp": [
+      "v2"
+     ],
+     "booking_centre": [
+      "v2"
+     ]
+    },
+    "first_utc": "04:46:29"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-03T19:19",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription",
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKELR01",
+      "procedure=VIS-FIS",
+      "priority=B"
+     ],
+     "text": "Thank you for telling me about your back pain: I am taking care of it right away. prescription prescription_number=prescription_number-FAKELR01 procedure=VIS-FIS priority=B I have prepared your prescription for a physiatry visit, priority B: it is due within 2 days. I am passing it to our booking centre: just send them the number and they will propose the times; tell them the language, days or doctor you prefer. Bring your health card and an ID to the visit. If it expires before you manage to book, send me the number and I will renew it; if you feel worse or something new comes up, write to me",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 448,
+     "agenda": "2026-12-04T02:47",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "I've got back pain. I need a doctor who speaks my language, please."
+    },
+    {
+     "t": 537,
+     "agenda": "2026-12-04T04:17",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430",
+      "slot_id=W01QQQ-asst-gorla-h2-20261209-1430",
+      "doctor_id=asst-gorla-h2",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-09T14:30:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-09T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKELR01",
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261210-1430",
+      "slot_id=W01QQQ-asst-gorla-h3-20261210-1430"
+     ],
+     "text": "I'm sorry: within the deadline of priority B there are no suitable free places in our ASST. These are the first dates available right after, and meanwhile I am also asking the partner ASSTs. offer offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430 slot_id=W01QQQ-asst-gorla-h2-20261209-1430 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-09T14:30:00.000Z agenda_day=wed expiry=2026-12-09T14:30:00.000Z priority=B prescription_number=prescription_number-FAKELR01\noffer offer_id=of-W01QQQ-asst-gorla-h3-20261210-1430 slot_id=W01QQQ-asst-gorla-h3-20261210-1430 doc",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 538,
+     "agenda": "2026-12-04T04:17",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=sw",
+      "prescription_number=prescription_number-FAKELR01",
+      "service_type=hospital.physiatry"
+     ],
+     "text": "Back pain, I need a visit with a doctor who speaks English, quickly. need.request area={'district':_8} lang=sw prescription_number=prescription_number-FAKELR01 service_type=hospital.physiatry"
+    },
+    {
+     "t": 1020,
+     "agenda": "2026-12-04T12:19",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430",
+      "reason=lang"
+     ],
+     "text": "No thanks, I need an English-speaking doctor. cancel offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430 reason=lang"
+    },
+    {
+     "t": 1020,
+     "agenda": "2026-12-04T12:19",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261210-1430",
+      "reason=lang"
+     ],
+     "text": "My back hurts and I need a doctor who speaks my language. I can't take this one. cancel offer_id=of-W01QQQ-asst-gorla-h3-20261210-1430 reason=lang"
+    },
+    {
+     "t": 1020,
+     "agenda": "2026-12-04T12:19",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261210-1600",
+      "reason=lang"
+     ],
+     "text": "I can't make it. I need an English-speaking doctor for my back. cancel offer_id=of-W01QQQ-asst-gorla-h2-20261210-1600 reason=lang"
+    }
+   ],
+   "expected": "lang=sw nel token: offerte di un partner con un medico che parla sw (S = 3), oppure l'alternativa rilassata detta come tale; dopo tre reason=lang, mai silenzio."
+  },
+  {
+   "id": "lr-2",
+   "need_id": "N-TEST-lr-02",
+   "source": {
+    "level": 5,
+    "state": "failed",
+    "score": 1,
+    "S_size": 5,
+    "S_pref_size": 5,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:07:58"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-02T04:48",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Quick, back pain here. I need a doctor who speaks English."
+    },
+    {
+     "t": 244,
+     "agenda": "2026-12-02T08:52",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription",
+      "prescription",
+      "prescription",
+      "confirm"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKELR02",
+      "procedure=VIS-FIS",
+      "priority=B"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKELR02 procedure=VIS-FIS priority=B Thank you for telling me about your back pain. I have prepared your prescription for a physiatry visit, number prescription_number-FAKELR02, priority B: the visit is due within 2 days. Next step: you do not need to repeat anything. I have already sent the prescription to our booking centre, together with your preferences (a doctor who speaks English): it will write to you with the available slots, and you only need to reply to confirm the one that suits you. If you have a preference for days or the docto",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 548,
+     "agenda": "2026-12-02T13:56",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [],
+     "text": "I cannot give you reliable information on this. You can ask: your GP (symptoms, prescriptions and renewals); the hospital (physiatry visits and check-in); the specialist (cardiology visits and reports); the family counselling centre (gynaecology, direct access without a prescription).",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 792,
+     "agenda": "2026-12-02T18:00",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Our own facilities have no slot that fits your request right now: I am asking the partner facilities of the other health districts, without sharing your data. I will write as soon as I have an answer.",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 1510,
+     "agenda": "2026-12-03T05:58",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=es",
+      "prescription_number=prescription_number-FAKELR02",
+      "service_type=hospital.physiatry"
+     ],
+     "text": "Back pain, I need a doctor who speaks English. Can I book soon? need.request area={'district':_8} lang=es prescription_number=prescription_number-FAKELR02 service_type=hospital.physiatry"
+    },
+    {
+     "t": 1992,
+     "agenda": "2026-12-03T14:00",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030",
+      "slot_id=W01QQQ-asst-gorla-h1-20261207-1030",
+      "doctor_id=asst-gorla-h1",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-07T10:30:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-07T10:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKELR02",
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261208-1030",
+      "slot_id=W01QQQ-asst-gorla-h3-20261208-1030",
+      "doctor_id=asst-gorla-h3"
+     ],
+     "text": "I'm sorry: no doctor in our ASST speaks the language you asked for. I am asking the partner ASSTs; meanwhile these are the first dates with Italian-speaking doctors. offer offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030 slot_id=W01QQQ-asst-gorla-h1-20261207-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-07T10:30:00.000Z agenda_day=mon expiry=2026-12-07T10:30:00.000Z priority=B prescription_number=prescription_number-FAKELR02\noffer offer_id=of-W01QQQ-asst-gorla-h3-20261208-1030 slot_id=W01QQQ-asst-gorla-h3-20261208-1030 doctor_id=asst-gorla-h3 faci",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2465,
+     "agenda": "2026-12-03T21:53",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030",
+      "reason=lang"
+     ],
+     "text": "Sorry, this doesn't work: I need an English-speaking doctor. cancel offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030 reason=lang"
+    },
+    {
+     "t": 2465,
+     "agenda": "2026-12-03T21:53",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261208-1030",
+      "reason=lang"
+     ],
+     "text": "Thanks, but I still need a doctor who speaks English. cancel offer_id=of-W01QQQ-asst-gorla-h3-20261208-1030 reason=lang"
+    },
+    {
+     "t": 2465,
+     "agenda": "2026-12-03T21:53",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600",
+      "reason=lang"
+     ],
+     "text": "I need a doctor who speaks my language, so I have to say no. cancel offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600 reason=lang"
+    }
+   ],
+   "expected": "lang=es nel token (S = 5): nessun redirect, il giro dai partner porta un'offerta o un esito detto al cittadino."
+  }
+ ]
+}

@@ -1,0 +1,767 @@
+{
+ "class": "Lo stesso slot offerto a molti cittadini insieme",
+ "summary": "Su 561 slot offerti, 394 sono stati offerti anche a un altro cittadino entro 10 minuti (v1 90, v2 304); uno a 23 cittadini. Alle 04:10 v1 ha offerto s1-20261202-1430 come prima scelta a 9 cittadini in 4 s; tre lo confermano e nessuno è prenotato.",
+ "count": 394,
+ "roles": [
+  "booking_centre",
+  "family_counseling"
+ ],
+ "v1": {
+  "applies": "si",
+  "where": "booking_centre/agent/agent.py:905-912 (_OFFERED aggiornato solo dopo city.say: i turni contemporanei non si vedono), :1718-1736 (_spread ripiega sugli slot condivisi), :917-921 (_shared)"
+ },
+ "covered_by": "calendario D1 (claim debole all'offerta, parcheggiato); arena slot_condivisi (others=2) e journey booking_slot_condivisi non hanno turni contemporanei",
+ "cases": [
+  {
+   "id": "ss-1",
+   "need_id": "N-TEST-ss-01",
+   "source": {
+    "level": 4,
+    "state": "failed",
+    "score": 1,
+    "S_size": 208,
+    "S_pref_size": 208,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:02:47"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-01T23:37",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "raga, ultimamente il cuore mi batte forte, lowkey mi sento strano."
+    },
+    {
+     "t": 221,
+     "agenda": "2026-12-02T03:18",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKESS01",
+      "procedure=VIS-CARD",
+      "priority=B"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKESS01 procedure=VIS-CARD priority=B Grazie per avermi descritto le palpitazioni. Le ho preparato la ricetta per una visita cardiologica, numero prescription_number-FAKESS01, priorità B: la visita va fatta entro 2 giorni. Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro centro prenotazioni: le scriverà con gli orari disponibili e a lei basterà rispondere per confermare quello che le va meglio. Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica pure al centro prenotazioni. Conservi il nu",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 458,
+     "agenda": "2026-12-02T07:15",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "slot_id=W01QQQ-asst-gorla-s1-20261202-1430",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-02T14:30:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-02T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS01",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-0900",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T09:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T09:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescri"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 slot_id=W01QQQ-asst-gorla-s1-20261202-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-02T14:30:00.000Z agenda_day=wed expiry=2026-12-02T14:30:00.000Z priority=B prescription_number=prescription_number-FAKESS01\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900 slot_id=W01QQQ-asst-gorla-s2-20261203-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T09:00:00.000Z agenda_day=thu expiry=2026-12-03T09:00:00.000Z priority=B prescription_number=prescri",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 461,
+     "agenda": "2026-12-02T07:19",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKESS01",
+      "service_type=specialist_care.cardiology"
+     ],
+     "text": "raga, il cuore a mille, mi servirebbe un appuntamento per un controllo, boh. need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKESS01 service_type=specialist_care.cardiology"
+    },
+    {
+     "t": 729,
+     "agenda": "2026-12-02T11:46",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-1200",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-1200",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T12:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS01",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-1430",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-1430",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T14:30:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescri"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-s2-20261203-1200 slot_id=W01QQQ-asst-gorla-s2-20261203-1200 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T12:00:00.000Z agenda_day=thu expiry=2026-12-03T12:00:00.000Z priority=B prescription_number=prescription_number-FAKESS01\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261203-1430 slot_id=W01QQQ-asst-gorla-s2-20261203-1430 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T14:30:00.000Z agenda_day=thu expiry=2026-12-03T14:30:00.000Z priority=B prescription_number=prescri",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 2023,
+     "agenda": "2026-12-03T09:21",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Grazie, ho ricevuto la sua scelta: sto completando la prenotazione con la struttura. Le mando la ricevuta appena il registro conferma, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2519,
+     "agenda": "2026-12-03T17:36",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "reason=facility_cancelled"
+     ],
+     "text": "Mi dispiace: la struttura mi segnala che questo posto non è più disponibile. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 reason=facility_cancelled Non deve fare nulla: le mando subito altre opzioni.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2519,
+     "agenda": "2026-12-03T17:37",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "slot_id=W01QQQ-asst-gorla-s1-20261207-1030",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-07T10:30:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-07T10:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS01",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030",
+      "slot_id=W01QQQ-asst-gorla-s2-20261208-1030"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 slot_id=W01QQQ-asst-gorla-s1-20261207-1030 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-07T10:30:00.000Z agenda_day=mon expiry=2026-12-07T10:30:00.000Z priority=B prescription_number=prescription_number-FAKESS01\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030 slot_id=W01QQQ-asst-gorla-s2-20261208-1030 d",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2640,
+     "agenda": "2026-12-03T19:38",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-ss-01-booking",
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-ss-01-booking offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+    },
+    {
+     "t": 3007,
+     "agenda": "2026-12-04T01:45",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "reason=deadline"
+     ],
+     "text": "raga il cuore batte forte ma quella data no, salto. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 reason=deadline"
+    },
+    {
+     "t": 3007,
+     "agenda": "2026-12-04T01:45",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030",
+      "reason=deadline"
+     ],
+     "text": "tipo questa data non fa per me. cancel offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030 reason=deadline"
+    },
+    {
+     "t": 3007,
+     "agenda": "2026-12-04T01:45",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261209-1030",
+      "reason=deadline"
+     ],
+     "text": "boh, preferisco non venire. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261209-1030 reason=deadline"
+    }
+   ],
+   "expected": "Insieme a ss-2 e ss-3: tre cittadini nello stesso secondo non ricevono lo stesso slot come prima offerta; ciascuno ha almeno una scelta che nessun altro tiene."
+  },
+  {
+   "id": "ss-2",
+   "need_id": "N-TEST-ss-02",
+   "source": {
+    "level": 5,
+    "state": "failed",
+    "score": 1,
+    "S_size": 208,
+    "S_pref_size": 208,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:02:47"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-01T23:37",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "ciao doc, ultimamente il cuore mi batte a mille, vorrei un controllo fr."
+    },
+    {
+     "t": 221,
+     "agenda": "2026-12-02T03:19",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKESS02",
+      "procedure=VIS-CARD",
+      "priority=B"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKESS02 procedure=VIS-CARD priority=B Grazie per avermi descritto le palpitazioni. Le ho preparato la ricetta per una visita cardiologica, numero prescription_number-FAKESS02, priorità B: la visita va fatta entro 2 giorni. Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro centro prenotazioni: le scriverà con gli orari disponibili e a lei basterà rispondere per confermare quello che le va meglio. Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica pure al centro prenotazioni. Conservi il nu",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 458,
+     "agenda": "2026-12-02T07:15",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "slot_id=W01QQQ-asst-gorla-s1-20261202-1430",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-02T14:30:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-02T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS02",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-0900",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T09:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T09:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescri"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 slot_id=W01QQQ-asst-gorla-s1-20261202-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-02T14:30:00.000Z agenda_day=wed expiry=2026-12-02T14:30:00.000Z priority=B prescription_number=prescription_number-FAKESS02\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900 slot_id=W01QQQ-asst-gorla-s2-20261203-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T09:00:00.000Z agenda_day=thu expiry=2026-12-03T09:00:00.000Z priority=B prescription_number=prescri",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 462,
+     "agenda": "2026-12-02T07:20",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKESS02",
+      "service_type=specialist_care.cardiology"
+     ],
+     "text": "raga, il cuore fa cose strane, vorrei un check. need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKESS02 service_type=specialist_care.cardiology"
+    },
+    {
+     "t": 2023,
+     "agenda": "2026-12-03T09:20",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Grazie, ho ricevuto la sua scelta: sto completando la prenotazione con la struttura. Le mando la ricevuta appena il registro conferma, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2506,
+     "agenda": "2026-12-03T17:23",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "reason=facility_cancelled"
+     ],
+     "text": "Mi dispiace: la struttura mi segnala che questo posto non è più disponibile. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 reason=facility_cancelled Non deve fare nulla: le mando subito altre opzioni.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2507,
+     "agenda": "2026-12-03T17:25",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "slot_id=W01QQQ-asst-gorla-s1-20261207-1030",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-07T10:30:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-07T10:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS02",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200",
+      "slot_id=W01QQQ-asst-gorla-s2-20261215-1200"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 slot_id=W01QQQ-asst-gorla-s1-20261207-1030 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-07T10:30:00.000Z agenda_day=mon expiry=2026-12-07T10:30:00.000Z priority=B prescription_number=prescription_number-FAKESS02\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200 slot_id=W01QQQ-asst-gorla-s2-20261215-1200 d",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2642,
+     "agenda": "2026-12-03T19:39",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-ss-02-booking",
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-ss-02-booking offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+    },
+    {
+     "t": 2999,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "reason=deadline"
+     ],
+     "text": "raga tocca annullare, quella data non riesco. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 reason=deadline"
+    },
+    {
+     "t": 2999,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200",
+      "reason=deadline"
+     ],
+     "text": "scusate ma quella data non me la sento. cancel offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200 reason=deadline"
+    },
+    {
+     "t": 2999,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200",
+      "reason=deadline"
+     ],
+     "text": "boh, per 'sto giro non ci sono. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200 reason=deadline"
+    }
+   ],
+   "expected": "Vedi ss-1."
+  },
+  {
+   "id": "ss-3",
+   "need_id": "N-TEST-ss-03",
+   "source": {
+    "level": 4,
+    "state": "failed",
+    "score": 1,
+    "S_size": 208,
+    "S_pref_size": 208,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:02:47"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-01T23:37",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Ciao dottore, il cuore mi batte veloce, ma preferisco non dire troppo."
+    },
+    {
+     "t": 221,
+     "agenda": "2026-12-02T03:19",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKESS03",
+      "procedure=VIS-CARD",
+      "priority=B"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKESS03 procedure=VIS-CARD priority=B Grazie per avermi descritto le palpitazioni. Le ho preparato la ricetta per una visita cardiologica, numero prescription_number-FAKESS03, priorità B: la visita va fatta entro 2 giorni. Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro centro prenotazioni: le scriverà con gli orari disponibili e a lei basterà rispondere per confermare quello che le va meglio. Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica pure al centro prenotazioni. Conservi il nu",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 460,
+     "agenda": "2026-12-02T07:18",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "slot_id=W01QQQ-asst-gorla-s1-20261202-1430",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-02T14:30:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-02T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS03",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-0900",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T09:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T09:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescri"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 slot_id=W01QQQ-asst-gorla-s1-20261202-1430 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-02T14:30:00.000Z agenda_day=wed expiry=2026-12-02T14:30:00.000Z priority=B prescription_number=prescription_number-FAKESS03\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261203-0900 slot_id=W01QQQ-asst-gorla-s2-20261203-0900 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T09:00:00.000Z agenda_day=thu expiry=2026-12-03T09:00:00.000Z priority=B prescription_number=prescri",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 464,
+     "agenda": "2026-12-02T07:21",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKESS03",
+      "service_type=specialist_care.cardiology"
+     ],
+     "text": "Buongiorno, ho la ricetta. Posso prenotare una visita per il cuore? need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKESS03 service_type=specialist_care.cardiology"
+    },
+    {
+     "t": 729,
+     "agenda": "2026-12-02T11:46",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-1200",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-1200",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T12:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS03",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261203-1430",
+      "slot_id=W01QQQ-asst-gorla-s2-20261203-1430",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-03T14:30:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-03T14:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescri"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-s2-20261203-1200 slot_id=W01QQQ-asst-gorla-s2-20261203-1200 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T12:00:00.000Z agenda_day=thu expiry=2026-12-03T12:00:00.000Z priority=B prescription_number=prescription_number-FAKESS03\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261203-1430 slot_id=W01QQQ-asst-gorla-s2-20261203-1430 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-03T14:30:00.000Z agenda_day=thu expiry=2026-12-03T14:30:00.000Z priority=B prescription_number=prescri",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 2024,
+     "agenda": "2026-12-03T09:21",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Grazie, ho ricevuto la sua scelta: sto completando la prenotazione con la struttura. Le mando la ricevuta appena il registro conferma, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2514,
+     "agenda": "2026-12-03T17:31",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430",
+      "reason=facility_cancelled"
+     ],
+     "text": "Mi dispiace: la struttura mi segnala che questo posto non è più disponibile. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430 reason=facility_cancelled Non deve fare nulla: le mando subito altre opzioni.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2514,
+     "agenda": "2026-12-03T17:32",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "slot_id=W01QQQ-asst-gorla-s1-20261207-1030",
+      "doctor_id=asst-gorla-s1",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-07T10:30:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-07T10:30:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKESS03",
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030",
+      "slot_id=W01QQQ-asst-gorla-s2-20261208-1030"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 slot_id=W01QQQ-asst-gorla-s1-20261207-1030 doctor_id=asst-gorla-s1 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-07T10:30:00.000Z agenda_day=mon expiry=2026-12-07T10:30:00.000Z priority=B prescription_number=prescription_number-FAKESS03\noffer offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030 slot_id=W01QQQ-asst-gorla-s2-20261208-1030 d",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2644,
+     "agenda": "2026-12-03T19:41",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-ss-03-booking",
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-ss-03-booking offer_id=of-W01QQQ-asst-gorla-s1-20261202-1430"
+    },
+    {
+     "t": 3000,
+     "agenda": "2026-12-04T01:38",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030",
+      "reason=deadline"
+     ],
+     "text": "Mi dispiace, devo dire di no, non posso venire. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261207-1030 reason=deadline"
+    },
+    {
+     "t": 3000,
+     "agenda": "2026-12-04T01:38",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030",
+      "reason=deadline"
+     ],
+     "text": "Non credo di poter venire. cancel offer_id=of-W01QQQ-asst-gorla-s2-20261208-1030 reason=deadline"
+    },
+    {
+     "t": 3000,
+     "agenda": "2026-12-04T01:38",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261209-1030",
+      "reason=deadline"
+     ],
+     "text": "Non credo di poter venire, mi dispiace. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261209-1030 reason=deadline"
+    }
+   ],
+   "expected": "Vedi ss-1."
+  }
+ ]
+}

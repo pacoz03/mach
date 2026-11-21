@@ -1,0 +1,522 @@
+{
+ "class": "Il centro (v1) risponde 'Su questo non posso darle un'informazione sicura' a chi ha una ricetta valida",
+ "summary": "Solo v1, 04:14-04:21: 20 percorsi ricevono tools.redirect() dal centro, in 11 come primo messaggio; S fino a 520. Poi v2 offre tardi e il percorso fallisce.",
+ "count": 20,
+ "roles": [
+  "booking_centre"
+ ],
+ "v1": {
+  "applies": "si",
+  "where": "booking_centre/agent/agent.py:743 (taken |= _GONE, globale e quasi sempre non vuoto) e :770-774 (taken and not replacing and not fallback -> redirect e return, senza leggere la pagina 2); :408-418 (_tell con again -> redirect anche dopo un data.response senza numero)"
+ },
+ "covered_by": "nessuna correzione in corso, nessuno scenario: nessun test vieta il redirect al centro",
+ "cases": [
+  {
+   "id": "rd-1",
+   "need_id": "N-TEST-rd-01",
+   "source": {
+    "level": 7,
+    "state": "failed",
+    "score": 1,
+    "S_size": 130,
+    "S_pref_size": 130,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:10:02"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-02T06:52",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Eccomi di nuovo! Il ginocchio mi fa male e posso venire solo in pochi giorni precisi: spero riusciate a trovarmi un posto."
+    },
+    {
+     "t": 266,
+     "agenda": "2026-12-02T11:18",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKERD01",
+      "procedure=VIS-FIS",
+      "priority=D"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKERD01 procedure=VIS-FIS priority=D Grazie per avermi descritto il dolore al ginocchio. Le ho preparato la ricetta per una visita fisiatrica, numero prescription_number-FAKERD01, priorità D: la visita va fatta entro 5 giorni. Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro centro prenotazioni: le scriverà con gli orari disponibili e a lei basterà rispondere per confermare quello che le va meglio. Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica pure al centro prenotazioni. Conservi i",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 562,
+     "agenda": "2026-12-02T16:14",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Su questo non posso darle un'informazione sicura. Può rivolgersi a: medico di base (sintomi, ricette e rinnovi); ospedale (visite di fisiatria e check-in); specialista (visite di cardiologia e referti); consultorio (ginecologia, accesso diretto senza ricetta).",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 2058,
+     "agenda": "2026-12-03T17:10",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030",
+      "slot_id=W01QQQ-asst-gorla-h1-20261207-1030",
+      "doctor_id=asst-gorla-h1",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-07T10:30:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-07T10:30:00.000Z",
+      "priority=D",
+      "prescription_number=prescription_number-FAKERD01"
+     ],
+     "text": "Buongiorno, sono il centro prenotazioni della sua ASST: il suo medico di base mi ha passato la ricetta per una visita fisiatrica (priorità D, da fare entro 5 giorni) e ho già cercato i posti per lei. offer offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030 slot_id=W01QQQ-asst-gorla-h1-20261207-1030 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-07T10:30:00.000Z agenda_day=mon expiry=2026-12-07T10:30:00.000Z priority=D prescription_number=prescription_number-FAKERD01\n 1) lunedì 07/12 alle 10:30 con una dottoressa. Mi indichi il numero dell'opzione che pref",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2484,
+     "agenda": "2026-12-04T00:16",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKERD01",
+      "service_type=hospital.physiatry"
+     ],
+     "text": "Il ginocchio fa di nuovo i capricci: mi serve una visita, ma ho solo alcuni giorni liberi. need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKERD01 service_type=hospital.physiatry"
+    },
+    {
+     "t": 2541,
+     "agenda": "2026-12-04T01:13",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030",
+      "reason=gender"
+     ],
+     "text": "Con queste attese e il ginocchio che fa male, non so se riusciremo a vederci. cancel offer_id=of-W01QQQ-asst-gorla-h1-20261207-1030 reason=gender"
+    }
+   ],
+   "expected": "Al passaggio del gp (D, S = 130) il primo messaggio del centro è un'offerta, cercando anche nelle pagine successive di world; mai tools.redirect() a chi ha una ricetta valida."
+  },
+  {
+   "id": "rd-2",
+   "need_id": "N-TEST-rd-02",
+   "source": {
+    "level": 5,
+    "state": "failed",
+    "score": 1,
+    "S_size": 520,
+    "S_pref_size": 520,
+    "era": {
+     "gp": [
+      "v1"
+     ],
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:02:45"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-01T23:35",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Ciao, ho mal di schiena da alcune settimane. Vorrei vedere il medico."
+    },
+    {
+     "t": 222,
+     "agenda": "2026-12-02T03:17",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKERD02",
+      "procedure=VIS-FIS",
+      "priority=B"
+     ],
+     "text": "prescription prescription_number=prescription_number-FAKERD02 procedure=VIS-FIS priority=B Grazie per avermi descritto il suo mal di schiena. Le ho preparato la ricetta per una visita fisiatrica, numero prescription_number-FAKERD02, priorità B: la visita va fatta entro 2 giorni. Passo successivo: non deve ripetere nulla. Ho già inviato la ricetta al nostro centro prenotazioni: le scriverà con gli orari disponibili e a lei basterà rispondere per confermare quello che le va meglio. Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica pure al centro prenotazioni. Conservi il",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 455,
+     "agenda": "2026-12-02T07:10",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200",
+      "slot_id=W01QQQ-asst-gorla-h1-20261202-1200",
+      "doctor_id=asst-gorla-h1",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-02T12:00:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-02T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKERD02",
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261202-1200",
+      "slot_id=W01QQQ-asst-gorla-h2-20261202-1200",
+      "doctor_id=asst-gorla-h2",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-02T12:00:00.000Z",
+      "agenda_day=wed",
+      "expiry=2026-12-02T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescript"
+     ],
+     "text": "offer offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200 slot_id=W01QQQ-asst-gorla-h1-20261202-1200 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-02T12:00:00.000Z agenda_day=wed expiry=2026-12-02T12:00:00.000Z priority=B prescription_number=prescription_number-FAKERD02\noffer offer_id=of-W01QQQ-asst-gorla-h2-20261202-1200 slot_id=W01QQQ-asst-gorla-h2-20261202-1200 doctor_id=asst-gorla-h2 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-02T12:00:00.000Z agenda_day=wed expiry=2026-12-02T12:00:00.000Z priority=B prescription_number=prescript",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 456,
+     "agenda": "2026-12-02T07:11",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKERD02",
+      "service_type=hospital.physiatry"
+     ],
+     "text": "Ciao, la schiena mi fa male da un po', vorrei fare una visita per favore. need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKERD02 service_type=hospital.physiatry"
+    },
+    {
+     "t": 725,
+     "agenda": "2026-12-02T11:40",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Su questo non posso darle un'informazione sicura. Può rivolgersi a: medico di base (sintomi, ricette e rinnovi); ospedale (visite di fisiatria e check-in); specialista (visite di cardiologia e referti); consultorio (ginecologia, accesso diretto senza ricetta).",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 2025,
+     "agenda": "2026-12-03T09:20",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Grazie, ho ricevuto la sua scelta: sto completando la prenotazione con la struttura. Le mando la ricevuta appena il registro conferma, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2516,
+     "agenda": "2026-12-03T17:31",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200",
+      "reason=facility_cancelled"
+     ],
+     "text": "Mi dispiace: la struttura mi segnala che questo posto non è più disponibile. cancel offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200 reason=facility_cancelled Non deve fare nulla: le mando subito altre opzioni.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2517,
+     "agenda": "2026-12-03T17:32",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261210-1200",
+      "slot_id=W01QQQ-asst-gorla-h3-20261210-1200",
+      "doctor_id=asst-gorla-h3",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-10T12:00:00.000Z",
+      "agenda_day=thu",
+      "expiry=2026-12-10T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKERD02",
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261210-1430",
+      "slot_id=W01QQQ-asst-gorla-h2-20261210-1430"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-h3-20261210-1200 slot_id=W01QQQ-asst-gorla-h3-20261210-1200 doctor_id=asst-gorla-h3 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-10T12:00:00.000Z agenda_day=thu expiry=2026-12-10T12:00:00.000Z priority=B prescription_number=prescription_number-FAKERD02\noffer offer_id=of-W01QQQ-asst-gorla-h2-20261210-1430 slot_id=W01QQQ-asst-gorla-h2-20261210-1430 do",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2643,
+     "agenda": "2026-12-03T19:38",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-rd-02-booking",
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-rd-02-booking offer_id=of-W01QQQ-asst-gorla-h1-20261202-1200"
+    },
+    {
+     "t": 3002,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261210-1200",
+      "reason=deadline"
+     ],
+     "text": "Quel giorno non posso venire, mi dispiace. cancel offer_id=of-W01QQQ-asst-gorla-h3-20261210-1200 reason=deadline"
+    },
+    {
+     "t": 3002,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261210-1430",
+      "reason=deadline"
+     ],
+     "text": "No grazie, a quell'ora non riesco. Cerco altro. cancel offer_id=of-W01QQQ-asst-gorla-h2-20261210-1430 reason=deadline"
+    },
+    {
+     "t": 3002,
+     "agenda": "2026-12-04T01:37",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261211-1030",
+      "reason=deadline"
+     ],
+     "text": "Grazie, ma questo appuntamento non va bene per me. cancel offer_id=of-W01QQQ-asst-gorla-h2-20261211-1030 reason=deadline"
+    }
+   ],
+   "expected": "Il need.request del cittadino incrocia le offerte del passaggio (1 s dopo): il centro ricorda le offerte vive o ne manda di nuove, mai il redirect."
+  },
+  {
+   "id": "rd-3",
+   "need_id": "N-TEST-rd-03",
+   "source": {
+    "level": 8,
+    "state": "failed",
+    "score": -1,
+    "S_size": 520,
+    "S_pref_size": 520,
+    "era": {
+     "booking_centre": [
+      "v1",
+      "v2"
+     ]
+    },
+    "first_utc": "04:08:06"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-02T04:56",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "data.request"
+     ],
+     "tokens": [
+      "purpose=booking",
+      "fields=prescription_number"
+     ],
+     "text": "data.request purpose=booking fields=prescription_number Volentieri, la aiuto io a prenotare. Ha già la ricetta del medico di base? Se sì, mi indichi il numero e cerco subito un posto; se non l'ha ancora, il suo medico di base può prescriverla e poi prenotiamo insieme.",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 242,
+     "agenda": "2026-12-02T08:58",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "data.response"
+     ],
+     "tokens": [
+      "purpose=booking"
+     ],
+     "text": "data.response purpose=booking"
+    },
+    {
+     "t": 548,
+     "agenda": "2026-12-02T14:04",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Su questo non posso darle un'informazione sicura. Può rivolgersi a: medico di base (sintomi, ricette e rinnovi); ospedale (visite di fisiatria e check-in); specialista (visite di cardiologia e referti); consultorio (ginecologia, accesso diretto senza ricetta).",
+     "status": "wip",
+     "version": "v1"
+    },
+    {
+     "t": 973,
+     "agenda": "2026-12-02T21:09",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "data.request"
+     ],
+     "tokens": [
+      "purpose=booking",
+      "fields=prescription_number"
+     ],
+     "text": "Buongiorno, la aiuto volentieri a prenotare. data.request purpose=booking fields=prescription_number Mi indica il numero della ricetta del medico di base? Appena ce l'ho cerco subito i posti; se non l'ha ancora, il suo medico di base può prepararla in pochi minuti.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 1352,
+     "agenda": "2026-12-03T03:28",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "data.response"
+     ],
+     "tokens": [
+      "purpose=booking"
+     ],
+     "text": "data.response purpose=booking"
+    },
+    {
+     "t": 1690,
+     "agenda": "2026-12-03T09:06",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [],
+     "tokens": [],
+     "text": "Gentili operatori, vorrei fissare una visita ortopedica per un dolore alla schiena che non passa."
+    },
+    {
+     "t": 1698,
+     "agenda": "2026-12-03T09:14",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "data.request"
+     ],
+     "tokens": [
+      "purpose=booking",
+      "fields=prescription_number"
+     ],
+     "text": "Buongiorno, la aiuto volentieri a prenotare. data.request purpose=booking fields=prescription_number Mi indica il numero della ricetta del medico di base? Appena ce l'ho cerco subito i posti; se non l'ha ancora, il suo medico di base può prepararla in pochi minuti.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2236,
+     "agenda": "2026-12-03T18:12",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "data.response"
+     ],
+     "tokens": [
+      "purpose=booking"
+     ],
+     "text": "data.response purpose=booking"
+    }
+   ],
+   "expected": "Cittadino senza ricetta (data.response senza numero): il centro spiega che serve la ricetta del medico di base e come averla, una volta; S = 520 era raggiungibile solo passando dal gp. Mai il redirect generico."
+  }
+ ]
+}

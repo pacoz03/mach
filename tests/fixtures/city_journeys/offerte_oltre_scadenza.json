@@ -1,0 +1,343 @@
+{
+ "class": "Solo offerte oltre la scadenza di priorità, poi silenzio",
+ "summary": "Con S non vuoto il centro scrive 'entro la scadenza B non ci sono posti' e offre date successive; il cittadino rifiuta tutto con reason=deadline e il centro non risponde più: wrong_outcome -1 (0 se S vuoto).",
+ "count": 23,
+ "roles": [
+  "booking_centre"
+ ],
+ "v1": {
+  "applies": "in parte",
+  "where": "v2/core.py:756-762 (margine fino a 40 h) è di v2. In v1 il margine è al massimo 11 h (booking_centre/agent/agent.py:1956-1959) e dopo reason=deadline si passa alla lista d'attesa (:815-842), ma la scadenza è born + giorni di calendario (:1786), non giorni feriali"
+ },
+ "covered_by": "calendario D4; arena insieme_vuoto e partner_finestra_piena (1 punto su v1)",
+ "cases": [
+  {
+   "id": "os-1",
+   "need_id": "N-TEST-os-01",
+   "source": {
+    "level": 7,
+    "state": "failed",
+    "score": 1,
+    "S_size": 130,
+    "S_pref_size": 130,
+    "era": {
+     "gp": [
+      "v2"
+     ],
+     "booking_centre": [
+      "v2"
+     ]
+    },
+    "first_utc": "05:02:48"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-04T11:38",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKEOS01",
+      "procedure=VIS-FIS",
+      "priority=B"
+     ],
+     "text": "Grazie per avermi descritto il suo mal di schiena: me ne occupo subito. prescription prescription_number=prescription_number-FAKEOS01 procedure=VIS-FIS priority=B Le ho preparato la ricetta per una visita fisiatrica, priorità B: va fatta entro 2 giorni. La sto passando al nostro centro prenotazioni: le basta scrivergli il numero della ricetta e le proporrà gli orari; gli dica pure la lingua, i giorni o il medico che preferisce. Alla visita porti la tessera sanitaria e un documento. Se la ricetta scade prima di prenotare, mi scriva il numero e gliela rinnovo io; se si sente peggio o compare un ",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 444,
+     "agenda": "2026-12-04T19:02",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Buongiorno, è da settimane che ho mal di schiena: avreste un posticino per una visita prima che metta radici in sala d'attesa?"
+    },
+    {
+     "t": 455,
+     "agenda": "2026-12-04T19:13",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600",
+      "slot_id=W01QQQ-asst-gorla-h1-20261208-1600",
+      "doctor_id=asst-gorla-h1",
+      "facility=agent:m6py14a1ej77",
+      "procedure=VIS-FIS",
+      "agenda_date=2026-12-08T16:00:00.000Z",
+      "agenda_day=tue",
+      "expiry=2026-12-08T16:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKEOS01",
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261208-1600",
+      "slot_id=W01QQQ-asst-gorla-h3-20261208-1600"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600 slot_id=W01QQQ-asst-gorla-h1-20261208-1600 doctor_id=asst-gorla-h1 facility=agent:m6py14a1ej77 procedure=VIS-FIS agenda_date=2026-12-08T16:00:00.000Z agenda_day=tue expiry=2026-12-08T16:00:00.000Z priority=B prescription_number=prescription_number-FAKEOS01\noffer offer_id=of-W01QQQ-asst-gorla-h3-20261208-1600 slot_id=W01QQQ-asst-gorla-h3-20261208-1600 do",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 751,
+     "agenda": "2026-12-07T00:08",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKEOS01",
+      "service_type=hospital.physiatry"
+     ],
+     "text": "Buongiorno, non vorrei disturbare, ma se per una visita ci vuole un mutuo la mia schiena aspetterà, no? need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKEOS01 service_type=hospital.physiatry"
+    },
+    {
+     "t": 858,
+     "agenda": "2026-12-07T01:55",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600",
+      "reason=deadline"
+     ],
+     "text": "Con questo mal di schiena che non passa, la data proposta non mi va bene. cancel offer_id=of-W01QQQ-asst-gorla-h1-20261208-1600 reason=deadline"
+    },
+    {
+     "t": 858,
+     "agenda": "2026-12-07T01:55",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h3-20261208-1600",
+      "reason=deadline"
+     ],
+     "text": "La mia schiena non può aspettare così tanto: questa volta rinuncio. cancel offer_id=of-W01QQQ-asst-gorla-h3-20261208-1600 reason=deadline"
+    },
+    {
+     "t": 858,
+     "agenda": "2026-12-07T01:55",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430",
+      "reason=deadline"
+     ],
+     "text": "Per la schiena non posso aspettare fino ad allora, passo. cancel offer_id=of-W01QQQ-asst-gorla-h2-20261209-1430 reason=deadline"
+    }
+   ],
+   "expected": "S = 130: un'offerta entro la scadenza B ancora raggiungibile. Dopo tre reason=deadline, una risposta nello stesso turno (altre date entro la scadenza o lista d'attesa), mai silenzio."
+  },
+  {
+   "id": "os-2",
+   "need_id": "N-TEST-os-02",
+   "source": {
+    "level": 4,
+    "state": "failed",
+    "score": 1,
+    "S_size": 130,
+    "S_pref_size": 130,
+    "era": {
+     "gp": [
+      "v2"
+     ],
+     "booking_centre": [
+      "v2"
+     ]
+    },
+    "first_utc": "04:48:25"
+   },
+   "rubric_lost": [
+    {
+     "row": "citizen.booking_centre.wrong_outcome",
+     "points": -1,
+     "role": "booking_centre",
+     "reason": "no_booking"
+    }
+   ],
+   "rubric_kept": [
+    {
+     "row": "citizen.gp.protocol_match",
+     "points": 2,
+     "role": "gp"
+    }
+   ],
+   "ledger_facts": [],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-03T21:15",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKEOS02",
+      "procedure=VIS-CARD",
+      "priority=B"
+     ],
+     "text": "Grazie per avermi descritto le palpitazioni: me ne occupo subito. prescription prescription_number=prescription_number-FAKEOS02 procedure=VIS-CARD priority=B Le ho preparato la ricetta per una visita cardiologica, priorità B: va fatta entro 2 giorni. La sto passando al nostro centro prenotazioni: le basta scrivergli il numero della ricetta e le proporrà gli orari; gli dica pure la lingua, i giorni o il medico che preferisce. Alla visita porti la tessera sanitaria e un documento. Se la ricetta scade prima di prenotare, mi scriva il numero e gliela rinnovo io; se si sente peggio o compare un dis",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 494,
+     "agenda": "2026-12-04T05:30",
+     "from": "citizen",
+     "to": "gp",
+     "acts": [],
+     "tokens": [],
+     "text": "Buongiorno, il cuore che batte forte ormai è un'abitudine, come le attese lunghe. Spero si capisca senza troppi dati."
+    },
+    {
+     "t": 582,
+     "agenda": "2026-12-04T06:58",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Mi dispiace: nella nostra ASST non c'è al momento un posto adatto alla sua visita cardiologica con i requisiti che mi ha indicato. Ho già chiesto alle strutture partner delle altre ASST, senza condividere i suoi dati: le scrivo appena una ha un posto adatto. Non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 583,
+     "agenda": "2026-12-04T06:59",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "need.request"
+     ],
+     "tokens": [
+      "area={'district':_8}",
+      "lang=it",
+      "prescription_number=prescription_number-FAKEOS02",
+      "service_type=specialist_care.cardiology"
+     ],
+     "text": "Cuore a mille e prenotazione chissà quando. Che tempismo. need.request area={'district':_8} lang=it prescription_number=prescription_number-FAKEOS02 service_type=specialist_care.cardiology"
+    },
+    {
+     "t": 944,
+     "agenda": "2026-12-04T13:00",
+     "from": "gp",
+     "to": "citizen",
+     "acts": [
+      "prescription"
+     ],
+     "tokens": [
+      "prescription_number=prescription_number-FAKEOS02",
+      "procedure=VIS-CARD",
+      "priority=B"
+     ],
+     "text": "Sono qui, nessun problema. prescription prescription_number=prescription_number-FAKEOS02 procedure=VIS-CARD priority=B La sua ricetta per una visita cardiologica è registrata e il nostro centro prenotazioni l'ha già ricevuta: gli scriva il numero e le proporrà gli orari. Se la ricetta scade o compare un disturbo nuovo, mi scriva e ci penso io.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 1026,
+     "agenda": "2026-12-04T14:22",
+     "from": "booking_centre",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200",
+      "slot_id=W01QQQ-asst-gorla-s2-20261215-1200",
+      "doctor_id=asst-gorla-s2",
+      "facility=agent:h6krzxx6es83",
+      "procedure=VIS-CARD",
+      "agenda_date=2026-12-15T12:00:00.000Z",
+      "agenda_day=tue",
+      "expiry=2026-12-15T12:00:00.000Z",
+      "priority=B",
+      "prescription_number=prescription_number-FAKEOS02",
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200",
+      "slot_id=W01QQQ-asst-gorla-s1-20261216-1200"
+     ],
+     "text": "Mi dispiace: entro la scadenza della priorità B nella nostra ASST non ci sono posti liberi adatti. Queste sono le prime date disponibili subito dopo, e intanto chiedo anche alle ASST partner. offer offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200 slot_id=W01QQQ-asst-gorla-s2-20261215-1200 doctor_id=asst-gorla-s2 facility=agent:h6krzxx6es83 procedure=VIS-CARD agenda_date=2026-12-15T12:00:00.000Z agenda_day=tue expiry=2026-12-15T12:00:00.000Z priority=B prescription_number=prescription_number-FAKEOS02\noffer offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200 slot_id=W01QQQ-asst-gorla-s1-20261216-1200 d",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 1476,
+     "agenda": "2026-12-04T21:52",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200",
+      "reason=deadline"
+     ],
+     "text": "Grazie, ma col cuore che corre aspettare così tanto non mi aiuta. cancel offer_id=of-W01QQQ-asst-gorla-s2-20261215-1200 reason=deadline"
+    },
+    {
+     "t": 1476,
+     "agenda": "2026-12-04T21:52",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200",
+      "reason=deadline"
+     ],
+     "text": "Non posso accettare questo appuntamento, il cuore batte troppo forte. cancel offer_id=of-W01QQQ-asst-gorla-s1-20261216-1200 reason=deadline"
+    },
+    {
+     "t": 1476,
+     "agenda": "2026-12-04T21:52",
+     "from": "citizen",
+     "to": "booking_centre",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-s2-20261217-1200",
+      "reason=deadline"
+     ],
+     "text": "Grazie, ma aspettare fino a quella data non va bene per me. cancel offer_id=of-W01QQQ-asst-gorla-s2-20261217-1200 reason=deadline"
+    }
+   ],
+   "expected": "Prima del 'nessun posto adatto' non serve un giro di 7 minuti: offerte entro la scadenza B subito. Dopo i rifiuti per scadenza, mai silenzio."
+  }
+ ]
+}

@@ -1,0 +1,356 @@
+{
+ "class": "Consultorio: stesso slot a due cittadini, due cancel per la stessa offerta, confirm senza risposta",
+ "summary": "Alle 04:30:59 il consultorio (v2) offre c1-20261204-1030 a due cittadini; poi manda due cancel per la stessa offerta (reason=slot_expired e reason=NO_CAPACITY) e lascia confirm senza risposta fino alla chiusura.",
+ "count": 11,
+ "roles": [
+  "family_counseling"
+ ],
+ "v1": {
+  "applies": "da verificare",
+  "where": "shared/facility.py:2858-2945 (_on_refused: un cancel per ogni rifiuto del Ledger, senza dedup per offer_id)"
+ },
+ "covered_by": "G (cancel DUPLICATE) se riguarda il cancel doppio; calendario D1 per lo slot condiviso; arena consultorio e consultorio_prosa senza concorrenza",
+ "cases": [
+  {
+   "id": "fc-1",
+   "need_id": "N-TEST-fc-01",
+   "source": {
+    "level": 4,
+    "state": "open",
+    "score": 0,
+    "S_size": 0,
+    "S_pref_size": 0,
+    "era": {
+     "family_counseling": [
+      "v2"
+     ]
+    },
+    "first_utc": "04:24:29"
+   },
+   "rubric_lost": [],
+   "rubric_kept": [],
+   "ledger_facts": [
+    {
+     "kind": "hold",
+     "role": "family_counseling",
+     "detail": "{\"slot_id\": \"W01QQQ-asst-gorla-c1-20261211-1030\"}"
+    }
+   ],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-02T21:19",
+     "from": "citizen",
+     "to": "family_counseling",
+     "acts": [],
+     "tokens": [],
+     "text": "Vorrei prenotare una visita al consultorio, il prima possibile."
+    },
+    {
+     "t": 382,
+     "agenda": "2026-12-03T03:41",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Buongiorno, sono il consultorio: può prenotare la visita direttamente qui. Sto leggendo l'agenda aggiornata. Le scrivo tra pochi istanti con le date disponibili, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 390,
+     "agenda": "2026-12-03T03:49",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030",
+      "slot_id=W01QQQ-asst-gorla-c1-20261204-1030",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-04T10:30:00.000Z",
+      "agenda_day=fri",
+      "expiry=2026-12-04T10:30:00.000Z",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1200",
+      "slot_id=W01QQQ-asst-gorla-c1-20261204-1200",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-04T12:00:00.000Z",
+      "agenda_day=fr"
+     ],
+     "text": "Buongiorno, sono il consultorio: può prenotare la sua visita ginecologica direttamente qui, e ho già cercato le prime date per lei. offer offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030 slot_id=W01QQQ-asst-gorla-c1-20261204-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-04T10:30:00.000Z agenda_day=fri expiry=2026-12-04T10:30:00.000Z\noffer offer_id=of-W01QQQ-asst-gorla-c1-20261204-1200 slot_id=W01QQQ-asst-gorla-c1-20261204-1200 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-04T12:00:00.000Z agenda_day=fr",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 1280,
+     "agenda": "2026-12-03T18:39",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Perfetto, grazie: sto registrando la sua scelta sul registro. Le mando la conferma con giorno, ora e indirizzo appena risponde: non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2253,
+     "agenda": "2026-12-04T10:52",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030",
+      "reason=slot_expired"
+     ],
+     "text": "Mi dispiace: il registro non ha confermato questo appuntamento. cancel offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030 reason=slot_expired Non deve fare nulla: le mando subito altre date.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2253,
+     "agenda": "2026-12-04T10:52",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261211-1030",
+      "slot_id=W01QQQ-asst-gorla-c1-20261211-1030",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-11T10:30:00.000Z",
+      "agenda_day=fri",
+      "expiry=2026-12-11T10:30:00.000Z",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261214-1600",
+      "slot_id=W01QQQ-asst-gorla-c1-20261214-1600",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-14T16:00:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-14T1"
+     ],
+     "text": "Capisco, grazie per avermelo detto: ho tolto quelle date e ho cercato tenendo conto di ciò che mi ha indicato. offer offer_id=of-W01QQQ-asst-gorla-c1-20261211-1030 slot_id=W01QQQ-asst-gorla-c1-20261211-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-11T10:30:00.000Z agenda_day=fri expiry=2026-12-11T10:30:00.000Z\noffer offer_id=of-W01QQQ-asst-gorla-c1-20261214-1600 slot_id=W01QQQ-asst-gorla-c1-20261214-1600 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-14T16:00:00.000Z agenda_day=mon expiry=2026-12-14T1",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2253,
+     "agenda": "2026-12-04T10:52",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "cancel"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030",
+      "reason=NO_CAPACITY"
+     ],
+     "text": "Mi dispiace: il registro non ha confermato questo appuntamento. cancel offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030 reason=NO_CAPACITY Non deve fare nulla: le mando subito altre date.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2676,
+     "agenda": "2026-12-04T17:55",
+     "from": "citizen",
+     "to": "family_counseling",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-fc-01-booking",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-fc-01-booking offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030"
+    },
+    {
+     "t": 3049,
+     "agenda": "2026-12-07T00:08",
+     "from": "citizen",
+     "to": "family_counseling",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-fc-01-booking",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261211-1030"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-fc-01-booking offer_id=of-W01QQQ-asst-gorla-c1-20261211-1030"
+    },
+    {
+     "t": 3069,
+     "agenda": "2026-12-07T00:28",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261211-1600",
+      "slot_id=W01QQQ-asst-gorla-c1-20261211-1600",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-11T16:00:00.000Z",
+      "agenda_day=fri",
+      "expiry=2026-12-11T16:00:00.000Z",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261214-1200",
+      "slot_id=W01QQQ-asst-gorla-c1-20261214-1200",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-14T12:00:00.000Z",
+      "agenda_day=mon",
+      "expiry=2026-12-14T1"
+     ],
+     "text": "Capisco, grazie per avermelo detto: ho tolto quelle date e ho cercato tenendo conto di ciò che mi ha indicato. offer offer_id=of-W01QQQ-asst-gorla-c1-20261211-1600 slot_id=W01QQQ-asst-gorla-c1-20261211-1600 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-11T16:00:00.000Z agenda_day=fri expiry=2026-12-11T16:00:00.000Z\noffer offer_id=of-W01QQQ-asst-gorla-c1-20261214-1200 slot_id=W01QQQ-asst-gorla-c1-20261214-1200 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-14T12:00:00.000Z agenda_day=mon expiry=2026-12-14T1",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 3118,
+     "agenda": "2026-12-07T01:17",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Perfetto, grazie: sto registrando la sua scelta sul registro. Le mando la conferma con giorno, ora e indirizzo appena risponde: non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    }
+   ],
+   "expected": "Un solo cancel per offer_id, con una sola ragione; un confirm per un'offerta ancora viva riceve risposta nello stesso turno."
+  },
+  {
+   "id": "fc-2",
+   "need_id": "N-TEST-fc-02",
+   "source": {
+    "level": 5,
+    "state": "failed",
+    "score": 0,
+    "S_size": 0,
+    "S_pref_size": 0,
+    "era": {
+     "family_counseling": [
+      "v2"
+     ]
+    },
+    "first_utc": "04:21:59"
+   },
+   "rubric_lost": [],
+   "rubric_kept": [],
+   "ledger_facts": [
+    {
+     "kind": "hold",
+     "role": "family_counseling",
+     "detail": "{\"slot_id\": \"W01QQQ-asst-gorla-c1-20261204-1030\"}"
+    },
+    {
+     "kind": "cancellation",
+     "role": "family_counseling",
+     "detail": "{\"type\": \"ledger.expired\"}"
+    }
+   ],
+   "messages": [
+    {
+     "t": 0,
+     "agenda": "2026-12-02T18:49",
+     "from": "citizen",
+     "to": "family_counseling",
+     "acts": [],
+     "tokens": [],
+     "text": "Buongiorno, sono un po' in ansia e vorrei prenotare una visita al consultorio, grazie."
+    },
+    {
+     "t": 340,
+     "agenda": "2026-12-03T00:29",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Buongiorno, sono il consultorio: può prenotare la visita direttamente qui. Sto leggendo l'agenda aggiornata. Le scrivo tra pochi istanti con le date disponibili, non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 540,
+     "agenda": "2026-12-03T03:49",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [
+      "offer",
+      "offer"
+     ],
+     "tokens": [
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030",
+      "slot_id=W01QQQ-asst-gorla-c1-20261204-1030",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-GIN",
+      "agenda_date=2026-12-04T10:30:00.000Z",
+      "agenda_day=fri",
+      "expiry=2026-12-04T10:30:00.000Z",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1200",
+      "slot_id=W01QQQ-asst-gorla-c1-20261204-1200",
+      "doctor_id=asst-gorla-c1",
+      "facility=agent:yg8debxe3x0p",
+      "procedure=CONS-G"
+     ],
+     "text": "Capisco la sua preoccupazione e me ne occupo subito. Buongiorno, sono il consultorio: può prenotare la sua visita ginecologica direttamente qui, e ho già cercato le prime date per lei. offer offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030 slot_id=W01QQQ-asst-gorla-c1-20261204-1030 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-GIN agenda_date=2026-12-04T10:30:00.000Z agenda_day=fri expiry=2026-12-04T10:30:00.000Z\noffer offer_id=of-W01QQQ-asst-gorla-c1-20261204-1200 slot_id=W01QQQ-asst-gorla-c1-20261204-1200 doctor_id=asst-gorla-c1 facility=agent:yg8debxe3x0p procedure=CONS-G",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 1430,
+     "agenda": "2026-12-03T18:39",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Perfetto, grazie: sto registrando la sua scelta sul registro. Le mando la conferma con giorno, ora e indirizzo appena risponde: non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2401,
+     "agenda": "2026-12-04T10:49",
+     "from": "family_counseling",
+     "to": "citizen",
+     "acts": [],
+     "tokens": [],
+     "text": "Perfetto, grazie: sto registrando la sua scelta sul registro. Le mando la conferma con giorno, ora e indirizzo appena risponde: non deve fare altro.",
+     "status": "wip",
+     "version": "v2"
+    },
+    {
+     "t": 2823,
+     "agenda": "2026-12-04T17:52",
+     "from": "citizen",
+     "to": "family_counseling",
+     "acts": [
+      "confirm"
+     ],
+     "tokens": [
+      "consent_ref=cons-N-TEST-fc-02-booking",
+      "offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030"
+     ],
+     "text": "confirm consent_ref=cons-N-TEST-fc-02-booking offer_id=of-W01QQQ-asst-gorla-c1-20261204-1030"
+    }
+   ],
+   "expected": "Stesso slot di fc-1 nello stesso secondo: hold ledger.expired; al cittadino, dopo l'EXPIRED, nuove date (non due 'sto registrando la sua scelta')."
+  }
+ ]
+}
