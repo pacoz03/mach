@@ -2065,8 +2065,10 @@ def writes_to_booking(b: Bus) -> None:
 
 
 def offers_first(b: Bus) -> str | None:
-    """Il primo messaggio del centro al cittadino è un'offerta (redirect_invece_di_offerta, caso 1)."""
-    first = next((m for m in b.log if m.sender == b.ids["booking_centre"] and m.recipient == CIT), None)
+    """Il primo messaggio del centro al cittadino è un'offerta (redirect_invece_di_offerta, caso 1). L'avviso
+    «sto verificando» col Ledger in ritardo (R2) non è un rinvio: non conta."""
+    first = next((m for m in b.log if m.sender == b.ids["booking_centre"] and m.recipient == CIT
+                  and CHECKING not in m.text), None)
     if first is None or act(first) != "offer":
         return f"primo messaggio del centro al cittadino: «{first.text[:60] if first else ''}», attesa un'offerta"
 
@@ -2130,6 +2132,73 @@ SCENARIOS.update({
     # Rifiuti reason=day: il giorno diventa un vincolo del caso, le offerte nuove arrivano nello stesso turno.
     "booking_rifiuto_giorno": dict(start=KNEE, handoff=True, refuse_first="day", expect=[
         answered_fast(2.0), refused_days_avoided, wrote("checkin", "R:234")]),
+})
+
+
+# --- Centro prenotazioni con il Ledger muto (R2; banco di guasti: clock_lost e ledger_lost, quasi tutti
+# «booking_centre muto»): una risposta del Ledger non arriva mai. Il cittadino sente una volta che si sta
+# verificando, mai uno slot inventato; la lettura si richiede in background e il caso riprende.
+
+CHECKING = "Sto ancora verificando sul registro"
+MUTE_RX = "RX-M1"
+MUTE = ("booking_centre", f"Buongiorno, vorrei prenotare. prescription_number={MUTE_RX} lang=it")
+
+
+def ledger_silent_once(*heads: str, naming: str = ""):
+    """Il cittadino scrive al centro con una ricetta già emessa (MUTE_RX, VIS-FIS B), senza passaggio del gp.
+    La prima risposta del Ledger al centro che comincia con una di ``heads`` (e ha il token ``naming``) non
+    arriva mai. I tentativi del centro scendono a decimi di secondo e il bus aspetta i suoi task in
+    background come i propri."""
+    def setup(b: Bus) -> None:
+        bc, reply, lost = b.ids["booking_centre"], b.reply, []
+        b.ledger.rx[MUTE_RX] = dict(prescription_number=MUTE_RX, patient=CIT, procedure="VIS-FIS", priority="B",
+                                    issued=b.ledger.now)
+
+        def dropped(to, text, need, conv):
+            if not lost and to == bc and (text.split() or [""])[0] in heads and (not naming or naming in text.split()):
+                lost.append(text)
+                return None
+            return reply(to, text, need, conv)
+
+        class Awaited(dict):
+            def __setitem__(self, key, task):
+                super().__setitem__(key, task)
+                b.tasks.append(task)
+
+        b.reply = dropped
+        brain = b.agents[bc].main.__globals__
+        brain["_RETRY"], brain["_RTT_UNMEASURED"], brain["_TASKS"] = (0.1, 0.2, 0.4), 0.0, Awaited()
+    return setup
+
+
+def checked_once(b: Bus) -> str | None:
+    """Un solo avviso «sto verificando» al cittadino, prima della prima offerta del centro."""
+    bc = b.ids["booking_centre"]
+    said = [m for m in b.log if m.sender == bc and m.recipient == CIT]
+    notices = [i for i, m in enumerate(said) if CHECKING in m.text]
+    offer = next((i for i, m in enumerate(said) if act(m) == "offer"), None)
+    if len(notices) != 1 or offer is None or notices[0] > offer:
+        return f"booking_centre: {len(notices)} avvisi «{CHECKING}», prima offerta al messaggio {offer}: atteso un avviso, poi l'offerta"
+
+
+def asked_again(read: str, most: int = 4):
+    """Il centro richiede la lettura persa, ma al più ``most`` volte in tutto: la sua e tre tentativi
+    (letture rare, fix D; con ledger_late le risposte restano ferme finché i tentativi non finiscono)."""
+    def check(b: Bus) -> str | None:
+        n = sum(m.sender == b.ids["booking_centre"] and m.recipient == LEDGER and m.text == read for m in b.log)
+        if not 2 <= n <= most:
+            return f"booking_centre: «{read}» chiesto {n} volte al Ledger, attese da 2 a {most}"
+    return check
+
+
+SCENARIOS.update({
+    "booking_agenda_muta": dict(start=MUTE, setup=ledger_silent_once("agenda"), expect=[
+        checked_once, asked_again("agenda"), wrote("checkin", "R:234")]),
+    "booking_world_muto": dict(start=MUTE, setup=ledger_silent_once("slots", "world"), expect=[
+        checked_once, asked_again("world procedure=VIS-FIS page=1"), wrote("checkin", "R:234")]),
+    "booking_ricetta_muta": dict(
+        start=MUTE, setup=ledger_silent_once("prescription", naming=f"prescription_number={MUTE_RX}"), expect=[
+            checked_once, asked_again(f"prescription prescription_number={MUTE_RX}"), wrote("checkin", "R:234")]),
 })
 
 

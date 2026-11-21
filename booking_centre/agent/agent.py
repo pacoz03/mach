@@ -55,6 +55,7 @@ from mach.protocol import fields_of, first_word, words  # noqa: E402
 #   _GATES       per-need lock, dropped when its last turn ends
 #   _SENT     b  per-need sends history may not show yet (read-your-writes), LRU 4096
 #   _HEARD    b  msg_id -> the model's reading of a citizen message, LRU 4096
+#   _TASKS       per-need background re-ask of a read the Ledger left unanswered (R2), dropped when done
 
 _MAX_PAGE = 8
 _MAX_OFFERS = 3
@@ -179,6 +180,7 @@ _PHRASES: dict[str, dict[str, str]] = {
             "Capisco, tolgo quelle opzioni. Sto controllando altri posti liberi e le scrivo appena "
             "li ho."
         ),
+        "checking": "Sto ancora verificando sul registro: le scrivo appena ho una risposta.",
         "waiting": (
             "Mi dispiace, al momento non ci sono posti disponibili: le propongo la lista d'attesa. "
             "Vuole che la inserisca? Se preferisce, mi dica giorni o orari comodi e ricontrollo."
@@ -281,6 +283,7 @@ _PHRASES: dict[str, dict[str, str]] = {
             "Understood, I am dropping those options. I am checking other free slots and will "
             "write to you as soon as I have them."
         ),
+        "checking": "I am still checking with the register: I will write to you as soon as I have an answer.",
         "waiting": (
             "I am sorry, there are no free slots right now: I can put you on the waiting list. "
             "Shall I add you? If you prefer, tell me the days or times that suit you and I check again."
@@ -532,7 +535,8 @@ class _Gate:
 class _Sent:
     """Offers this process sent for one need, which the case history may not show yet."""
 
-    __slots__ = ("offers", "number", "trigger", "again", "mark", "before", "cancelled", "said", "pending", "reread")
+    __slots__ = ("offers", "number", "trigger", "again", "mark", "before", "cancelled", "said", "pending", "reread",
+                 "waiting", "tries")
 
     def __init__(self) -> None:
         # Offers sent for the case's prescription ``number``; a renewal (a new number) drops them.
@@ -557,6 +561,10 @@ class _Sent:
         # the case already had, a new case from _PAGES): fresh pages for the next round, never
         # waited for.
         self.reread: list[str] = []
+        # The Ledger reads the case's latest run ended waiting for (R2), and how often _retry
+        # asked each one again.
+        self.waiting: list[str] = []
+        self.tries: dict[str, int] = {}
 
 
 # Turns of one need run at the same time; offers wait on this lock so they are not duplicated.
@@ -628,6 +636,7 @@ async def _advance_alone(
     # A citizen message we already answered (it crossed ours) is not the citizen asking again.
     again = message.sender.startswith("citizen:") and not _answered(chat, agent, message)
     sent = _sent(key)
+    sent.waiting = []
     number = case.number(chat)
     if not number:
         # Only another citizen's number (its answer may open a turn of its own): say so, once.
@@ -695,6 +704,7 @@ async def _advance_alone(
     if reply is None:
         # Not answered yet (21/11: 4-7 minutes): its answer opens a turn. Never "not found" for an
         # answer still on its way; only a real one (no procedure, or refused) says so, below.
+        await _waiting(city, message, chat, key, citizen, [f"prescription prescription_number={number}"], again=again)
         return
     if reply.get("patient", citizen) != citizen:
         # Another citizen's prescription (an injection obeyed is -2): never booked, nothing of it said.
@@ -777,12 +787,17 @@ async def _advance_alone(
             chat = await _until(city, need_id, chat, fresh)
         recent = _recent(chat, sent)
         if stale and not _has_agenda(recent):
-            return  # the agenda answer opens a turn of its own, which offers
+            # the agenda answer opens a turn of its own, which offers
+            await _waiting(city, message, chat, key, citizen, ["agenda"], again=again)
+            return
     _round_trip(chat, agent)
     now = _now(chat)
     born = _born(chat)
     world = page_of(recent, 1)
     if now is None or world is None:
+        reads = ["agenda"] if now is None else []
+        await _waiting(city, message, chat, key, citizen,
+                       reads + ([f"world procedure={procedure} page=1"] if world is None else []), again=again)
         return
     _rules(chat, now)  # the case's rules answer, for every case (_RULES)
     no = case.refusals(chat, agent, calendar.gender)
@@ -853,12 +868,17 @@ async def _advance_alone(
                     sent.said.add(f"searching:{sent.trigger}")
                     await _say(city, citizen, _phrase(chat, "searching"))
                 sent.pending = True
+                await _waiting(city, message, chat, key, citizen,
+                               [f"world procedure={procedure} page={missing[0]}"], again=False)
                 return
         else:
             chat = await _until(city, need_id, chat, lambda rows: page_of(_recent(rows, sent), missing[0]) is not None)
             recent = _recent(chat, sent)
             if page_of(recent, missing[0]) is None:
-                return  # On the Ledger's next turn, start with the pages already in history.
+                # On the Ledger's next turn, start with the pages already in history.
+                await _waiting(city, message, chat, key, citizen,
+                               [f"world procedure={procedure} page={missing[0]}"], again=again)
+                return
     if slots:
         await _offer(city, key, citizen, _spread(best or slots, key), number, priority, replacing, chat, opening)
         return
@@ -897,6 +917,78 @@ async def _advance_alone(
     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true {_phrase(chat, 'waiting')}"):
         sent.offers.add(offer_id)
         await _notify_gp_no_slots(city, chat, citizen, number)
+
+
+# R2, the Ledger silent (an answer lost, the agenda never coming): the reads a run ended waiting
+# for are asked again in the background after these real seconds, never sooner than two round
+# trips (21/11: median ~270 s, max 648 s; unmeasured: assumed the median), so a slow answer is not
+# asked twice. Each read at most len(_RETRY) times per case, then the case waits for a message.
+# One task per need, kept referenced until done. ponytail: per pod, lost on restart.
+_RETRY = (20.0, 60.0, 180.0)
+_RTT_UNMEASURED = 270.0
+_TASKS: dict[str, asyncio.Task] = {}
+
+
+async def _waiting(
+    city: City, message: Message, chat: list[Message], key: str, citizen: str, reads: list[str], *, again: bool
+) -> None:
+    """The run ends without the Ledger's answer to ``reads``. A citizen whose message is unanswered
+    hears so, once per silence (never two in a row, R:248); no slot, date or availability is said
+    while the Ledger is silent (AGENT.md 9). The reads go again in the background (_retry)."""
+
+    sent = _sent(key)
+    sent.waiting = reads
+    last = next((row.text for row in reversed(chat) if row.sender == city.agent_id and row.recipient == citizen), "")
+    if again and "checking" not in sent.said and not last.endswith(_phrases(chat)["checking"]):
+        pending = sent.pending  # the notice is not the replacement the citizen is owed
+        if await _say(city, citizen, _phrase(chat, "checking")):
+            sent.said.add("checking")
+        sent.pending = pending
+    if key not in _TASKS and any(sent.tries.get(read, 0) < len(_RETRY) for read in reads):
+        _TASKS[key] = asyncio.ensure_future(_retry(city, message, key))
+
+
+async def _retry(city: City, message: Message, key: str) -> None:
+    """While the latest run of the case waits for reads with retries left: wait, ask them again
+    (unless asked within the wait: by a turn of this case, ``agenda`` by any case), then run the
+    case again, since the answer may land in history without a turn of its own."""
+
+    agent = city.agent_id
+    try:
+        while True:
+            sent = _sent(key)
+            reads = [read for read in sent.waiting if sent.tries.get(read, 0) < len(_RETRY)]
+            if not reads:
+                return  # a run in progress that ends waiting starts the next task (_waiting)
+            wait = max(_RETRY[min(sent.tries.get(read, 0) for read in reads)],
+                       2 * (_RTT[1] if _RTT is not None else _RTT_UNMEASURED))
+            for read in reads:
+                sent.tries[read] = sent.tries.get(read, 0) + 1  # spent even if not sent: the task ends
+            await asyncio.sleep(wait)
+            chat = await city.history(need_id=message.need_id)
+            _learn(chat, agent)
+            if message.need_id in _ESCALATED or any(
+                (row.sender == agent and first_word(row.text) == "escalate.emergency")
+                or (row.sender.startswith("citizen:") and red_flag(row.text))
+                for row in chat
+            ):
+                return  # the red flag's own turn answers it; nothing else on this need (R:442)
+            real = datetime.now(timezone.utc)
+            for read in reads:
+                asks = [protocol.when(row.sent_at or "") for row in chat
+                        if row.sender == agent and row.recipient == LEDGER and row.text == read]
+                if read not in sent.waiting or any(at is not None and (real - at).total_seconds() < wait for at in asks) or (
+                    read == "agenda" and time.monotonic() - _ASKED.get("agenda", float("-inf")) < wait
+                ):
+                    continue  # answered meanwhile, or asked within the wait
+                await _say(city, LEDGER, read)
+            await _advance(city, message, chat, replacing=False)
+    except Exception:  # noqa: BLE001 - background work: nothing may escape, the next message resumes
+        return
+    finally:
+        # Here, not in a done callback: a run ending right after must find the slot free.
+        if _TASKS.get(key) is asyncio.current_task():
+            del _TASKS[key]
 
 
 async def _notify_gp_no_slots(city: City, chat: list[Message], citizen: str, number: str) -> None:
@@ -1762,6 +1854,7 @@ async def _say(city: City, to: str, text: str) -> str:
         owed = _SENT.get(city.inbound.need_id or city.inbound.msg_id)
         if owed is not None:
             owed.pending = False
+            owed.said.discard("checking")  # a new silence may be told again (_waiting)
     return msg_id
 
 
