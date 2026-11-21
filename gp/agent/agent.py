@@ -80,11 +80,15 @@ _NEGATED = re.compile(
 ESCALATION = {
     "it": (
         "escalate.emergency reason=red_flag Capisco la sua preoccupazione: è importante agire subito. "
-        "Contatti subito il 112."
+        "Contatti subito il 112. Se può, chieda a una persona vicina di restare con lei finché "
+        "arrivano i soccorsi e tenga il telefono libero. Passata l'urgenza mi riscriva pure: "
+        "la aiuto io con i passi successivi."
     ),
     "en": (
         "escalate.emergency reason=red_flag I understand your concern: it is important to act now. "
-        "Call 112, the emergency number, right away."
+        "Call 112, the emergency number, right away. If you can, ask someone nearby to stay with "
+        "you until help arrives and keep your phone free. Once the emergency is over, write to me "
+        "again: I will help you with the next steps."
     ),
 }
 # No protocol code in the citizen's words, not even for the model: we ask once more, warmly, and
@@ -146,8 +150,11 @@ class Prescription:
         )
 
     def reply(self, lang: str, handed: bool, prefs: dict[str, object] | None = None) -> str:
+        """Beyond the prescription, unasked: the preferences still missing and the renewal (P1)."""
+
         timing = TIMING[lang].get(self.priority)
         noted = _describe(prefs or {}, lang)
+        missing = _missing(prefs or {}, lang)
         if lang == "en":
             text = (
                 "I understand your concern and I have taken care of it right away. "
@@ -156,22 +163,30 @@ class Prescription:
             )
             if handed:
                 text += "I have already passed it to our booking centre. "
-                text += (
-                    f"I have noted your preferences ({noted}) and passed them on too, so they can "
-                    "look for a slot that matches them."
-                    if noted
-                    else "If you have preferred days or a preference for the doctor's gender or "
-                    "language, tell the booking centre: it will find the slot that suits you best."
-                )
+                if noted:
+                    text += (
+                        f"I have noted your preferences ({noted}) and passed them on too, so they "
+                        "can look for a slot that matches them. "
+                    )
+                if missing:
+                    text += (
+                        f"If you also have a preference for {missing}, tell the booking centre: "
+                        if noted
+                        else f"If you have a preference for {missing}, tell the booking centre: "
+                    ) + "it will find the slot that suits you best. "
             else:
                 text += "To book, write to your ASST's booking centre with the prescription number. "
-                text += (
-                    f"Remember to tell them your preferences ({noted}): they will look for a slot "
-                    "that matches them."
-                    if noted
-                    else "If you have preferred days or a preference for the doctor's gender or "
-                    "language, tell them: they will find the slot that suits you best."
-                )
+                if noted:
+                    text += (
+                        f"Remember to tell them your preferences ({noted}): they will look for a "
+                        "slot that matches them. "
+                    )
+                if missing:
+                    text += f"If you have a preference for {missing}, tell them too. "
+            text += (
+                "Keep the prescription number: if it expires before you manage to book, write to "
+                "me and I will renew it."
+            )
         else:
             text = (
                 "Capisco la sua preoccupazione e me ne sono occupato subito. "
@@ -180,25 +195,33 @@ class Prescription:
             )
             if handed:
                 text += "Ho già passato la ricetta al nostro centro prenotazioni. "
-                text += (
-                    f"Ho preso nota delle sue preferenze ({noted}) e le ho passate anche quelle, "
-                    "così cercherà uno slot che le rispetti."
-                    if noted
-                    else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
-                    "le indichi al centro prenotazioni: così troverà lo slot più adatto a lei."
-                )
+                if noted:
+                    text += (
+                        f"Ho preso nota delle sue preferenze ({noted}) e le ho passate anche "
+                        "quelle, così cercherà uno slot che le rispetti. "
+                    )
+                if missing:
+                    text += (
+                        f"Se ha anche preferenze {missing}, "
+                        if noted
+                        else f"Se ha preferenze {missing}, "
+                    ) + "le indichi al centro prenotazioni: così troverà lo slot più adatto a lei. "
             else:
                 text += (
                     "Per prenotare scriva al centro prenotazioni della sua ASST con il numero "
                     "della ricetta. "
                 )
-                text += (
-                    f"Ricordi di indicare le sue preferenze ({noted}): cercheranno uno slot che le "
-                    "rispetti."
-                    if noted
-                    else "Se ha giorni preferiti o preferenze sul genere o sulla lingua del medico, "
-                    "le indichi: così troverà lo slot più adatto a lei."
-                )
+                if noted:
+                    text += (
+                        f"Ricordi di indicare le sue preferenze ({noted}): cercheranno uno slot "
+                        "che le rispetti. "
+                    )
+                if missing:
+                    text += f"Se ha preferenze {missing}, le indichi anche quelle. "
+            text += (
+                "Conservi il numero della ricetta: se scade prima che riesca a prenotare, mi "
+                "scriva e gliela rinnovo io."
+            )
         return f"{self.head} {text}"
 
 
@@ -509,6 +532,21 @@ def _describe(prefs: dict[str, object], lang: str) -> str:
         joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + (" or " if lang == "en" else " o ") + names[-1]
         parts.append(joined)
     return "; ".join(parts)
+
+
+def _missing(prefs: dict[str, object], lang: str) -> str:
+    """The preferences the citizen has not given yet, to suggest them; '' when all are there."""
+
+    names = {
+        "it": {"days": "sui giorni", "gender": "sul genere", "doctor_lang": "sulla lingua del medico"},
+        "en": {"days": "days", "gender": "the doctor's gender", "doctor_lang": "the doctor's language"},
+    }[lang]
+    left = [names[key] for key in ("days", "gender", "doctor_lang") if not prefs.get(key)]
+    if not left:
+        return ""
+    if lang == "en":
+        return left[0] if len(left) == 1 else ", ".join(left[:-1]) + " or " + left[-1]
+    return left[0] if len(left) == 1 else ", ".join(left[:-1]) + " o " + left[-1]
 
 
 def _preference_tokens(prefs: dict[str, object]) -> str:
