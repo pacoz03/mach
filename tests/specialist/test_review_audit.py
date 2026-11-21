@@ -24,15 +24,14 @@ def _booked(first: str = "Buongiorno, ho la visita cardiologica.") -> list:
     ]
 
 
-def test_slow_ledger_checkin_gets_a_holding_message(brain):
+def test_slow_ledger_checkin_waits_for_the_ledger_in_silence(brain):
+    """Live 21/11 08:36: any reply to the check-in ends the citizen's journey and the judge scores
+    it a minute later. A holding reply before checked_in turned checkin_honored +2 into
+    receipt_refused -2. The checkin goes to the Ledger; the citizen hears nothing until it answers."""
     fake = FakeCity(_booked(), auto=("report",))  # checked_in does not come back in time
     run(brain, fake, msg(CITIZEN, f"checkin booking_id={B} Buongiorno, sono arrivata."))
-    to_citizen = [t for to, t in fake.sent if to == CITIZEN]
-    assert len(to_citizen) == 1
-    holding = to_citizen[0]
-    assert "cardiologia" in holding
-    # Not honoured yet: no checkin act word, no report.
-    assert "checkin" not in holding.split()
+    assert [t for to, t in fake.sent if to == CITIZEN] == []
+    assert any(to == LEDGER and t.startswith(f"checkin booking_id={B}") for to, t in fake.sent)
     assert fake.reports() == []
 
 

@@ -490,8 +490,9 @@ async def arrive(role: str, city, message, chat, entry: dict | None, code: str, 
     if entry.get("checkin") != "pending" and once(need, "checkin", booking, str(entry.get("tries", 0))):
         if not await say(city, LEDGER, f"checkin booking_id={booking} citizen={citizen}"):
             core.undo(need, "checkin", booking, str(entry.get("tries", 0)))
-    if once(need, "registering", booking, message.msg_id):
-        await tell(city, citizen, lang, *fill(REGISTERING, visit=VISIT[role]), f"booking_id={booking}")
+    # Nessuna risposta d'attesa: chiuderebbe il percorso del cittadino prima che il Ledger scriva il
+    # check-in (in città, 21/11 08:36: verdetto 64 s dopo l'attesa, checked_in 43 s dopo il verdetto,
+    # receipt_refused -2). La conferma parte con il checked_in.
     # Se il Ledger è svelto la conferma parte in questo turno (``advance``); altrimenti dal suo ``checked_in``.
     await core.settle(city, message, lambda rows: any(e.get("booking") == booking and e.get("checkin") in ("done", "refused")
                                                       for e in bookings(rows, city.agent_id).values()), 2.0)
@@ -649,10 +650,6 @@ ARRIVED_REPORT = (("Benvenuto, grazie di essere qui: il suo arrivo per la {visit
                    "Non deve fare altro: si accomodi, lo specialista la riceverà a breve. Subito dopo la visita archivio io il referto e le scrivo qui, così sa sempre a che punto è."),
                   ("Welcome, thank you for being here: your arrival for the {visit}{when} is registered.",
                    "There is nothing else to do: please take a seat, the specialist will see you shortly. Right after the visit I will file the summary and write to you here, so you always know where things stand."))
-REGISTERING = (("Buongiorno, grazie di essere qui per la sua {visit}: sto registrando il suo arrivo.",
-                "Il registro impiega qualche istante: le confermo appena risponde, non deve fare altro."),
-               ("Hello, thank you for being here for your {visit}: I am registering your arrival.",
-                "The register takes a moment: I will let you know as soon as it answers, there is nothing else to do."))
 ALREADY = (("Il suo arrivo è già registrato, è tutto a posto.", "Non deve fare altro: si accomodi pure, le auguro una buona visita."),
            ("Your arrival is already registered, everything is in order.", "There is nothing else to do: please take a seat, I wish you a good visit."))
 TOO_EARLY = (("Mi dispiace, in questo momento il registro non mi lascia registrare il suo arrivo.",

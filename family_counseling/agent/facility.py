@@ -3158,32 +3158,13 @@ async def _on_checkin(city: City, message: Message, chat: list[Message], *, repo
     if not booking_id or not citizen:
         return
     token = f"booking_id={booking_id}"
-    asked = False
     if not protocol.we(chat, city.agent_id, token, to=LEDGER, word="checkin"):
         if not await _say(city, LEDGER, f"checkin booking_id={booking_id} citizen={citizen}"):
             return
-        asked = True
     found = await _await_line(city, message.need_id, chat, "checked_in", token, op="checkin")
     if found is None:
         _LOG.info("care.checkin.missing", extra={"need_id": (message.need_id or "")[:48]})
-        if reports and asked:
-            # Specialist: the live Ledger confirms a check-in in ~34 s; never leave the citizen
-            # in silence (review: passive). No checkin act word: it is not honoured yet. The
-            # checked_in push brings the confirmation and the report.
-            await _say(
-                city,
-                citizen,
-                f"{token} "
-                + (
-                    "Hello, thank you for coming: I am registering your arrival for your "
-                    "cardiology visit. The register takes a few moments, I will confirm as soon "
-                    "as it answers; you need do nothing else."
-                    if _en(chat)
-                    else "Buongiorno, grazie di essere qui: sto registrando il suo arrivo per la "
-                    "visita di cardiologia. Il registro impiega qualche istante, le confermo appena "
-                    "risponde; non deve fare altro."
-                ),
-            )
+        # No interim reply (as the hospital's): it would end the journey before checked_in.
         return
     reply, fresh = found
     if first_word(reply.text) == "checked_in":
