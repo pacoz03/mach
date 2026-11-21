@@ -6,11 +6,13 @@
 # 2026-11-21 booking col calendario e R1: 232 (14 risolte, tutti i say_timeout; 22 nuove solo nei 3 scenari aggiunti e nei 2 P1 prima saltati, gemelle di booking_rifiuto_subito: hostile, ledger_lost, say_tnv, redeliver)
 # 2026-11-21 strutture (cancelled inoltrato da specialista e consultorio, slot_id nella ricevuta, specialista senza no_availability) e rinfresco raro: 248 (2 risolte, specialista_hold_duplicate; 18 nuove solo negli scenari aggiunti: 14 gemelle di righe già qui (booking muto con clock_lost/ledger_lost, R2; say_tnv come cardiologia_referto; ledger_late come consultorio_senza_ricetta), 4 di cross_asst_rinfresco_raro sotto restart e two_pods: il limite è per processo, un rinfresco in più per pod)
 # 2026-11-21 booking R2 (mai muto col Ledger muto: avviso onesto, riletture in background): 146 (104 risolte, tutti i clock_lost del booking; 2 nuove in booking_ricetta_muta sotto say_tnv, gemelle di say_tnv booking_redirect_pagina_due: la ricevuta persa e rimandata dall'ospedale)
+# 2026-11-21 finestra del richiedente (MACH-1.3) e check-in dell'ospedale senza messaggio d'attesa: 170 (0 risolte; 24 nuove: 20 «hospital muto dopo checkin» sotto ledger_lost in scenari esistenti, costo voluto: col checked_in perso il cittadino non riceve niente, regola del kit «prima il Ledger»; 2 in consultorio_checkin_lento, gemelle di consultorio_senza_ricetta sotto ledger_late/clock_lost; 2 say_tnv in cross_asst_finestra e specialista_finestra, gemelle di cross_asst_distribuite e cardiologia_referto)
 clock_lost plain consultorio_alternativa_offerta
 clock_lost plain consultorio_annullata
 clock_lost plain consultorio_senza_ricetta
 clock_lost turns consultorio_alternativa_offerta
 clock_lost turns consultorio_annullata
+clock_lost turns consultorio_checkin_lento
 clock_lost turns consultorio_senza_ricetta
 hostile plain booking_rifiuto_giorno
 hostile plain booking_rifiuto_subito
@@ -30,6 +32,7 @@ ledger_late turns booking_rifiuto_giorno
 ledger_late turns booking_world_in_cache
 ledger_late turns consultorio_alternativa_offerta
 ledger_late turns consultorio_annullata
+ledger_late turns consultorio_checkin_lento
 ledger_late turns consultorio_hold_duplicate
 ledger_late turns consultorio_senza_ricetta
 ledger_late turns gp_rinnovo_p1_lento
@@ -39,28 +42,48 @@ ledger_late turns ospedale_rehold
 ledger_late turns p1_ricetta_scaduta
 ledger_late turns p1_rinnovo_prenota
 ledger_late turns p1_rinnovo_prenota_cittadino
+ledger_lost plain booking_agenda_muta
 ledger_lost plain booking_rifiuto_giorno
 ledger_lost plain booking_rifiuto_subito
 ledger_lost plain booking_world_in_cache
 ledger_lost plain consultorio_alternativa_offerta
+ledger_lost plain cross_asst_push_reale
+ledger_lost plain cross_asst_riavvio
+ledger_lost plain cross_asst_riavvio_hold
+ledger_lost plain cross_asst_rinfresco_raro
 ledger_lost plain facility_cancel
 ledger_lost plain gp_alternativa_primo_posto
 ledger_lost plain gp_grazie_prima_del_ledger
+ledger_lost plain gp_lingua_es
 ledger_lost plain gp_preferenze_falsi
 ledger_lost plain gp_secondo_sintomo
+ledger_lost plain gp_stesso_sintomo
+ledger_lost plain ospedale_benvenuto_proattivo
 ledger_lost plain ospedale_hold_scaduto
 ledger_lost plain p1_ricetta_scaduta
+ledger_lost plain welcome_lang_en_partner
+ledger_lost turns booking_agenda_muta
 ledger_lost turns booking_rifiuto_giorno
 ledger_lost turns booking_rifiuto_subito
 ledger_lost turns booking_world_in_cache
 ledger_lost turns consultorio_alternativa_offerta
+ledger_lost turns cross_asst_push_reale
+ledger_lost turns cross_asst_riavvio
+ledger_lost turns cross_asst_riavvio_hold
+ledger_lost turns cross_asst_rinfresco_raro
+ledger_lost turns cross_asst_world_prima_di_agenda
 ledger_lost turns facility_cancel
 ledger_lost turns gp_alternativa_primo_posto
 ledger_lost turns gp_grazie_prima_del_ledger
+ledger_lost turns gp_ledger_lento_en
+ledger_lost turns gp_lingua_es
 ledger_lost turns gp_preferenze_falsi
 ledger_lost turns gp_secondo_sintomo
+ledger_lost turns gp_stesso_sintomo
+ledger_lost turns ospedale_benvenuto_proattivo
 ledger_lost turns ospedale_hold_scaduto
 ledger_lost turns p1_ricetta_scaduta
+ledger_lost turns welcome_lang_en_partner
 ledger_reorder turns booking_nostro_consultorio
 ledger_reorder turns booking_nostro_ospedale
 ledger_reorder turns booking_nostro_specialista
@@ -123,6 +146,7 @@ say_tnv turns consultorio_alternativa_offerta
 say_tnv turns consultorio_annullata
 say_tnv turns consultorio_senza_ricetta
 say_tnv turns cross_asst_distribuite
+say_tnv turns cross_asst_finestra
 say_tnv turns cross_asst_orologio_nota
 say_tnv turns cross_asst_push_reale
 say_tnv turns cross_asst_riavvio
@@ -140,6 +164,7 @@ say_tnv turns ospedale_slot_rubato
 say_tnv turns p1_rinnovo_prenota_cittadino
 say_tnv turns ricevuta_slot_specialista
 say_tnv turns specialista_annullata
+say_tnv turns specialista_finestra
 two_pods plain booking_letture_rare
 two_pods plain booking_slot_condivisi
 two_pods plain booking_slot_raffica
