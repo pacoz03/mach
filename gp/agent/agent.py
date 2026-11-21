@@ -79,16 +79,16 @@ _NEGATED = re.compile(
 )
 ESCALATION = {
     "it": (
-        "escalate.emergency reason=red_flag Capisco la sua preoccupazione: è importante agire subito. "
-        "Contatti subito il 112. Se può, chieda a una persona vicina di restare con lei finché "
-        "arrivano i soccorsi e tenga il telefono libero. Passata l'urgenza mi riscriva pure: "
-        "la aiuto io con i passi successivi."
+        "escalate.emergency reason=red_flag Mi dispiace, dev'essere un momento difficile. "
+        "Chiami subito il 112 e spieghi all'operatore che cosa le sta succedendo. "
+        "Se c'è qualcuno vicino, può chiedergli di chiamare per lei o di restarle accanto. "
+        "Passata l'urgenza, se ha bisogno di aiuto per i prossimi passi, mi può riscrivere."
     ),
     "en": (
-        "escalate.emergency reason=red_flag I understand your concern: it is important to act now. "
-        "Call 112, the emergency number, right away. If you can, ask someone nearby to stay with "
-        "you until help arrives and keep your phone free. Once the emergency is over, write to me "
-        "again: I will help you with the next steps."
+        "escalate.emergency reason=red_flag I'm sorry you're going through this. "
+        "Call 112 now and tell the operator what's happening. If someone is nearby, you can ask "
+        "them to make the call for you or stay with you. Once the emergency is over, you can write "
+        "to me if you need help with the next steps."
     ),
 }
 # No protocol code in the citizen's words, not even for the model: we ask once more, warmly, and
@@ -118,6 +118,19 @@ CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 # to it only when the Index returns it.
 BOOKING_CENTRE = "agent:sbdpbpqz5sxe"
 HANDOFF = "need.request handoff=gp"
+BOOKING_FOLLOW_UP = "data.response purpose=booking_follow_up outcome=no_slots"
+BOOKING_WITHOUT_SLOTS = {
+    "it": (
+        "Il centro prenotazioni mi ha avvisato che non ha trovato un posto per lei. Capisco che "
+        "dover aspettare sia frustrante. Se nel frattempo la ricetta scade, mi scriva con il numero "
+        "{number} e verificherò se è da rinnovare."
+    ),
+    "en": (
+        "The booking centre told me it couldn't find an appointment for you. I know waiting can be "
+        "frustrating. If your referral expires while you wait, send me the number {number} so I can "
+        "check and renew it if needed."
+    ),
+}
 # Priority deadlines (e19-rules.md R:91).
 TIMING = {
     "it": {
@@ -266,6 +279,11 @@ async def main(need: Need, city: City) -> None:
                 request = _previous_prescription(history, city.agent_id)
                 if request is not None:
                     await _notify(city, history, request)
+        return
+    if message.sender == BOOKING_CENTRE:
+        if message.need_id and (number := _no_slots_number(message)):
+            async with _case_lock(message.need_id):
+                await _follow_up_booking(city, message.need_id, number)
         return
     # Every citizen message: a word like "prescription" in the text changes the act understood()
     # reads, and a red flag must never be missed for that.
@@ -650,6 +668,10 @@ def _reminder(
     text = issued.opening(lang).replace("I have prepared", "I have already prepared").replace(
         "Le ho preparato", "Le ho già preparato"
     ) + (f": {timing}. " if timing else ". ")
+    if handed and any(
+        row.recipient == agent_id and _no_slots_number(row) == issued.number for row in history
+    ):
+        return f"{issued.head} booking_status=no_slots {text}{BOOKING_WITHOUT_SLOTS[lang].format(number=issued.number)}"
     if lang == "en":
         text += (
             "Next step: our booking centre already has it and will write to you with the "
@@ -842,6 +864,40 @@ async def _tell(city: City, patient: str, text: str, history: list[Message] | No
     await city.say(patient, await tools.localize(city, text, heard, _LANG.get()))
 
 
+def _no_slots_number(message: Message) -> str | None:
+    if message.sender != BOOKING_CENTRE or message.text.split()[:1] != ["data.response"]:
+        return None
+    fields = understood(message).body
+    number = fields.get("prescription_number")
+    if fields.get("purpose") == "booking_follow_up" and fields.get("outcome") == "no_slots" and isinstance(number, str):
+        return number
+    return None
+
+
+async def _follow_up_booking(city: City, need_id: str, number: str) -> None:
+    history = await city.history(need_id=need_id)
+    request = _previous_prescription(history, city.agent_id, number=number)
+    if request is None or _issued(history, city.agent_id, request.patient) != request:
+        return
+    head = f"{BOOKING_FOLLOW_UP} prescription_number={number}"
+    handoff = next((
+        row for row in history
+        if row.sender == city.agent_id and row.recipient == BOOKING_CENTRE
+        and row.text.startswith(HANDOFF + " ") and f"prescription_number={number}" in row.text.split()
+    ), None)
+    if handoff is None or any(
+        row.sender == city.agent_id and row.recipient == request.patient and row.text.startswith(head + " ")
+        for row in history
+    ):
+        return
+    lang = "en" if understood(handoff).body.get("lang") == "en" else "it"
+    text = BOOKING_WITHOUT_SLOTS[lang].format(number=number)
+    try:
+        await _tell(city, request.patient, f"{head} {text}", history)
+    except CapError:
+        return
+
+
 def _lang(history: list[Message]) -> str:
     """The citizen's ``lang=``, as the booking centre reads it; else plain English; Italian otherwise."""
 
@@ -868,11 +924,11 @@ async def _handoff(
         await city.say(
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
-            f"procedure={request.procedure} priority={request.priority} lang={lang} "
+            f"procedure={request.procedure} priority={request.priority} lang={lang} notify_if=no_slots "
             + (f"{tokens} " if (tokens := _preference_tokens(prefs)) else "")
             + "Buongiorno, vi passo la ricetta appena registrata sul Ledger per la prenotazione"
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
-            + "Grazie!",
+            + "Se non trovate un posto, avvisatemi così posso aiutare la persona a proseguire. Grazie!",
         )
         return True
     except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us

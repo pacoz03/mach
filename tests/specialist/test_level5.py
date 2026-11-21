@@ -111,3 +111,42 @@ def test_slow_world_answers_from_the_cached_page(brain):
     run(brain, fake, msg(PARTNER, _ask("", rid="c-2")[0], need_id="N-Y"))
     second = [t for to, t in fake.sent if to == PARTNER][1]
     assert second.startswith("offer ") and "request_id=c-2" in second.split()
+
+
+def _timed(brain, fake, inbound) -> float:
+    import time
+    t0 = time.monotonic()
+    run(brain, fake, inbound)
+    return time.monotonic() - t0
+
+
+def test_turn_ends_right_after_the_answer(brain):
+    # The fast reply (+1, R:246) is measured on the ack, which the cloud sends at the end of the
+    # turn: waiting ~20 s for world after answering lost it on every partner request.
+    slow = {"on": False}
+    base = _ledger([[S2_TUE, S1_WED]])
+
+    def ledger(to: str, text: str, fake: FakeCity) -> None:
+        if slow["on"] and to == LEDGER and text.startswith("world"):
+            return
+        base(to, text, fake)
+
+    fake = FakeCity([], on_post=ledger)
+    run(brain, fake, msg(PARTNER, _ask("", rid="t-1")[0], need_id="N-X"))
+    slow["on"] = True
+    took = _timed(brain, fake, msg(PARTNER, _ask("", rid="t-2")[0], need_id="N-Y"))
+    assert [t for to, t in fake.sent if to == PARTNER][1].startswith("offer ")
+    assert took < 3, f"il turno è rimasto vivo {took:.1f} s dopo la risposta"
+
+
+def test_world_reply_turn_fills_the_cache(brain):
+    # The Ledger's late world answer arrives as a turn of its own: it refreshes the cache.
+    fake = FakeCity([], on_post=lambda to, text, f: None)  # the Ledger never answers in a turn
+    page = "\n".join(["slots page=1/1 count=2", S2_TUE, S1_WED])
+    clock = (f"agenda agenda_now={NOW} agenda_day=mon epoch_real={datetime.now(timezone.utc).isoformat()} "
+             f"epoch_agenda={NOW} rate=60")
+    run(brain, fake, msg(LEDGER, clock, recipient=AGENT, need_id="N-L"))
+    run(brain, fake, msg(LEDGER, page, recipient=AGENT, need_id="N-L"))
+    run(brain, fake, msg(PARTNER, _ask("", rid="t-3")[0], need_id="N-Z"))
+    reply = [t for to, t in fake.sent if to == PARTNER][0]
+    assert reply.startswith("offer ") and "request_id=t-3" in reply.split()
