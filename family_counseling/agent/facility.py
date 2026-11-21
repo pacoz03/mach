@@ -60,7 +60,7 @@ _CROSS_WAIT = 5.5
 # from the last world page read (_WORLD) while it is _WORLD_FRESH seconds old; without one we wait
 # _CROSS_COLD (a history read can overrun it, still < 10 s) and keep waiting for the reply up to
 # _WORLD_WAIT after answering, so the next request finds it.
-_CROSS_COLD = 8.5
+_CROSS_COLD = 7.0  # live 1.0.7: each Ledger say takes 1-5 s, 8.5 s gave cancels at 10.7 s
 _WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
 _WORLD_WAIT = 20.0
 # (procedure, page) -> (time.monotonic() of the read, world reply text).
@@ -1789,6 +1789,7 @@ async def _cross_asst(
         chosen: list[dict[str, str]] = []
         relaxed = False
         owed = 0  # hospital: the last world page answered without its reply (cache or late)
+        later: list[str] = []  # hospital, cache hit: Ledger reads sent after the answer
         # Only our own service: world lists every slot of the ASST, other facilities' too.
         if procedure in procedures:
             hospital = procedures == (_PROCEDURE,)
@@ -1809,17 +1810,28 @@ async def _cross_asst(
                 world = _latest_slots(fresh(rows))
                 return world if world is not None and _page(world)[0] >= page else None
 
-            await _say(city, LEDGER, "agenda")
+            def warm(page: int) -> str | None:
+                # Hospital: a fresh cached page and a known city clock answer at once.
+                hit = _WORLD.get((procedure, page)) if hospital else None
+                if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH or not _city_now():
+                    return None
+                return hit[1]
+
+            if warm(1) is not None:
+                later.append("agenda")  # a say to the Ledger takes 1-5 s live: after the answer
+            else:
+                await _say(city, LEDGER, "agenda")
             page = 1
             found: list[dict[str, str]] = []
             every: list[dict[str, str]] = []
             while True:
-                await _say(city, LEDGER, f"world procedure={procedure} page={page}")
-                hit = _WORLD.get((procedure, page)) if hospital else None
-                if hit is not None and time.monotonic() - hit[0] <= _WORLD_FRESH:
-                    # Answer now; this read's reply refreshes the cache after the answer.
-                    rows, world, owed = chat, hit[1], page
+                cached = warm(page)
+                if cached is not None:
+                    # Answer now; the read goes out after the answer and refreshes the cache.
+                    rows, world, owed = chat, cached, page
+                    later.append(f"world procedure={procedure} page={page}")
                 else:
+                    await _say(city, LEDGER, f"world procedure={procedure} page={page}")
                     rows = await _until(
                         city,
                         message.need_id,
@@ -1909,6 +1921,8 @@ async def _cross_asst(
         sent.offers.add(key)
         await _say(city, sender, text)
         if owed:
+            for read in later:
+                await _say(city, LEDGER, read)
             # Answered without a world reply: wait for it now, so the next request finds it.
             rows = await _until(
                 city,
