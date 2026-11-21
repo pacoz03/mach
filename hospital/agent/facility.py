@@ -1219,8 +1219,10 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
                 await _finish_booking(city, message, chat, slot, hold_self=True)
         elif _facility_turn(message):
             await _facility(city, message, chat, reports=False, hold_self=True)
-        else:
-            # Agenda/world replies already consumed by history must not replace live offers.
+        elif not partner:
+            # Agenda/world replies already consumed by history must not replace live offers. After a
+            # partner's confirm the only citizen in the chat is theirs (protocol.citizen falls back to
+            # its citizen=): never offer to them.
             own = [r for r in chat if r.sender == city.agent_id and r.recipient.startswith("citizen:")]
             if not any(first_word(r.text) in {"offer", "consent", "booking.receipt", "checkin"} for r in own):
                 await _advance(city, message, chat, replacing=False)

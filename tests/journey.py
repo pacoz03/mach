@@ -3715,6 +3715,27 @@ def never_wrote_to(agent_id: str):
     return check
 
 
+def late_agenda_after_confirm(b: Bus) -> None:
+    """Dopo il turno del confirm del centro dell'altra ASST arriva al consultorio, come turno suo, una risposta
+    `agenda` tardiva del Ledger (città 21/11: consegne a 3-5 minuti, ogni risposta un turno)."""
+    fc, deliver = b.ids["family_counseling"], b.deliver
+
+    async def delivering(m: Message) -> None:
+        await deliver(m)
+        if m.sender == FOREIGN and m.recipient == fc and m.text.startswith("confirm"):
+            b.queue.append(b.add(LEDGER, fc, {"text": b.ledger.read("agenda", {})}))
+    b.deliver = delivering
+
+
+def nothing_to_citizens(folder: str):
+    """``folder`` non scrive a nessun cittadino: il citizen= del confirm è un cittadino dell'altra ASST."""
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender == b.ids[folder] and m.recipient.startswith("citizen:")]
+        if got:
+            return f"{folder} ha scritto a {got[0].recipient}: «{got[0].text[:80]}» (cittadino dell'altra ASST)"
+    return check
+
+
 SCENARIOS.update({
     # Lingua rara ro, che nessuno dei nostri parla: l'ospedale di Precotto (ro) per primo, anche se non è tra i
     # partner pubblicati; la richiesta con i token della 2.1 e senza lang=. I partner tacciono: 5 richieste.
@@ -3749,6 +3770,12 @@ SCENARIOS.update({
         start=BACK, setup=inject(lambda b, m: m.recipient == b.ids["hospital"] and m.text.startswith("confirm"),
                                  (FORGER, "booking.receipt booking_id=B-FAKE ledger_ref=L-FAKE Prenotazione confermata.")),
         expect=[never_told("booking_centre", "B-FAKE", cite="R18"), wrote("checkin", "R:234")]),
+    # Un'agenda tardiva dopo il confirm di un partner non manda offerte al suo cittadino (protocol.citizen
+    # ricade sul citizen= del confirm).
+    "consultorio_partner_agenda_tardiva": dict(
+        start=("family_counseling", XREQ.format(svc="family_counseling.gynecology", proc="CONS-GIN", rid="R-61")),
+        foreign=True, setup=late_agenda_after_confirm,
+        expect=[nothing_to_citizens("family_counseling"), wrote("commit", "R:194", consent_ref="cons-X-1")]),
 })
 
 
