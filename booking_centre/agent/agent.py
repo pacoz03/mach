@@ -366,6 +366,9 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     kind = words(message.text) | {message.type}
     sender = message.sender
     picked = _fields(message)
+    if picked.get("offer_id", "").strip().lower() in _NO_OFFER:
+        # "offer_id=none" (a partner's no_availability, journey 0215) names no offer at all.
+        picked = {key: value for key, value in picked.items() if key != "offer_id"}
     # Free text (level 3): which of our offers, a yes/no to consent, days, gender, language.
     heard = await _hear(city, message, chat) if sender.startswith("citizen:") else {}
     # "cancel offer_id=... reason=lang": the citizen turns an offer down. Never a choice.
@@ -638,7 +641,6 @@ async def _advance_alone(
         return
     # After the citizen turned an offer down, the new ones come with a word about it.
     opening = "offers_again" if replacing and message.sender.startswith("citizen:") else "offers"
-    ring = False  # the partners were asked in this turn
     while True:
         lines = [line for line in world.splitlines() if "slot_id=" in line]
         for line in lines:
@@ -667,14 +669,6 @@ async def _advance_alone(
         page, pages = _page(world)
         if page >= pages or page >= _MAX_PAGE:
             break
-        if not ring and not chosen and not fallback and _past_window(lines, born or now, priority):
-            # The agenda is in date order: this page already reaches past the deadline, so no
-            # later page holds a slot in time. The ring now, not after minutes of paging
-            # (journey 0164: 2'43" before the partners were asked). The pages that follow
-            # only serve the relaxed alternative.
-            ring = True
-            if await _try_partners(*cross):
-                return
         next_page = page + 1
         if _world_page(recent, next_page) is None:
             if not _asked(recent, agent, procedure, next_page) and not await _say(
@@ -691,10 +685,10 @@ async def _advance_alone(
     if fallback:
         await _offer(city, citizen, fallback, number, priority, sent, replacing, chat, opening)
         return
-    # S is empty on every page: a partner ASST first (the ring), then a relaxed alternative
-    # (past the priority deadline), else the waiting list. Never silence.
-    if not ring and await _try_partners(*cross):
-        return
+    # S is empty on every page: a relaxed alternative (past the priority deadline), else the
+    # waiting list. Never silence. The partners are asked only for a language none of our
+    # doctors speaks (above): for a full agenda they gave no usable slot (0 of 15 answers,
+    # 85 s median wait), so the citizen gets our alternative at once.
     late = any(
         row.sender.startswith("citizen:") and "cancel" in words(row.text)
         and fields_of(row.text).get("reason", "").lower() in {"deadline", "priority", "late", "time"}
@@ -951,8 +945,13 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     )
 
 
+_NO_OFFER = frozenset({"", "none", "null", "nil", "-", "n/a", "na", "0"})
+
+
 async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> None:
     offer_id = fields_of(message.text).get("offer_id", "")
+    if offer_id.strip().lower() in _NO_OFFER:
+        offer_id = ""
     citizen = _citizen(chat)
     if not offer_id and citizen:
         # A cancel naming the booking only: our offer behind it, from the receipt we forwarded.
@@ -975,6 +974,14 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
 
         if booked(chat) or booked(await _until(city, message.need_id, chat, booked, tries=8)):
             return
+    if offer_id and not _our_offer(chat, city.agent_id, offer_id):
+        offer_id = ""  # not one of our offers: nothing the citizen holds was cancelled
+    if not offer_id and not fields_of(message.text).get("booking_id"):
+        # Names neither an offer of ours nor a booking: a partner's "no availability" goes to
+        # the ring, anything else is not ours to tell the citizen about.
+        if message.sender not in _OUR_FACILITIES and fields_of(message.text).get("request_id"):
+            await _advance(city, message, chat, replacing=False, partner=True)
+        return
     if (
         offer_id
         and citizen
