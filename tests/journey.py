@@ -159,6 +159,7 @@ class Ledger:
         self.refuse_checkin = sc.get("refuse_checkin")
         self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
+        self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -169,6 +170,8 @@ class Ledger:
         return bool(r) and self.rules["P1"] == "on" and self.now - r["issued"] > timedelta(days=2)
 
     def late(self, text: str) -> float:
+        if (text.split() or [""])[0] == "world":
+            return self.slow_world
         if (text.split() or [""])[0] != "agenda":
             return 0
         self.agendas += 1
@@ -817,6 +820,17 @@ def cross_doctors(rid: str, first: str, *keys: str):
     return check
 
 
+def cross_only(rid: str, key: str):
+    """Ogni slot offerto per ``rid`` è del medico ``key``: nessuno che rispetti meno vincoli."""
+    def check(b: Bus) -> str | None:
+        m = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                  and f"request_id={rid}" in m.text.split()), None)
+        docs = [o.get("doctor_id", "").rsplit("-", 1)[-1] for o in parse_offers(m.text)] if m else []
+        if not docs or set(docs) != {key}:
+            return f"offerte {rid}: medici {docs}, attesi solo {key} (livello 5, vincoli combinati)"
+    return check
+
+
 def hospital_to_gp(expected: bool):
     """Il gp sa della prenotazione solo se è del nostro centro: il cittadino di un'altra ASST
     non è suo paziente (R:243 over-disclosure)."""
@@ -983,7 +997,17 @@ SCENARIOS: dict[str, dict] = {
         expect=[cross_reply("R-7", "B"), cross_doctors("R-7", "h3")]),
     "cross_asst_lingua_en": dict(
         start=("hospital", XFIS.format(rid="R-8", extra=" lang=en")), foreign=True,
-        expect=[cross_reply("R-8", "B"), cross_doctors("R-8", "h1", "h3")]),
+        expect=[cross_reply("R-8", "B"), cross_doctors("R-8", "h1")]),
+    # Livello 5: lang=en e gender=f li rispetta solo h1, quindi niente h3 di rinforzo.
+    "cross_asst_vincoli": dict(
+        start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True,
+        expect=[cross_reply("R-13", "B"), cross_only("R-13", "h1")]),
+    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e il turno
+    # aspetta la risposta di world; R-12 trova la pagina in memoria e offre in meno di 1 s.
+    "cross_asst_world_lento": dict(
+        start=("hospital", XFIS.format(rid="R-11", extra="")), foreign_after=[XFIS.format(rid="R-12", extra="")],
+        foreign=True, slow_world=12.0,
+        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5), cross_reply("R-12", "B"), cross_fast("R-12", 1.0)]),
     "cross_asst_tutto_pieno": dict(
         start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
         expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),

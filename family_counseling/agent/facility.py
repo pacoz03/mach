@@ -55,6 +55,17 @@ _SHORT_TRIES = 12
 # A cross-ASST answer goes out by this many seconds from the turn's start: the fast reply (+1,
 # R:246) needs < 10 s, and the real Ledger's agenda reply alone takes 3-5 s.
 _CROSS_WAIT = 5.5
+# Hospital: the live Ledger answers world after ~12 s (21/11 00:50), so a cross-ASST answer comes
+# from the last world page read (_WORLD) while it is _WORLD_FRESH seconds old; without one we wait
+# _CROSS_COLD (a history read can overrun it, still < 10 s) and keep waiting for the reply up to
+# _WORLD_WAIT after answering, so the next request finds it.
+_CROSS_COLD = 8.5
+_WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
+_WORLD_WAIT = 20.0
+# (procedure, page) -> (time.monotonic() of the read, world reply text).
+# ponytail: one process's memory, empty after a restart or rollout and not shared between pods;
+# a shared store if the hospital ever runs on more than one pod.
+_WORLD: dict[tuple[str, int], tuple[float, str]] = {}
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 # The kit names no outcome_code values: VISIT is the only one it writes (examples/agent.py).
@@ -1690,12 +1701,14 @@ async def _cross_asst(
     ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
     attribute the Ledger did not write. The confirm that follows takes _on_confirm.
 
-    Hospital only: the answer goes out by _CROSS_WAIT. The clock is _city_now (agenda is asked
-    to refresh it, waited for only without it), else world's first day (_day_after). A partner
-    asks because its own set is empty: with nothing in the priority window we offer the first
-    free slots after it (relaxed alternative, R:232), page 2 too, and always one h3 slot."""
+    Hospital only: the answer comes at once from a fresh _WORLD page, else by _CROSS_COLD.
+    The clock is _city_now (agenda is asked to refresh it, waited for only without it), else
+    world's first day (_day_after). A partner asks because its own set is empty: with nothing
+    in the priority window we offer the first free slots after it (relaxed alternative, R:232),
+    page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days."""
 
-    deadline = time.monotonic() + _CROSS_WAIT
+    start = time.monotonic()
+    deadline = start + (_CROSS_COLD if procedures == (_PROCEDURE,) else _CROSS_WAIT)
     fields = _fields(message)
     rid = fields.get("request_id", "")
     tag = f"request_id={rid}" if rid else ""
@@ -1718,6 +1731,7 @@ async def _cross_asst(
         priority = priority if priority in {"U", "B", "D", "P"} else None
         chosen: list[dict[str, str]] = []
         relaxed = False
+        owed = 0  # hospital: the last world page answered without its reply (cache or late)
         # Only our own service: world lists every slot of the ASST, other facilities' too.
         if procedure in procedures:
             hospital = procedures == (_PROCEDURE,)
@@ -1744,16 +1758,24 @@ async def _cross_asst(
             every: list[dict[str, str]] = []
             while True:
                 await _say(city, LEDGER, f"world procedure={procedure} page={page}")
-                rows = await _until(
-                    city,
-                    message.need_id,
-                    chat,
-                    lambda rows, page=page: page_of(rows, page) is not None
-                    and clock(rows) is not None,
-                    tries=_SHORT_TRIES,
-                    deadline=deadline if rich else None,
-                )
-                world = page_of(rows, page)
+                hit = _WORLD.get((procedure, page)) if hospital else None
+                if hit is not None and time.monotonic() - hit[0] <= _WORLD_FRESH:
+                    # Answer now; this read's reply refreshes the cache after the answer.
+                    rows, world, owed = chat, hit[1], page
+                else:
+                    rows = await _until(
+                        city,
+                        message.need_id,
+                        chat,
+                        lambda rows, page=page: page_of(rows, page) is not None
+                        and clock(rows) is not None,
+                        tries=_SHORT_TRIES,
+                        deadline=deadline if rich else None,
+                    )
+                    world = page_of(rows, page)
+                    if hospital:
+                        _keep_world(procedure, fresh(rows))
+                        owed = owed if world else page
                 now = clock(rows) or (_day_after(world) if rich and world else None)
                 if world is None or now is None:
                     break
@@ -1782,12 +1804,18 @@ async def _cross_asst(
             if hospital:
                 # Partners mostly want h3, our only sq speaker: no lang= reads as sq. The
                 # earliest slot in the asked language first, then by time, and always one h3.
+                # Level 5: a named lang/gender/days ranks first the slots meeting most of them.
                 lang = (fields.get("lang") or _RARE).lower()
                 first = next((slot for slot in pool if _speaks(slot["doctor_id"], lang)), None)
                 pool = ([first] if first else []) + [slot for slot in pool if slot is not first]
+                pool = _by_constraints(pool, fields)
                 rare = next((s for s in (*pool, *every) if _speaks(s["doctor_id"], _RARE)), None)
                 chosen = pool[:3]
-                if rare is not None and rare not in chosen:
+                # The h3 goes in unless it meets fewer named constraints than the last offer:
+                # the sort is stable, so rare stays first on a tie.
+                if rare is not None and rare not in chosen and (
+                    _by_constraints([rare, chosen[-1]], fields)[0] is rare
+                ):
                     chosen = [*chosen[:2], rare]
             elif rich and pool:
                 # Level 5: the partner's lang/gender/days, when named, rank the slots that meet
@@ -1823,6 +1851,25 @@ async def _cross_asst(
         # Marked even if the say fails: a redelivery is not a retry after a 4xx.
         sent.offers.add(key)
         await _say(city, sender, text)
+        if owed:
+            # Answered without a world reply: wait for it now, so the next request finds it.
+            rows = await _until(
+                city,
+                message.need_id,
+                chat,
+                lambda rows: page_of(rows, owed) is not None and clock(rows) is not None,
+                deadline=start + _WORLD_WAIT,
+            )
+            _keep_world(procedure, fresh(rows))
+
+
+def _keep_world(procedure: str, rows: list[Message]) -> None:
+    """Hospital: every ``world`` page in ``rows`` becomes the cached page of ``procedure``."""
+
+    for row in rows:
+        world = _latest_slots([row])
+        if world is not None:
+            _WORLD[(procedure, _page(world)[0])] = (time.monotonic(), world)
 
 
 _GENDERS = {"f": "f", "female": "f", "donna": "f", "femmina": "f", "woman": "f",
