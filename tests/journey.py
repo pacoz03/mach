@@ -3489,6 +3489,146 @@ SCENARIOS.update({
 })
 
 
+# --- Centro prenotazioni e MACH-2.1 (docs/protocol/mach-2.1.md): il need.request porta mach, after, deadline e
+# lease_s e mai lang= (R:191); 5 strutture per ondata, la seconda solo dopo il no di tutta la prima (R3); solo
+# l'anello (R17): niente richieste né offerte girate fuori dall'anello o da chi non abbiamo interpellato; un
+# annullamento solo da chi ha emesso l'offerta, una ricevuta solo da chi ha avuto il confirm (R18).
+
+PRECOTTO = "agent:s1twcdzg3296"  # ospedale di asst-precotto, lingua rara ro (ring.RARE), non tra _KNOWN_PARTNERS
+NOT_RING = "agent:zzzzzzzzzzzz"  # nessuna ASST della mappa
+UNASKED = "agent:p90cbsk3n9e6"  # ospedale di asst-sud: nell'anello, mai interpellato
+FORGER = "agent:h6r1v45esk77"  # ospedale di asst-giambellino: nell'anello, non ha emesso le nostre offerte
+RX_RO = "RX-RO1"
+
+
+def fake_offer(slot: str) -> str:
+    return (f"offer offer_id=of-{slot} slot_id={slot} doctor_id=asst-sud-h1 facility={{me}} procedure=VIS-FIS "
+            "agenda_date=2026-11-24T10:00:00+00:00 agenda_day=tue expiry=2026-11-24T10:00:00+00:00 priority=B "
+            "request_id={rid} Ecco la nostra disponibilità.")
+
+
+def inject(trigger, *says: tuple[str, str]):
+    """Al primo messaggio del centro per cui ``trigger(b, m)`` è vero, ogni (mittente, testo) di ``says`` (fuori
+    dal bus) gli scrive: {rid} è il request_id di quel messaggio, {offer_id} la sua prima offerta, {me} il mittente."""
+    def setup(b: Bus) -> None:
+        bc, add, done = b.ids["booking_centre"], b.add, []
+
+        def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+            m = add(sender, to, body, need, conv, kind)
+            if sender == bc and not done and trigger(b, m):
+                done.append(m)
+                offers = parse_offers(m.text)
+                for who, text in says:
+                    text = text.format(rid=fields(m.text).get("request_id", ""), me=who,
+                                       offer_id=offers[0].get("offer_id", "") if offers else "")
+                    b.queue.append(add(who, bc, {"text": text}, need))
+            return m
+        b.add = adding
+    return setup
+
+
+def not_ring_first(b: Bus) -> None:
+    """Un agente fuori dall'anello in testa ai partner pubblicati della fisiatria (una tabella a mano sbagliata)."""
+    known = b.agents[b.ids["booking_centre"]].main.__globals__["_KNOWN_PARTNERS"]
+    known["hospital.physiatry"] = {NOT_RING: "", **known["hospital.physiatry"]}
+
+
+def mach21_request(first: str | None = None):
+    """Ogni need.request ai partner: mach=2.1, i criteri, after/deadline/lease_s (R5, R6, R14), mai lang= né dati del
+    cittadino (R:191); B: scadenza a 48 h meno il margine dalla nascita (lun 08:00), after almeno 4 h avanti.
+    ``first``: la struttura chiesta per prima (lingua rara, R3)."""
+    def check(b: Bus) -> str | None:
+        asks = _partner_asks(b)
+        if not asks:
+            return "nessun need.request ai partner"
+        if first and asks[0].recipient != first:
+            return f"primo need.request a {asks[0].recipient}, atteso {first} (lingua rara prima, R3)"
+        for m in asks:
+            f = fields(m.text)
+            missing = [k for k in ("service_type", "procedure", "priority", "after", "deadline", "lease_s", "request_id")
+                       if not f.get(k)]
+            leaked = [k for k in ("lang", "citizen", "patient", "prescription_number") if k in f]
+            if f.get("mach") != "2.1" or missing or leaked:
+                return f"need.request «{m.text[:120]}»: mach={f.get('mach')}, mancano {missing}, in più {leaked} (R:191)"
+            after, deadline = (datetime.fromisoformat(f[k]).replace(tzinfo=UTC) for k in ("after", "deadline"))
+            if not START + timedelta(hours=46) <= deadline <= START + timedelta(hours=47, minutes=30):
+                return f"deadline={f['deadline']}: attesa nascita + 48 h - 30 min (R6)"
+            if not START + timedelta(hours=4) <= after < deadline:
+                return f"after={f['after']}: atteso almeno 4 h avanti e prima della scadenza (R5)"
+            if not 0 < int(f["lease_s"]) <= 1800:
+                return f"lease_s={f['lease_s']} fuori da 1..1800 (R14)"
+    return check
+
+
+def waves(total: int | None = None):
+    """Un giro, un request_id: al massimo 5 strutture per ondata, la seconda ondata solo dopo il no (cancel) di
+    tutte quelle della prima (R3), nessuna chiesta due volte; ``total`` richieste (None: i partner di ring(), max 10)."""
+    def check(b: Bus) -> str | None:
+        bc, asks = b.ids["booking_centre"], _partner_asks(b)
+        want = min(10, len(b.partners)) if total is None else total
+        rids = {fields(m.text).get("request_id") for m in asks}
+        if len(asks) != want or len(rids) != 1 or len({m.recipient for m in asks}) != len(asks):
+            return f"{len(asks)} need.request a {len({m.recipient for m in asks})} strutture, request_id {sorted(rids)}: attesi {want}, uno solo"
+        if len(asks) > 5:
+            nos = {m.sender for m in b.log[:b.log.index(asks[5])] if m.recipient == bc and m.text.startswith("cancel")}
+            if not {m.recipient for m in asks[:5]} <= nos:
+                return "seconda ondata prima del no di tutta la prima (R3)"
+    return check
+
+
+def never_offered(*slots: str):
+    def check(b: Bus) -> str | None:
+        for _, m in _to_citizen(b):
+            bad = {o.get("slot_id") for o in parse_offers(m.text)} & set(slots) if act(m) == "offer" else set()
+            if bad:
+                return f"offerto al cittadino {sorted(bad)}, da fuori dall'anello o da chi non abbiamo interpellato (R17)"
+    return check
+
+
+def never_wrote_to(agent_id: str):
+    def check(b: Bus) -> str | None:
+        if any(m.sender == b.ids["booking_centre"] and m.recipient == agent_id for m in b.log):
+            return f"il centro ha scritto a {agent_id}, fuori dall'anello (R17)"
+    return check
+
+
+SCENARIOS.update({
+    # Lingua rara ro, che nessuno dei nostri parla: l'ospedale di Precotto (ro) per primo, anche se non è tra i
+    # partner pubblicati; la richiesta con i token della 2.1 e senza lang=. I partner tacciono: 5 richieste.
+    "booking_mach21_richiesta": dict(
+        start=("booking_centre", f"Buongiorno, vorrei prenotare. prescription_number={RX_RO} lang=ro"),
+        setup=seeded_rx(RX_RO, CIT, "VIS-FIS", "B"),
+        expect=[mach21_request(first=PRECOTTO), waves(5), wrote("checkin", "R:234")]),
+    # S vuoto entro la B, tutti i partner dicono no: prima ondata di 5, la seconda dopo i 5 no, stesso request_id.
+    "booking_mach21_ondate": dict(start=BACK, full_days=2,
+                                  setup=ring({i: (0.1 * (i + 1), RING_NONE) for i in range(12)}, round_s=3 * RING),
+                                  expect=[waves(), mach21_request(), ring_then_fallback(within=2 * RING)]),
+    # Uno della prima ondata tace: niente seconda ondata, il giro finisce allo scadere.
+    "booking_mach21_ondata_muta": dict(start=BACK, full_days=2,
+                                       setup=ring({i: (0.1 * (i + 1), RING_NONE) for i in range(4)}, round_s=RING / 2),
+                                       expect=[waves(5), ring_then_fallback(after=RING / 2)]),
+    # Un agente fuori dall'anello nella tabella dei partner, e un ospedale dell'anello mai interpellato, offrono
+    # col nostro request_id: nessuna richiesta fuori dall'anello, nessuna delle due offerte al cittadino.
+    "booking_mach21_offerta_impostore": dict(
+        start=BACK, full_days=2,
+        setup=setups(not_ring_first, inject(lambda b, m: m.text.startswith("need.request"),
+                                            (NOT_RING, fake_offer("W01QQQ-asst-sud-h1-20261124-1000")),
+                                            (UNASKED, fake_offer("W01QQQ-asst-sud-h1-20261124-1100")))),
+        expect=[never_wrote_to(NOT_RING), never_offered("W01QQQ-asst-sud-h1-20261124-1000", "W01QQQ-asst-sud-h1-20261124-1100"),
+                wrote("checkin", "R:234")]),
+    # Un ospedale dell'anello che non ha emesso le nostre offerte le annulla: ignorato, la prenotazione va (R18).
+    "booking_mach21_annullo_falso": dict(
+        start=BACK, setup=inject(lambda b, m: m.recipient == CIT and act(m) == "offer",
+                                 (FORGER, "cancel offer_id={offer_id} reason=facility_cancelled Il posto non c'è più.")),
+        expect=[never_told("booking_centre", "reason=facility_cancelled", cite="R18"), wrote("checkin", "R:234")]),
+    # Una ricevuta da chi non ha avuto il confirm: mai al cittadino (R18).
+    "booking_mach21_ricevuta_falsa": dict(
+        start=BACK, setup=inject(lambda b, m: m.recipient == b.ids["hospital"] and m.text.startswith("confirm"),
+                                 (FORGER, "booking.receipt booking_id=B-FAKE ledger_ref=L-FAKE Prenotazione confermata.")),
+        expect=[never_told("booking_centre", "B-FAKE", cite="R18"), wrote("checkin", "R:234")]),
+})
+
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"

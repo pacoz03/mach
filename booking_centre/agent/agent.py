@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -37,8 +38,9 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tools  # noqa: E402  (shared/tools.py, copied by shared/sync.sh; best effort, never raises)
-from mach import calendar, case, protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
+from mach import calendar, case, protocol, ring  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
 from mach.protocol import fields_of, first_word, words  # noqa: E402
+from mach.ring import in_ring  # noqa: E402  (MACH-2.1 R17: the 130 agents of the city map)
 from mach.safety import red_flag  # noqa: E402  (red flag in 6 lingue con la negazione, come il gp)
 
 # Module state (plan step 5: a = from history, b = declared cache with TTL and size, c = fact).
@@ -1221,6 +1223,7 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     if not booking_id or not ledger_ref or not citizen:
         return
     if not protocol.we(chat, city.agent_id, f"citizen={citizen}", to=message.sender, word="confirm"):
+        _alert(message, "phantom_receipt")  # R18: only from the facility our confirm went to
         return
     if protocol.we(chat, city.agent_id, f"booking_id={booking_id}", to=citizen, word="booking.receipt"):
         return
@@ -1278,12 +1281,18 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
             return
     if offer_id and not case.our_offer(chat, city.agent_id, offer_id):
         offer_id = ""  # not one of our offers: nothing the citizen holds was cancelled
+    if offer_id and message.sender.startswith("agent:") and (
+            message.sender != case.our_offer(chat, city.agent_id, offer_id).get("facility")):
+        _alert(message, "forged_cancel")  # R18: an offer or booking is cancelled only by who issued it
+        return
     if offer_id:
         # Through the facility, the Ledger's word: NO_CAPACITY, EXPIRED or SLOT_TAKEN lose the slot
         # for every case (calendar GONE); any cancel ends this case's claim on it. Only the slot of
-        # our own offer: a slot_id= in the sender's text moves nothing.
+        # our own offer: a slot_id= in the sender's text moves nothing. MACH-2.1 partners say taken.
         slot = case.our_offer(chat, city.agent_id, offer_id).get("slot_id", "")
-        if (code := fields_of(message.text).get("reason", "").upper()) in calendar.GONE:
+        code = fields_of(message.text).get("reason", "").upper()
+        code = "SLOT_TAKEN" if code == "TAKEN" else code
+        if code in calendar.GONE:
             CAL.mark(slot, code)
         CAL.release(slot, message.need_id or message.msg_id)
     if not offer_id and not fields_of(message.text).get("booking_id"):
@@ -1365,7 +1374,63 @@ _KNOWN_PARTNERS = {
         "agent:drchwbffymha": "",  # Navigli, EPICA
     },
 }
-_MAX_PARTNERS = 3
+# MACH-2.1 R3: at most _WAVE facilities per wave and two waves per round, the rare-language hospital
+# first; the second wave only once every facility of the first said no (25 requests at once: the first
+# answer to the citizen went from 9-26 s to 40-49 s).
+_WAVE = 5
+# MACH-2.1 R6: the deadline we send keeps this margin before the priority's end.
+_DEADLINE_MARGIN = timedelta(minutes=30)
+_LOG = logging.getLogger("booking_centre")
+
+
+def _alert(message: Message, reason: str) -> None:
+    """R17/R18: a line we ignore for who sent it. Logged (MACH-2.1 ``ring.alert``), never answered,
+    never told the citizen."""
+
+    _LOG.warning("ring.alert suspect=%s reason=%s need=%s", message.sender, reason, message.need_id)
+
+
+def _candidates(service: str, lang: str, found: list[str]) -> list[str]:
+    """The facilities a round asks, in order (R3): the hospital whose ASST speaks the citizen's rare
+    language (ring.RARE, the teams' table), then the Index's best of the published partners, then
+    the other published ones. Only agents of the ring (R17), never ours. The language is never sent."""
+
+    known = _KNOWN_PARTNERS.get(service, {})
+    rare = {**(ring.RARE if service == "hospital.physiatry" else {}), **{a: r for a, r in known.items() if r}}
+    first = [agent_id for agent_id, spoken in rare.items() if spoken == lang]
+    if not first and lang not in ("it", "en"):
+        # Nobody published this language: the ASSTs that published none come first.
+        first = [agent_id for agent_id, spoken in known.items() if not spoken]
+    return [p for p in dict.fromkeys([*first, *found, *known]) if in_ring(p) and p not in _OUR_FACILITIES]
+
+
+def _request_text(service: str, procedure: str, priority: str | None, request: str,
+                  now: datetime | None, born: datetime | None) -> str:
+    """Our ``need.request`` to a partner (MACH-2.1): the search criteria and our window only, never
+    ``lang=`` nor anything of the citizen (R:191, R9: over-disclosure is -2). ``deadline``: the need's
+    birth + the priority's calendar hours (R6) - _DEADLINE_MARGIN; ``after``: now + our chain, the
+    offer -> commit time (_offer_lead(), never < 4 h; U: _lead(), never < 1 h), the shorter one when
+    the longer leaves nothing before the deadline (R5); ``lease_s``: that chain in real seconds (R14)."""
+
+    text = f"need.request mach=2.1 service_type={service} procedure={procedure}"
+    if priority:
+        text += f" priority={priority}"
+    if now is not None:
+        end = calendar.deadline(priority, born or now)
+        deadline = None if end is None else end - _DEADLINE_MARGIN
+        floor = timedelta(hours=1 if priority == "U" else 4)
+        after = now + max(_offer_lead(), floor)
+        if priority == "U" or (deadline is not None and after >= deadline):
+            after = now + max(_lead(), floor)
+        text += f" after={after:%Y-%m-%dT%H:%M}" + (f" deadline={deadline:%Y-%m-%dT%H:%M}" if deadline else "")
+    lease = min(1800, round(max(_lead(), _OFFER_LEAD).total_seconds() / max(_rate(), 1.0)))
+    return text + (
+        f" lease_s={lease} request_id={request} Buongiorno, siamo il centro prenotazioni dell'ASST Gorla: "
+        "cerchiamo disponibilità per questa prestazione. Nessun dato del cittadino in questa "
+        "richiesta: ve li mandiamo solo dopo il suo consenso. Grazie!"
+    )
+
+
 # A round to the partners, in real seconds. It ends at the first fitting partner slot, when every
 # partner asked has answered, or at this cap; until then no relaxed alternative and no waiting list.
 # It never holds the turn: the answers' turns or the timer (_ring) decide. Our old 30 s in the turn
@@ -1525,98 +1590,104 @@ def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) 
 
 async def _ask_partners(
     city: City, chat: list[Message], citizen: str, procedure: str, priority: str | None, key: str,
-    lang: str = "it",
+    lang: str = "it", now: datetime | None = None, born: datetime | None = None,
 ) -> tuple[list[Message], bool, bool]:
     """Once per need (again after the citizen turned our offers down): the search criteria, and
-    nothing about the citizen, to the facilities of the other ASSTs that offer the service. One look
-    at the case after, never a wait. (chat, a round was sent, now or before; it was sent now)."""
+    nothing about the citizen, to the facilities of the other ASSTs that offer the service, one wave
+    of _WAVE; the round's second wave once every facility of the first said no (R3). One look at the
+    case after, never a wait. (chat, a round was sent, now or before; a wave was sent now)."""
 
     agent = city.agent_id
     service = _SERVICES.get(procedure)
     if not service:
         return chat, False, False
     rounds = _partner_rounds(chat, agent)
-    if not rounds or (len(rounds) < _PARTNER_ROUNDS and _refused_since(chat, citizen, rounds[-1])):
+    if rounds and not (len(rounds) < _PARTNER_ROUNDS and _refused_since(chat, citizen, rounds[-1])):
+        request, asks = _latest_round(chat, agent)
+        asked = {row.recipient for row in asks}
+        no = {row.sender for row in _partner_rows(chat, agent)
+              if _request_of(row, [request]) and "cancel" in words(row.text) and "offer" not in words(row.text)}
+        sent = _sent(key)
+        if len(asked) > _WAVE or f"wave2:{request}" in sent.said or not asked <= no:
+            return chat, True, False  # the round runs on: an answer pending, or both waves sent
+        sent.said.add(f"wave2:{request}")  # no await since the check: one second wave per round
+        wave = [partner for partner in _candidates(service, lang, []) if partner not in asked]
+        reached = await _send_wave(city, wave, _request_text(service, procedure, priority, request, now, born))
+        return chat, True, reached > 0
+    try:
+        peers = await city.find(service)
+    except Exception:  # noqa: BLE001 - the Index is down: the published partners remain
+        peers = []
+    ranked = sorted(
+        (
+            peer
+            for peer in peers
+            if peer.agent_id not in _OUR_FACILITIES
+            and peer.agent_id.startswith("agent:")
+            and peer.role in ("", "facility")
+            and (not peer.capabilities or service in peer.capabilities)
+        ),
+        key=lambda peer: -float(peer.reputation or 0),
+    )
+    # Only the published partners: an agent outside the teams' list may be an impostor.
+    found = [peer.agent_id for peer in ranked if peer.agent_id in _KNOWN_PARTNERS.get(service, {})]
+    # A new round after the citizen turned our offers down: the partners' agendas move.
+    seed = f"{agent}/{key}" + (f"/{len(rounds)}" if rounds else "")
+    request = "x-" + hashlib.sha256(seed.encode()).hexdigest()[:12]
+    text = _request_text(service, procedure, priority, request, now, born)
+    if not await _send_wave(city, _candidates(service, lang, found), text):
+        return chat, False, False
+    notice = _phrase(chat, "partners")
+    if not protocol.exact(chat, agent, notice):
+        sent = _sent(key)
+        pending = sent.pending  # the notice is not the replacement the citizen is owed
+        await _say(city, citizen, notice)
+        sent.pending = pending
+    # A partner may answer at once; any later answer opens a turn of its own (_partner_answer).
+    chat = await _until(city, chat[-1].need_id if chat else None, chat, lambda rows: True, tries=1)
+    return chat, True, True
+
+
+async def _send_wave(city: City, partners: list[str], text: str) -> int:
+    """``text`` to the first _WAVE of ``partners`` that are not DOWN: how many took it."""
+
+    reached = 0
+    for partner in [partner for partner in partners if not CAL.down(partner)][:_WAVE]:
         try:
-            peers = await city.find(service)
-        except Exception:  # noqa: BLE001 - the Index is down: the published partners remain
-            peers = []
-        ranked = sorted(
-            (
-                peer
-                for peer in peers
-                if peer.agent_id not in _OUR_FACILITIES
-                and peer.agent_id.startswith("agent:")
-                and peer.role in ("", "facility")
-                and (not peer.capabilities or service in peer.capabilities)
-            ),
-            key=lambda peer: -float(peer.reputation or 0),
-        )
-        known = _KNOWN_PARTNERS.get(service, {})
-        # Only the published partners: an agent outside the teams' list may be an impostor.
-        found = [peer.agent_id for peer in ranked if peer.agent_id in known]
-        # The ASST whose doctor speaks the citizen's rare language first, then the Index's best,
-        # then the published ones the Index did not return. The language itself is never sent.
-        first = [agent_id for agent_id, rare in known.items() if rare and rare == lang]
-        # Every published partner is asked: at level 4 the valid slots are in one or few ASSTs
-        # (journeys 0134, 0164: English speakers, three partners asked, none had room).
-        limit = max(_MAX_PARTNERS, len(known))
-        if not first and lang not in ("it", "en"):
-            # Nobody published this language: the ASSTs that published none come first.
-            first = [agent_id for agent_id, rare in known.items() if not rare]
-        partners = list(dict.fromkeys([*first, *found, *known]))
-        # A new round after the citizen turned our offers down: the partners' agendas move.
-        seed = f"{agent}/{key}" + (f"/{len(rounds)}" if rounds else "")
-        request = "x-" + hashlib.sha256(seed.encode()).hexdigest()[:12]
-        text = f"need.request service_type={service} procedure={procedure}"
-        if priority:
-            text += f" priority={priority}"
-        text += (
-            f" request_id={request} Buongiorno, siamo il centro prenotazioni dell'ASST Gorla: "
-            "cerchiamo disponibilità per questa prestazione. Nessun dato del cittadino in questa "
-            "richiesta: ve li mandiamo solo dopo il suo consenso. Grazie!"
-        )
-        reached = 0
-        for partner in partners[:limit]:
-            if CAL.down(partner):
-                continue
-            try:
-                await city.say(partner, text)
-                reached += 1
-            except Exception:  # noqa: BLE001 - CapError or an httpx timeout: the next partner still gets it
-                CAL.mark(partner, "DOWN")  # never the same message again
-        if not reached:
-            return chat, False, False
-        notice = _phrase(chat, "partners")
-        if not protocol.exact(chat, agent, notice):
-            sent = _sent(key)
-            pending = sent.pending  # the notice is not the replacement the citizen is owed
-            await _say(city, citizen, notice)
-            sent.pending = pending
-        # A partner may answer at once; any later answer opens a turn of its own (_partner_answer).
-        chat = await _until(city, chat[-1].need_id if chat else None, chat, lambda rows: True, tries=1)
-        return chat, True, True
-    return chat, True, False
+            await city.say(partner, text)
+            reached += 1
+        except Exception:  # noqa: BLE001 - CapError or an httpx timeout: the next partner still gets it
+            CAL.mark(partner, "DOWN")  # never the same message again
+    return reached
+
+
+def _latest_round(chat: list[Message], agent: str) -> tuple[str, list[Message]]:
+    """Our latest round to the partners: its request_id and its need.request rows, both waves
+    (("", []) for none)."""
+
+    asks = [row for row in chat if row.sender == agent and row.recipient.startswith("agent:")
+            and first_word(row.text) == "need.request" and fields_of(row.text).get("request_id")]
+    if not asks:
+        return "", []
+    request = fields_of(asks[-1].text)["request_id"]
+    return request, [row for row in asks if fields_of(row.text)["request_id"] == request]
 
 
 def _round_left(chat: list[Message], agent: str, priority: str | None) -> float | None:
     """Real seconds the latest round to the partners still waits: 0.0 once every partner asked in
     it has answered or its cap has passed (_PARTNER_ROUND); None when the history shows no round.
-    By the request's sent_at against _wall(), so a restarted pod reads it from the case too."""
+    By the latest wave's sent_at against _wall(), so a restarted pod reads it from the case too."""
 
-    asks = [row for row in chat if row.sender == agent and row.recipient.startswith("agent:")
-            and first_word(row.text) == "need.request" and fields_of(row.text).get("request_id")]
-    if not asks:
+    request, asked = _latest_round(chat, agent)
+    if not asked:
         return None
-    request = fields_of(asks[-1].text)["request_id"]
-    asked = [row for row in asks if fields_of(row.text)["request_id"] == request]
     # An answer is an offer or a cancel: the partners' acks carry the request_id too (21/11, 6 h:
     # info 140 of 140, ack 17 of 17, ricevuto 56 of 492) and say nothing about their slots.
     heard = {row.sender for row in _partner_rows(chat, agent)
              if words(row.text) & {"offer", "cancel"} and _request_of(row, [request])}
     if {row.recipient for row in asked} <= heard:
         return 0.0
-    at = protocol.when(asked[0].sent_at or "")
+    at = protocol.when(asked[-1].sent_at or "")
     cap = _PARTNER_ROUND_U if priority == "U" else _PARTNER_ROUND
     return 0.0 if at is None else max(0.0, cap - (_wall() - at).total_seconds())
 
@@ -1631,7 +1702,7 @@ async def _try_partners(
     round is over with nothing that fits, or no partner took it: go on alone."""
 
     key = message.need_id or message.msg_id
-    chat, asked, fresh = await _ask_partners(city, chat, citizen, procedure, priority, key, lang)
+    chat, asked, fresh = await _ask_partners(city, chat, citizen, procedure, priority, key, lang, now, born)
     if not asked:
         return False
     slots = _partner_fit(chat, city.agent_id, key, procedure, priority, lang, now, born, no, skip)
@@ -1639,7 +1710,7 @@ async def _try_partners(
         await _offer(city, key, citizen, _spread(slots, key), number, priority, replacing, chat, "partner_offers")
         return True
     left = _round_left(chat, city.agent_id, priority)
-    if left is None:  # sent in this very turn, the history does not show it yet
+    if left is None or fresh:  # a wave sent in this very turn: the history may not show it yet
         left = _PARTNER_ROUND_U if priority == "U" else _PARTNER_ROUND
     if left <= 0:
         return False
@@ -1657,6 +1728,12 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     waiting list; a citizen holding offers keeps them)."""
 
     agent = city.agent_id
+    if not in_ring(message.sender):
+        _alert(message, "not_listed")  # R17: only the 130 agents of the city map
+        return
+    if not _request_of(message, _asked_partners(chat, agent).get(message.sender, [])):
+        _alert(message, "fake_slot" if "offer" in words(message.text) else "forged_cancel")  # not asked in this case
+        return
     citizen = protocol.citizen(chat)
     if citizen is None or _booking_stage(chat, agent, citizen):
         return
