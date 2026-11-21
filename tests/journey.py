@@ -1911,6 +1911,163 @@ SCENARIOS.update({
 })
 
 
+# --- Centro prenotazioni: pagine di world in cache tra i casi, red flag scritta al centro
+# (città 21/11 03:30-04:00: world risponde in ~270 s, il Relay consegna in 2-6 minuti).
+
+LATER = "citizen:T-42"
+
+
+def later_citizen(b: Bus) -> None:
+    """Un secondo cittadino (VIS-FIS, B) scrive al centro quando il primo ha già ricevuto le sue
+    offerte, quindi dopo una risposta di world al primo caso. Da lì world risponde dopo 3 s: senza
+    una pagina in cache il secondo caso aspetta il Ledger."""
+    c = Citizen(b, b.citizen.sc, LATER, "N-2026-11-23-0042")
+    c.rx = "RX-O42"
+    b.ledger.rx[c.rx] = dict(prescription_number=c.rx, patient=c.cid, procedure="VIS-FIS",
+                             priority="B", issued=b.ledger.now)
+    react = b.citizen.react
+
+    def first_offer(m: Message) -> None:
+        react(m)
+        if act(m) == "offer" and c.cid not in b.others:  # in b.others solo ora: Bus.run li fa scrivere all'avvio
+            b.others[c.cid], b.ledger.slow_world = c, 3.0
+            c.say(b.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={c.rx} lang=it")
+
+    b.citizen.react = first_offer
+
+
+def offered_on_turn(cid: str, seconds: float):
+    """``cid`` riceve la prima offerta nel turno aperto dal suo ultimo messaggio al centro (le
+    preferenze dette: da lì il caso è offribile), entro ``seconds`` s."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        at = next((i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == cid and act(m) == "offer"), None)
+        if at is None:
+            return f"nessuna offerta del centro a {cid}"
+        asked = max(i for i, m in enumerate(b.log[:at]) if m.sender == cid and m.recipient == bc)
+        offer, ask = b.log[at], b.log[asked]
+        took = b.stamp[offer.msg_id] - b.stamp[ask.msg_id]
+        if took >= seconds or b.opened.get(b.turn_of[offer.msg_id]) is not ask:
+            return (f"prima offerta a {cid} dopo {took:.1f} s da «{ask.text[:40]}» e non nel suo turno "
+                    f"(attesa entro {seconds} s, da una pagina di world già letta)")
+    return check
+
+
+def red_flag_after_prefs(text: str):
+    """Dopo il passaggio del gp il cittadino risponde alle preferenze del centro e subito dopo gli
+    scrive ``text`` (una red flag), mentre la lettura di world del centro è ancora in viaggio."""
+    def setup(b: Bus) -> None:
+        react, said = b.citizen.react, []
+
+        def wrapped(m: Message) -> None:
+            react(m)
+            if not said and m.sender == b.ids["booking_centre"] and act(m) == "data.request":
+                said.append(m.msg_id)
+                b.citizen.say(b.ids["booking_centre"], text)
+        b.citizen.react = wrapped
+    return setup
+
+
+def escalated_at(folder: str, text: str):
+    """La prima risposta di ``folder`` alla red flag è escalate.emergency reason=red_flag con il 112,
+    e su quel need non dice altro al cittadino (R:242, R:442: «Non inviate altro su quel need»)."""
+    def check(b: Bus) -> str | None:
+        me = b.ids[folder]
+        flag = next((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == me and m.text == text), None)
+        if flag is None:
+            return f"il cittadino non ha scritto «{text[:40]}» a {folder}"
+        after = [m for m in b.log[flag + 1:] if m.sender == me and m.recipient == CIT]
+        first = after[0] if after else None
+        if (first is None or act(first) != "escalate.emergency" or fields(first.text).get("reason") != "red_flag"
+                or not re.search(r"\b112\b", first.text)):
+            return (f"{folder}: dopo «{text[:40]}» la prima risposta è «{first.text[:60] if first else ''}», "
+                    "attesa escalate.emergency reason=red_flag con il 112 (R:242)")
+        if len(after) > 1:
+            return f"{folder}: dopo l'escalation ha scritto ancora al cittadino «{after[1].text[:60]}» (R:442)"
+    return check
+
+
+ROSSO_IT = "forti dolori al petto da stamattina"
+ROSSO_EN = "severe chest pain since this morning"
+SCENARIOS.update({
+    # Il secondo cittadino arriva dopo la risposta di world al primo, con world ormai a 3 s: le sue
+    # offerte partono nel turno delle sue preferenze dalla pagina già letta, su slot diversi.
+    "booking_world_in_cache": dict(start=BACK, handoff=True, setup=later_citizen, expect=[
+        offered_on_turn(LATER, 2.0), distinct_offers, wrote("checkin", "R:234")]),
+    # Red flag scritta al centro dopo il passaggio del gp per palpitazioni: escalation prima di tutto,
+    # poi silenzio anche quando arriva la risposta di world (--ledger-turns).
+    "booking_red_flag_it": dict(start=("gp", "Sento le palpitazioni da qualche giorno."), handoff=True,
+                                slow_world=3.0, setup=red_flag_after_prefs(ROSSO_IT),
+                                expect=[escalated_at("booking_centre", ROSSO_IT)]),
+    "booking_red_flag_en": dict(start=("gp", "I have had palpitations for a few days."), handoff=True,
+                                slow_world=3.0, setup=red_flag_after_prefs(ROSSO_EN),
+                                expect=[escalated_at("booking_centre", ROSSO_EN)]),
+})
+
+
+REWRITER = "citizen:T-43"
+
+
+def rewriting_citizen(b: Bus) -> None:
+    """Live N-2026-11-02-890924000260: il Ledger conferma la ricetta (issued), poi alla domanda sulle
+    preferenze il cittadino riscrive il numero due volte (in prosa e in un data.response) e da lì
+    `prescription` risponde dopo 3 s. Arriva dopo le prime offerte a T-1: la città ha già detto le
+    regole in vigore (nessuna, come il 21/11: rules count=0)."""
+    bc = b.ids["booking_centre"]
+    c = Citizen(b, b.citizen.sc, REWRITER, "N-2026-11-23-0043")
+    c.rx = "RX-O43"
+    b.ledger.rx[c.rx] = dict(prescription_number=c.rx, patient=c.cid, procedure="VIS-FIS",
+                             priority="B", issued=b.ledger.now)
+    react, own, late, slow = b.citizen.react, c.react, b.ledger.late, []
+    b.ledger.late = lambda text: 3.0 if slow and text.split()[:1] == ["prescription"] else late(text)
+
+    def first_offer(m: Message) -> None:
+        react(m)
+        if act(m) == "offer" and c.cid not in b.others:
+            b.others[c.cid] = c
+            c.say(bc, f"Buongiorno, vorrei prenotare. prescription_number={c.rx} lang=it")
+
+    def rewrite(m: Message) -> None:
+        if slow or m.sender != bc or act(m) != "data.request" or fields(m.text).get("fields") != "days":
+            return own(m)
+        slow.append(m.msg_id)
+        c.say(bc, f"Le riscrivo il numero della ricetta: prescription_number={c.rx}")
+        c.say(bc, f"data.response purpose=booking lang=it prescription_number={c.rx}")
+
+    b.citizen.react, c.react = first_offer, rewrite
+
+
+def rx_trusted(cid: str):
+    """Con la ricetta già confermata il centro non dice «non trovo una ricetta» né rinvia altrove, e
+    offre senza aspettare una seconda risposta del Ledger su `prescription`."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        said = [(i, m) for i, m in enumerate(b.log) if m.sender == bc and m.recipient == cid]
+        bad = next((m for _, m in said if "non trovo una ricetta" in m.text or "Su questo non posso" in m.text), None)
+        if bad:
+            return f"booking_centre a {cid}: «{bad.text[:70]}» con la ricetta già confermata (issued)"
+        at = next((i for i, m in said if act(m) == "offer"), None)
+        if at is None:
+            return f"nessuna offerta del centro a {cid}"
+        answers = sum(m.sender == LEDGER and m.recipient == bc and m.need_id == b.others[cid].need
+                      and m.text.startswith("prescription ") for m in b.log[:at])
+        if answers != 1:
+            return f"prima offerta a {cid} dopo {answers} risposte del Ledger a prescription invece di una"
+    return check
+
+
+SCENARIOS.update({
+    # Ricetta confermata, numero riscritto mentre la nuova lettura è in viaggio: offerte, mai «non
+    # trovo una ricetta» (live 02:25) né il rinvio «Su questo non posso…» (live 02:30).
+    "booking_ricetta_riscritta": dict(start=BACK, handoff=True, setup=rewriting_citizen, expect=[rx_trusted(REWRITER)]),
+    # Numero che il Ledger non conosce (refused prescription code=NOT_FOUND): lo si dice subito.
+    "booking_ricetta_inesistente": dict(
+        start=("booking_centre", "Buongiorno, vorrei prenotare. prescription_number=RX-NONE lang=it"),
+        expect=[told_text("booking_centre", "non trovo una ricetta", "Ledger: refused prescription"),
+                no_write("hold", "ricetta inesistente")]),
+})
+
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"

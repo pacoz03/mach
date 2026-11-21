@@ -57,7 +57,16 @@ _RTT_MAX = 600.0
 # ponytail: per process and a fixed window; a second pod does not see them.
 _OFFERED: dict[str, tuple[str, float]] = {}
 _OFFER_SECONDS = 900.0
-# Slots a facility lost on the Ledger (taken, expired): never offered again by this process.
+# World pages of any case, answers and pushes alike (the slots are the ASST's, not the case's):
+# (procedure, page) -> (time.monotonic() when first seen, Ledger sent_at, page text). A new case
+# offers from a page younger than _PAGE_FRESH in the turn it becomes offerable, then asks the
+# Ledger itself (21/11: world answers in ~270 s, max 648 s; the Relay adds 2-6 minutes).
+# ponytail: per process; 4 real minutes = 4 agenda hours at 60x. A slot taken since comes back as
+# a refused hold (_GONE, answered in the same turn): shorten it if those refusals climb.
+_PAGES: dict[tuple[str, int], tuple[float, datetime | None, str]] = {}
+_PAGE_FRESH = 240.0
+# Slots a facility lost on the Ledger (taken, expired), or that we asked a facility to book:
+# never offered again by this process.
 _GONE: set[str] = set()
 _GONE_CODES = frozenset({"NO_CAPACITY", "EXPIRED", "SLOT_TAKEN"})
 # Doctor key (the last segment of doctor_id) -> languages, gender, days. ``*`` is the ASST's
@@ -370,6 +379,11 @@ async def main(need: Need, city: City) -> None:
     # The turn's own message belongs to the case even when history does not show it yet.
     if all(row.msg_id != message.msg_id for row in chat):
         chat = [*chat, message]
+    _keep_pages(chat)
+    if message.need_id and any(
+        row.sender == city.agent_id and first_word(row.text) == "escalate.emergency" for row in chat
+    ):
+        return  # An emergency ends the case: nothing else on this need (R:442), whatever arrives.
     await _desk(city, message, chat)
 
 
@@ -491,9 +505,10 @@ class _Sent:
         # A replacement we owe the citizen (we said "cerco un'alternativa") that a slow Ledger
         # left unsent: the next turn of the case resumes it (journeys 0189, 0191 ended in silence).
         self.pending = False
-        # A Ledger read to send once the citizen has our answer (a refusal answered from the
-        # pages the case already had): fresh pages for the next round, never waited for.
-        self.reread = ""
+        # Ledger reads to send once the citizen has our answer (a refusal answered from the pages
+        # the case already had, a new case from _PAGES): fresh pages for the next round, never
+        # waited for.
+        self.reread: list[str] = []
 
 
 # Turns of one need run at the same time; offers wait on this lock so they are not duplicated.
@@ -533,8 +548,8 @@ async def _advance(
             else:
                 await _advance_alone(city, message, chat, key, replacing=replacing)
                 sent = _sent(key)
-                if sent.reread:
-                    read, sent.reread = sent.reread, ""
+                reads, sent.reread = sent.reread, []
+                for read in reads:
                     await _say(city, LEDGER, read)
     finally:
         gate.turns -= 1
@@ -586,23 +601,29 @@ async def _advance_alone(
         ),
         "",
     )
+    # With no rule that expires prescriptions (P1 off: 21/11 rules count=0), an issued answer from
+    # earlier in the case counts too. Live N-2026-11-02-890924000260: the citizen wrote the number
+    # again while our re-read was in flight, the Relay sorted it before that read, and the issued
+    # answer was ignored for half an hour. Rules unknown or P1 on: only an answer after them.
+    now = _now(chat)
+    rules = None if now is None else _rules(chat, now)
+    known = _prescription(chat, number) if rules is not None and "P1" not in rules else None
+    if known is not None and (not known.get("procedure") or known.get("state") not in (None, "issued")):
+        known = None
     asked = _we(_after(chat, since), agent, f"prescription_number={number}", to=LEDGER, word="prescription")
-    if _prescription(_after(chat, since), number) is None and not asked:
+    if known is None and _prescription(_after(chat, since), number) is None and not asked:
         if not await _say(city, LEDGER, f"prescription prescription_number={number}"):
             return
         # A number seen for the first time after an earlier phase (a renewal): fresh agenda.
         refresh = refresh or bool(sent.mark) or _ledger(chat, "agenda") is not None
-    if _prescription(_after(chat, since), number) is None:
+    if known is None and _prescription(_after(chat, since), number) is None:
         chat = await _until(
             city, need_id, chat, lambda rows: _prescription(_after(rows, since), number) is not None
         )
-    reply = _prescription(_after(chat, since), number)
+    reply = known or _prescription(_after(chat, since), number)
     if reply is None:
-        # The Ledger is slow: its answer opens a turn, or the citizen writes again. A citizen
-        # writing again about a number the Ledger never confirmed hears that we cannot find it.
-        if again and asked:
-            ask = f"data.request purpose=booking fields=prescription_number {_phrase(chat, 'unknown_rx')}"
-            await _tell(city, chat, citizen, ask, again=again)
+        # Not answered yet (21/11: 4-7 minutes): its answer opens a turn. Never "not found" for an
+        # answer still on its way; only a real one (no procedure, or refused) says so, below.
         return
     procedure = reply.get("procedure")
     priority = reply.get("priority")
@@ -631,13 +652,23 @@ async def _advance_alone(
         checked = _phrases(chat)["verified"].format(what=_visit(chat, procedure, priority))
         if missing and not await _preferences_ready(city, chat, citizen, missing, checked):
             return
+
+    def page_of(rows: list[Message], page: int) -> str | None:
+        """The page from _PAGES while fresh (the latest answer any case saw), else the case's own."""
+        return _fresh_page(procedure, page) or _world_page(rows, page)
+
     # A refusal or a facility's cancel is answered in its own turn, from the pages the case
     # already holds and the clock run forward (21/11: re-reading agenda, rules and world first
-    # left the citizen 4-5 minutes in silence). Page 1 is read again after the answer.
-    quick = replacing and not resumed and _now(chat) is not None and _world_page(chat, 1) is not None
+    # left the citizen 4-5 minutes in silence). So is a new case, from the pages another case
+    # read (_PAGES): every new citizen waited minutes for world. The reads go out after the answer.
+    first = not replacing and not sent.offers and not _offered(chat, agent) and _fresh_page(procedure, 1) is not None
+    quick = _now(chat) is not None and (first or (replacing and not resumed and page_of(chat, 1) is not None))
     if quick:
         recent = chat
-        sent.reread = f"world procedure={procedure} page=1"
+        if replacing:
+            sent.reread = [f"world procedure={procedure} page=1"]
+        elif not _asked(chat, agent, procedure, 1):
+            sent.reread = ["agenda", "rules", f"world procedure={procedure} page=1"]
     else:
         if refresh or (
             not sent.mark and _ledger(chat, "agenda") is None and not _exact(chat, agent, "agenda")
@@ -652,7 +683,7 @@ async def _advance_alone(
 
         def fresh(rows: list[Message]) -> bool:
             rows = _recent(rows, sent)
-            return _has_agenda(rows) and _world_page(rows, 1) is not None
+            return _has_agenda(rows) and page_of(rows, 1) is not None
 
         if not fresh(chat):
             chat = await _until(city, need_id, chat, fresh)
@@ -660,7 +691,7 @@ async def _advance_alone(
     _round_trip(chat, agent)
     now = _now(chat)
     born = _born(chat)
-    world = _world_page(recent, 1)
+    world = page_of(recent, 1)
     if now is None or world is None:
         return
     rules = _rules(chat, now)
@@ -728,18 +759,18 @@ async def _advance_alone(
         if page >= pages or page >= _MAX_PAGE:
             break
         next_page = page + 1
-        if _world_page(recent, next_page) is None:
+        if page_of(recent, next_page) is None:
             if not _asked(recent, agent, procedure, next_page) and not await _say(
                 city, LEDGER, f"world procedure={procedure} page={next_page}"
             ):
                 return
-            if quick:
+            if quick and replacing:
                 # One look, no wait: offer what fits so far, else say we are on it. The Ledger's
                 # answer opens a turn of its own, which resumes the search (pending).
                 chat = recent = await _until(
-                    city, need_id, chat, lambda rows: _world_page(rows, next_page) is not None, tries=1
+                    city, need_id, chat, lambda rows: page_of(rows, next_page) is not None, tries=1
                 )
-                if _world_page(recent, next_page) is None:
+                if page_of(recent, next_page) is None:
                     if fallback:
                         break
                     if f"searching:{sent.trigger}" not in sent.said:
@@ -749,10 +780,10 @@ async def _advance_alone(
                     return
             else:
                 chat = await _until(
-                    city, need_id, chat, lambda rows: _world_page(_recent(rows, sent), next_page) is not None
+                    city, need_id, chat, lambda rows: page_of(_recent(rows, sent), next_page) is not None
                 )
                 recent = _recent(chat, sent)
-        world = _world_page(recent, next_page)
+        world = page_of(recent, next_page)
         if world is None:
             return  # On the Ledger's next turn, start with the pages already in history.
     if fallback:
@@ -1007,6 +1038,9 @@ async def _on_confirm(
             f"cancel offer_id={offer_id} reason=facility_unavailable {_phrase(chat, 'down')}",
         )
         await _advance(city, message, chat, replacing=True)
+        return
+    # The slot is being held for this citizen: a cached page (_PAGES) still shows it free.
+    _GONE.add(slot)
 
 
 async def _forward_receipt(city: City, message: Message, chat: list[Message]) -> None:
@@ -1951,6 +1985,32 @@ def _world_page(chat: list[Message], page: int) -> str | None:
     return None
 
 
+def _keep_pages(chat: list[Message]) -> None:
+    """Every world page in ``chat`` goes to _PAGES under the procedure its slot lines name (an
+    empty page: the one our latest world ask named), unless _PAGES holds a later Ledger answer."""
+
+    asked = ""
+    for row in chat:
+        if row.recipient == LEDGER and first_word(row.text) == "world":
+            asked = fields_of(row.text).get("procedure", "")
+            continue
+        page = _page(row.text)[0]
+        if _world_page([row], page) is None:
+            continue
+        named = {_slot(line).get("procedure") for line in row.text.splitlines() if "slot_id=" in line} - {None, ""}
+        procedure = named.pop() if len(named) == 1 else "" if named else asked
+        if not procedure:
+            continue
+        at, old = _when(row.sent_at or ""), _PAGES.get((procedure, page))
+        if old is None or (at is not None and (old[1] is None or at > old[1])):
+            _PAGES[(procedure, page)] = (time.monotonic(), at, row.text)
+
+
+def _fresh_page(procedure: str, page: int) -> str | None:
+    hit = _PAGES.get((procedure, page))
+    return hit[2] if hit is not None and time.monotonic() - hit[0] < _PAGE_FRESH else None
+
+
 def _now(chat: list[Message]) -> datetime | None:
     """Agenda time now, never the bare reading: the Ledger answers minutes late and a reading
     from an earlier turn ages too (21/11: a reading 26 minutes old, slots offered 13 agenda
@@ -2033,7 +2093,9 @@ def _prescription(chat: list[Message], number: str) -> dict[str, str] | None:
 
     found: dict[str, str] | None = None
     for row in chat:
-        if row.sender == LEDGER and first_word(row.text) == "prescription":
+        head = first_word(row.text)
+        # "refused prescription code=NOT_FOUND ...": an answer too, with no procedure.
+        if row.sender == LEDGER and (head == "prescription" or head == "refused" and "prescription" in words(row.text)):
             fields = fields_of(row.text)
             if fields.get("prescription_number", number) == number:
                 found = fields
@@ -2105,6 +2167,7 @@ async def _until(
             fresh = await city.history(need_id=need_id)
         except CapError:
             fresh = chat
+        _keep_pages(fresh)
         if ready(fresh):
             return fresh
         if attempt + 1 < tries:
