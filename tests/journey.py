@@ -181,6 +181,9 @@ class Ledger:
         self.pods = bool(sc.get("pods"))  # due pod senza lock comune: un commit doppio (DUPLICATE) è la corsa iniettata
         # sc["reserve_marked"]: world marca la riserva U anche con P3 spenta (città 21/11: rules count=0)
         self.reserve_marked = sc.get("reserve_marked", False)
+        self.no_day = sc.get("no_day", False)  # world day=... rifiutato SCHEMA_INVALID detail=day
+        self.page_refused = sc.get("page_refused", False)  # pagina oltre l'ultima: SCHEMA_INVALID detail=page
+        self.pages_extra = sc.get("pages_extra", 0)
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -307,14 +310,23 @@ class Ledger:
         if op == "rules":
             return REPLY["rules"].format(**self.rules)
         if op == "world":
+            # day=: il giorno della settimana delle righe (mon..fri) o la data ISO; sc["no_day"] lo rifiuta
+            # come uno schema che non lo conosce (R:78 lo nomina, il formato non è documentato).
+            day = f.get("day", "")
+            if day and (self.no_day or not (day in DAYS[:5] or re.fullmatch(r"\d{4}-\d{2}-\d{2}", day))):
+                return f"{REPLY['refused'].format(op=op, code='SCHEMA_INVALID')} detail=day"
             rows = sorted((s for s in self.slots.values()
                            if f.get("procedure", s["procedure"]) == s["procedure"]
                            and f.get("facility", s["facility"]) == s["facility"]
+                           and (not day or day in (s["day"], s["at"][:10]))
                            and not (REPLY["slots"] == SDK_REPLY["slots"] and self.taken(s["slot_id"]))),
                           key=lambda s: (s["at"], s["slot_id"]))
             page = int(f["page"]) if f.get("page", "").isdigit() else 1
             pages = max(1, -(-len(rows) // PAGE))
-            lines = [REPLY["slots"].format(page=page, pages=pages, count=len(rows))]
+            if page > pages and self.page_refused:  # città 21/11 10:32-11:02: page=2 di VIS-CARD, page=4 di VIS-FIS
+                return f"{REPLY['refused'].format(op=op, code='SCHEMA_INVALID')} detail=page"
+            # sc["pages_extra"]: l'intestazione conta pagine che non ci sono più (slot presi nel frattempo)
+            lines = [REPLY["slots"].format(page=page, pages=pages + self.pages_extra, count=len(rows))]
             for s in rows[(page - 1) * PAGE: page * PAGE]:
                 line = REPLY["slot"].format(**s, free=0 if self.taken(s["slot_id"]) else 1)
                 marked = self.rules["P3"] == "on" or self.reserve_marked
@@ -3966,6 +3978,78 @@ SCENARIOS.update({
     "consultorio_cancel_correlabile": dict(
         start=("family_counseling", XGIN.format(rid="R-66", extra="")), foreign=True, setup=unconsented_confirm,
         expect=[family_cancel_rid("R-66")]),
+})
+
+
+# --- Centro prenotazioni: i giorni della finestra chiesti tutti nel primo turno (città 21/11 ~12:00: ~10
+# minuti per verso tra noi e il Ledger, 123 casi su 161 con 2-5 pagine di world chieste una dopo l'altra).
+
+
+def warm_clock(b: Bus) -> None:
+    """Il pod del centro conosce già l'orologio (un caso precedente ha letto agenda): la finestra si calcola
+    nel primo turno."""
+    b.agents[b.ids["booking_centre"]].main.__globals__["_CLOCK"].update(fields(b.ledger.read("agenda", {})))
+
+
+def booking_world_asks(b: Bus) -> list[Message]:
+    bc = b.ids["booking_centre"]
+    return [m for m in b.log if m.sender == bc and m.recipient == LEDGER and m.text.startswith("world ")]
+
+
+def days_together(n: int):
+    """Le prime letture di world del centro sono ``n`` giorni (day=, senza page=), tutte nello stesso turno,
+    e l'offerta parte senza altre letture di world prima."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        offer = next((i for i, m in enumerate(b.log) if m.sender == bc and m.recipient == CIT and act(m) == "offer"), None)
+        if offer is None:
+            return "nessuna offerta del centro dopo le letture per giorno"
+        asks = [m for m in booking_world_asks(b) if b.log.index(m) < offer]
+        days = [fields(m.text).get("day") for m in asks]
+        if len(asks) != n or None in days or len(set(days)) != n or any("page=" in m.text for m in asks):
+            return f"letture di world prima dell'offerta: {[m.text for m in asks]}, attesi {n} giorni con day="
+        if len({b.turn_of[m.msg_id] for m in asks}) != 1:
+            return "giorni della finestra chiesti in turni diversi: uno dopo l'altro"
+    return check
+
+
+def pages_after_day_refused(b: Bus) -> str | None:
+    """day= rifiutato (SCHEMA_INVALID detail=day): le pagine partono insieme, day= mai più."""
+    bc = b.ids["booking_centre"]
+    refused = [i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == bc and "detail=day" in m.text]
+    if not refused:
+        return "nessun world day= rifiutato al centro"
+    pages = [m for m in booking_world_asks(b) if b.log.index(m) > refused[0] and "page=" in m.text]
+    if len(pages) < 2 or len({b.turn_of[m.msg_id] for m in pages[:2]}) != 1:
+        return f"pagine dopo il rifiuto di day=: {[m.text for m in pages]}, attese almeno due nello stesso turno"
+    if any("day=" in m.text for m in booking_world_asks(b) if b.log.index(m) > refused[-1]):
+        return "world day= chiesto di nuovo dopo il rifiuto"
+
+
+def page_refused_no_loop(b: Bus) -> str | None:
+    """Una pagina oltre l'ultima rifiutata (detail=page): il centro non la aspetta e non la richiede in loop."""
+    bc = b.ids["booking_centre"]
+    refused = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == bc and "detail=page" in m.text), None)
+    if refused is None:
+        return "nessuna pagina oltre l'ultima rifiutata al centro"
+    asks = Counter(m.text for m in booking_world_asks(b))
+    if max(asks.values()) > 2:
+        return f"world chiesto in loop: {dict(asks)}"
+    if not any(m.sender == bc and m.recipient == CIT and act(m) == "offer" for m in b.log[refused:]):
+        return "nessuna offerta del centro dopo la pagina rifiutata"
+
+
+SCENARIOS.update({
+    # (a) B alle 17:00 di lunedì (late_hours=9): la finestra è martedì e mercoledì, chiesti insieme nel primo turno.
+    "booking_giorni_insieme": dict(start=BACK, handoff=True, late_hours=9, setup=warm_clock,
+                                   expect=[days_together(2), wrote("checkin", "R:234")]),
+    # (b) Il Ledger non conosce day=: le pagine partono tutte insieme, il caso si chiude.
+    "booking_giorno_rifiutato": dict(start=BACK, handoff=True, late_hours=9, setup=warm_clock, no_day=True,
+                                     expect=[pages_after_day_refused, wrote("checkin", "R:234")]),
+    # (c) Le pagine piene fino al giorno 9 e l'intestazione che conta una pagina in più: la pagina 5 è rifiutata
+    # (detail=page), il centro va avanti con l'alternativa invece di aspettarla.
+    "booking_pagina_oltre": dict(start=BACK, handoff=True, full_days=9, no_day=True, page_refused=True, pages_extra=1,
+                                 expect=[page_refused_no_loop, wrote("checkin", "R:234")]),
 })
 
 

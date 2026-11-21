@@ -28,7 +28,8 @@ import time
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, clinical, understood
 
@@ -53,6 +54,8 @@ from mach.safety import red_flag  # noqa: E402  (red flag in 6 lingue con la neg
 #                claims (offer 1200 s, confirm 1200 s); the Ledger's marks; facilities DOWN 600 s
 #   _LEARNED  b  msg_ids CAL has seen, LRU _LEARNED_MAX
 #   _PAGES    b  (procedure, page) -> world page: fresh 240 s on read, never evicted (~4x8 keys)
+#   _DAYS     b  (procedure, day, page) -> answer to a day= ask, like _PAGES (~3x5x2 keys)
+#   _NO_DAY   b  the Ledger refused day=: pages from then on, no TTL
 #   _RULES    b  rules of the latest answer of any case, no TTL (c: city:rules)
 #   _ASKED    b  agenda/rules -> our latest ask in any case: asked again after _EVERY
 #   _GATES       per-need lock, dropped when its last turn ends
@@ -106,6 +109,23 @@ _LEARNED_MAX = 16384
 # a refused hold (calendar GONE, answered in the same turn): shorten it if those refusals climb.
 _PAGES: dict[tuple[str, int], tuple[float, datetime | None, str]] = {}
 _PAGE_FRESH = 240.0
+# The window's days, asked all in the first turn (21/11 ~12:00: ~10 minutes each way to the Ledger, and
+# 123 of 161 cases read 2-5 world pages one after the other): ``world procedure=X day=<day>``, one per
+# agenda weekday that can hold an offerable slot (_window_days), never more than _DAY_MAX. The filter
+# (R:78, R:166) is not documented: it is taken to match the slot rows' own ``day=mon..fri``
+# (tests/fixtures/slots.txt). _DAY_ISO = True asks ``day=YYYY-MM-DD`` instead.
+_DAY_ISO = False
+_DAY_MAX = 5
+# Past the window (S empty): this many weekdays after it, for the relaxed alternative (R:232).
+_RELAXED_DAYS = 3
+# (procedure, day, page) -> like _PAGES, for the answers to a day= ask.
+_DAYS: dict[tuple[str, str, int], tuple[float, datetime | None, str]] = {}
+# The Ledger refused day= (refused world ... detail=day): pages instead, all at once, for good.
+# ponytail: per process; a restart asks day= once more and learns it again from the refusal.
+_NO_DAY = False
+# Pages asked at once without a day filter when no page of the procedure says how many there are.
+_PAGES_UNKNOWN = 4
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # need_id -> we already tried escalate.emergency on it (sent or refused): never twice (R:701).
 # ponytail: per pod and lost on restart; the history check still covers a sent one.
 _ESCALATED: set[str] = set()
@@ -706,54 +726,93 @@ async def _advance_alone(
     # known; the offer's closing asks for days and doctor if none fits (R:95, R:253).
     prefs = calendar.Prefs(case.lang(chat, _heard, doctor=True), case.gender(chat, _heard), case.days(chat, _heard))
 
-    def page_of(rows: list[Message], page: int) -> str | None:
-        """The page from _PAGES while fresh (the latest answer any case saw), else the case's own."""
-        return _fresh_page(procedure, page) or _world_page(rows, page)
+    def reads(rows: list[Message], *, relaxed: bool = False) -> tuple[list[str], list[str]]:
+        """(the world reads of the case's window, those unanswered in ``rows``): _world_reads."""
+        return _world_reads(rows, agent, procedure, priority, _now(rows), _born(chat), relaxed=relaxed)
+
+    said: set[str] = set()  # world reads sent in this turn: history may not show them yet
+
+    def asked(rows: list[Message], ask: str) -> bool:
+        """Asked in this round: in this turn, after our marking read, or as that read itself."""
+        return ask in said or protocol.exact(rows, agent, ask) or any(
+            row.msg_id == sent.mark and row.text == ask for row in chat)
+
+    async def ask_all(rows: list[Message], unread: list[str]) -> bool:
+        """Every unread world read not asked yet, in one go (21/11: ~10 minutes each way to the
+        Ledger): False when the first one did not go."""
+        for ask in unread:
+            if not asked(rows, ask):
+                if await _say(city, LEDGER, ask):
+                    said.add(ask)
+                    if ask in sent.reread:
+                        sent.reread.remove(ask)  # asked now, not again after the answer
+                elif ask == unread[0]:
+                    return False
+        return True
+
+    def answered(rows: list[Message]) -> bool:
+        """Some world read of the window has its answer (or none is needed)."""
+        asks, unread = reads(rows)
+        return not asks or len(unread) < len(asks)
 
     # A refusal or a facility's cancel is answered in its own turn, from the pages the case
     # already holds and the clock run forward (21/11: re-reading agenda, rules and world first
-    # left the citizen 4-5 minutes in silence). So is a new case, from the pages another case
-    # read (_PAGES): every new citizen waited minutes for world. The reads go out after the answer.
+    # left the citizen 4-5 minutes in silence). So is a new case, from the days (or pages) another
+    # case read (_DAYS, _PAGES): every new citizen waited minutes for world. The reads go out after
+    # the answer.
     if sent.number != number:
         sent.number, sent.offers = number, set()
     # After a renewal the clock is read again before any offer, also in a later turn than the one
     # that asked about the new number (ledger_late: offers on the reading of days before).
     stale, clock_asked = _renewal_clock(chat, agent, number)
     renewal, refresh = renewal or stale, refresh or (stale and not clock_asked)
-    first = not replacing and not sent.offers and not case.offered(chat, agent, number) and _fresh_page(procedure, 1) is not None
-    quick = not stale and _now(chat) is not None and (first or (replacing and not resumed and page_of(chat, 1) is not None))
+    days = [] if _NO_DAY else _window_days(priority, now, _born(chat))
+    # Fresh slots for the window: each of its days read, or page 1 (a pod with no clock yet reads pages).
+    cached = _fresh_page(procedure, 1) is not None or bool(days) and all(
+        _fresh_day(procedure, _day_key(day), 1) for day in days)
+    first = not replacing and not sent.offers and not case.offered(chat, agent, number) and cached
+    quick = not stale and _now(chat) is not None and (
+        first or (replacing and not resumed and (cached or any(_is_world(row) for row in chat))))
     if quick:
         recent = chat
+        # The window's first reads, as a new round asks them: each day's page 1, or page 1.
+        window = [ask for ask in reads(chat)[0] if "page=" not in ask or ask.endswith(" page=1")]
         if replacing:
-            sent.reread = [f"world procedure={procedure} page=1"]
-        elif not protocol.asked(chat, agent, procedure, 1):
-            sent.reread = [*filter(_due, ("agenda", "rules")), f"world procedure={procedure} page=1"]
+            sent.reread = window
+        elif not any(protocol.exact(chat, agent, ask) for ask in window):
+            sent.reread = [*filter(_due, ("agenda", "rules")), *window]
     else:
-        read, world_ask = "", f"world procedure={procedure} page=1"
+        read, window = "", reads([])[0]
         if refresh or (
             not sent.mark and protocol.ledger(chat, "agenda") is None and not protocol.exact(chat, agent, "agenda")
-            and not protocol.asked(chat, agent, procedure, 1)
+            and not any(protocol.exact(chat, agent, ask) for ask in window)
         ):
             # Our first read marks what is fresh (_recent): agenda when due or after a renewal, else
-            # world itself.
-            read = "agenda" if renewal or _due("agenda") else world_ask
+            # the first world read itself.
+            read = "agenda" if renewal or _due("agenda") or not window else window[0]
             mark = await _say(city, LEDGER, read)
             if mark:
                 sent.mark, sent.before = mark, frozenset(row.msg_id for row in chat)
+                said.add(read)
             if _due("rules"):
                 await _say(city, LEDGER, "rules")
         recent = _recent(chat, sent)
-        if read != world_ask and _world_page(recent, 1) is None and not protocol.asked(recent, agent, procedure, 1):
-            await _say(city, LEDGER, world_ask)
+        # The rest of the window in the same turn: days (or pages) never one after the other.
+        await ask_all(recent, reads(recent)[1])
 
         def fresh(rows: list[Message]) -> bool:
             # The clock runs from its anchor: once known, no fresh agenda to wait for, but after a
             # renewal (agenda days later).
             rows = _recent(rows, sent)
-            return (_has_agenda(rows) if renewal else _now(rows) is not None) and page_of(rows, 1) is not None
+            return (_has_agenda(rows) if renewal else _now(rows) is not None) and answered(rows)
 
         if not fresh(chat):
             chat = await _until(city, need_id, chat, fresh)
+            recent, asks = _recent(chat, sent), len(said)
+            # A day= refused meanwhile (_NO_DAY) or the clock just read: the window's reads changed.
+            # They go now, with one more wait, never on the next turn.
+            if not fresh(chat) and await ask_all(recent, reads(recent)[1]) and len(said) > asks:
+                chat = await _until(city, need_id, chat, fresh)
         recent = _recent(chat, sent)
         if stale and not _has_agenda(recent):
             # the agenda answer opens a turn of its own, which offers
@@ -762,11 +821,9 @@ async def _advance_alone(
     _round_trip(chat, agent)
     now = _now(chat)
     born = _born(chat)
-    world = page_of(recent, 1)
-    if now is None or world is None:
-        reads = ["agenda"] if now is None else []
+    if now is None or not (quick or answered(recent)):
         await _waiting(city, message, chat, key, citizen,
-                       reads + ([f"world procedure={procedure} page=1"] if world is None else []), again=again)
+                       (["agenda"] if now is None else []) + reads(recent)[1], again=again)
         return
     _rules(chat, now)  # the case's rules answer, for every case (_RULES)
     no = case.refusals(chat, agent, calendar.gender)
@@ -804,43 +861,36 @@ async def _advance_alone(
         return
     # After the citizen turned an offer down, the new ones come with a word about it.
     opening = "offers_again" if replacing and message.sender.startswith("citizen:") else "offers"
-    pages = min(protocol.page(world)[1], _MAX_PAGE)
     while True:
         slots, why = search()
         # With days or a gender asked, S_pref while the pages left may hold it (R:230).
         best = [slot for slot in slots if calendar.preferred(slot, prefs)] if prefs.days or prefs.gender else slots
-        missing = [page for page in range(2, pages + 1) if page_of(recent, page) is None]
+        missing = reads(recent)[1]
         # Offered once three slots no other case holds are known (wave W01QQQ: one slot to 23
-        # citizens), or the pages left are past the priority window, or none is left.
+        # citizens), or the reads left are past the priority window, or none is left.
         unshared = [slot for slot in best if not CAL.shared(slot["slot_id"], key)]
         if unshared and (len(unshared) >= _MAX_OFFERS or not missing or "deadline" in why.values()):
             await _offer(city, key, citizen, _spread(unshared, key), number, priority, replacing, chat, opening)
             return
         if not missing:
             break
-        # Every missing page in one go, never one after the other (21/11: ~5 minutes a Ledger
-        # round, up to _MAX_PAGE rounds in a row). The answers land in history as they come.
-        for later in missing:
-            if (
-                not protocol.asked(recent, agent, procedure, later)
-                and not await _say(city, LEDGER, f"world procedure={procedure} page={later}")
-                and later == missing[0]
-            ):
-                return
+        # Every missing read in one go, never one after the other (21/11: ~10 minutes each way to
+        # the Ledger, up to five rounds in a row). The answers land in history as they come.
+        if not await ask_all(recent, missing):
+            return
         if quick and replacing:
             # One look, never a wait: what the calendar holds now, else (below) the partners, a
             # relaxed alternative or the waiting list. 21/11, level 6: "sto controllando" alone, then
             # 3-6 minutes for world, and the judge closed the journey with no offer (no_booking -1).
-            chat = recent = await _until(city, need_id, chat, lambda rows: page_of(rows, missing[0]) is not None, tries=1)
-            if page_of(recent, missing[0]) is None:
+            chat = recent = await _until(city, need_id, chat, lambda rows: missing[0] not in reads(rows)[1], tries=1)
+            if missing[0] in reads(recent)[1]:
                 break
         else:
-            chat = await _until(city, need_id, chat, lambda rows: page_of(_recent(rows, sent), missing[0]) is not None)
+            chat = await _until(city, need_id, chat, lambda rows: missing[0] not in reads(_recent(rows, sent))[1])
             recent = _recent(chat, sent)
-            if page_of(recent, missing[0]) is None:
-                # On the Ledger's next turn, start with the pages already in history.
-                await _waiting(city, message, chat, key, citizen,
-                               [f"world procedure={procedure} page={missing[0]}"], again=again)
+            if missing[0] in reads(recent)[1]:
+                # On the Ledger's next turn, start with the reads already in history.
+                await _waiting(city, message, chat, key, citizen, reads(recent)[1], again=again)
                 return
     if not slots:
         # Nothing _offer_lead() ahead fits the window (U: the same day; B/D near the deadline): the
@@ -859,9 +909,21 @@ async def _advance_alone(
     # be only in a ring partner; since 07:56, 14 of 21 verdicts were no_booking with S not empty).
     # While their round runs, no relaxed alternative and no waiting list. Then a relaxed
     # alternative (past the priority deadline), else the waiting list. Never silence.
+    # Day reads stop at the window: the days after it go out now, beside the partners' round.
+    late = bool(no.reasons & {"deadline", "priority", "late", "time"})
+    after = [] if late else reads(recent, relaxed=True)[1]
+    if after and not await ask_all(recent, after):
+        after = []  # not sent: what the calendar holds, never silence
     if await partners():
         return
-    late = bool(no.reasons & {"deadline", "priority", "late", "time"})
+    if after and not (quick and replacing):
+        # No partner round to wait for: the relaxed alternative waits for its days (one look in a
+        # replacement, R:248: what the calendar holds then).
+        chat = await _until(city, need_id, chat, lambda rows: not reads(_recent(rows, sent), relaxed=True)[1])
+        recent = _recent(chat, sent)
+        if reads(recent, relaxed=True)[1]:
+            await _waiting(city, message, chat, key, citizen, reads(recent, relaxed=True)[1], again=again)
+            return
     alternatives, why = search(relaxed=True)
     phrase = "relaxed"
     if late:
@@ -2024,12 +2086,16 @@ def _learn(chat: list[Message], agent: str) -> None:
     """Every row of a case history, once, to the calendar: world pages and the Ledger's answers,
     our offers, confirms and cancels (the claims of the pod before a restart, or of another pod).
     Every world page also to _PAGES under the procedure its slot lines name (an empty page: the
-    one our latest world ask named), unless _PAGES holds a later Ledger answer."""
+    one our latest world ask named), unless _PAGES holds a later Ledger answer. An answer to a
+    day= ask (our latest world ask had one, or the answer names it) goes to _DAYS instead; a
+    refused day= sets _NO_DAY."""
 
-    asked = ""
+    global _NO_DAY
+    asked, by_day = "", False
     for row in chat:
         if row.recipient == LEDGER and first_word(row.text) == "world":
-            asked = fields_of(row.text).get("procedure", "")
+            found = fields_of(row.text)
+            asked, by_day = found.get("procedure", ""), "day" in found
         if row.msg_id in _LEARNED:
             continue
         if row.msg_id:
@@ -2037,6 +2103,8 @@ def _learn(chat: list[Message], agent: str) -> None:
             while len(_LEARNED) > _LEARNED_MAX:
                 _LEARNED.popitem(last=False)
         CAL.learn(row, me=agent)
+        if row.sender == LEDGER and _world_refusal(row.text) == "day":
+            _NO_DAY = True
         page = protocol.page(row.text)[0]
         if _world_page([row], page) is None:
             continue
@@ -2044,14 +2112,179 @@ def _learn(chat: list[Message], agent: str) -> None:
         procedure = named.pop() if len(named) == 1 else "" if named else asked
         if not procedure:
             continue
-        at, old = protocol.when(row.sent_at or ""), _PAGES.get((procedure, page))
+        day = _answer_day(row.text, guess=by_day)
+        cache, slot = (_DAYS, (procedure, day, page)) if day else (_PAGES, (procedure, page))
+        if by_day and not day:
+            continue  # an answer to a day= ask that names no day: in no cache
+        at, old = protocol.when(row.sent_at or ""), cache.get(slot)
         if old is None or (at is not None and (old[1] is None or at > old[1])):
-            _PAGES[(procedure, page)] = (time.monotonic(), at, row.text)
+            cache[slot] = (time.monotonic(), at, row.text)
 
 
 def _fresh_page(procedure: str, page: int) -> str | None:
     hit = _PAGES.get((procedure, page))
     return hit[2] if hit is not None and time.monotonic() - hit[0] < _PAGE_FRESH else None
+
+
+def _fresh_day(procedure: str, day: str, page: int) -> str | None:
+    hit = _DAYS.get((procedure, day, page))
+    return hit[2] if hit is not None and time.monotonic() - hit[0] < _PAGE_FRESH else None
+
+
+def _day_key(day: date) -> str:
+    return day.isoformat() if _DAY_ISO else _WEEKDAYS[day.weekday()]
+
+
+def _weekdays(start: datetime, end: datetime | None, count: int) -> list[date]:
+    """Up to ``count`` agenda weekdays (R:80) from ``start``'s, or the next one once the clinics
+    have closed (18:00, R:91), each opening (08:00) before ``end``."""
+
+    day = (start + timedelta(hours=6)).date() if start.hour >= 18 else start.date()
+    days: list[date] = []
+    while len(days) < count and (end is None or datetime.combine(day, dtime(8), start.tzinfo) < end):
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
+
+
+def _window_days(priority: str | None, now: datetime | None, born: datetime | None) -> list[date]:
+    """The agenda days that can hold a slot to offer: from now + _offer_lead() (else + _lead(), as
+    the search falls back) to the priority deadline (calendar.deadline); U: today. [] for P (the
+    waiting list) or with no clock."""
+
+    if now is None or priority == "P":
+        return []
+    if priority == "U":
+        return [now.date()]
+    end = calendar.deadline(priority, born or now)
+    for lead in (_offer_lead(), _lead()):
+        if days := _weekdays(now + lead, end, _DAY_MAX):
+            return days
+    return []
+
+
+def _world_refusal(text: str) -> str:
+    """For a Ledger refusal of a world read: "day" when it names the day filter, "page" when it
+    names the page, else "other". "" for anything else."""
+
+    detail = fields_of(text).get("detail", "").lower()
+    if first_word(text) != "refused" or not ("world" in words(text) or detail in ("day", "page")):
+        return ""
+    # detail= first, then the free text: the request's own tokens (day=wed page=2) name both.
+    prose = " ".join(token for token in text.split()[2:] if "=" not in token)
+    return next((name for name in ("day", "page") if detail.startswith(name)), None) or next(
+        (name for name in ("day", "page") if re.search(rf"\b{name}\b", prose)), "other")
+
+
+def _answer_day(text: str, guess: bool) -> str:
+    """The day= a world answer is for: the one its first line or its ``more:`` line names; with
+    ``guess``, else the one day (weekday, or date with _DAY_ISO) all its slot lines share."""
+
+    lines = text.splitlines()
+    for line in [*lines[:1], *(line for line in lines if line.startswith("more:"))]:
+        if "slot_id=" not in line and (day := fields_of(line).get("day", "").lower()):
+            return day
+    if not guess:
+        return ""
+    found = {(slot.get("at", "")[:10] if _DAY_ISO else slot.get("day", ""))
+             for slot in (calendar.row(line) for line in lines if "slot_id=" in line)}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _is_world(row: Message) -> bool:
+    return row.sender == LEDGER and _world_page([row], protocol.page(row.text)[0]) is not None
+
+
+def _day_reads(rows: list[Message], procedure: str, days: list[date]) -> tuple[list[str], list[str]]:
+    """(the day= reads ``days`` need, those still unanswered in ``rows`` or _DAYS). A day needs its
+    page 1, then the next page while the last one ends on or before that day and has a next. An
+    answer naming no day (empty, or unreadable) and a refused world read answer one open read each:
+    never a wait for an answer that came (tests/unit/test_booking_days.py)."""
+
+    got: dict[tuple[str, int], str] = {}
+    blank = 0
+    for row in rows:
+        if _is_world(row):
+            day = _answer_day(row.text, guess=True)
+            if day:
+                got[(day, protocol.page(row.text)[0])] = row.text
+            else:
+                blank += 1
+        elif row.sender == LEDGER and _world_refusal(row.text) in ("page", "other"):
+            blank += 1
+    asks: list[str] = []
+    unread: list[str] = []
+    for day in days:
+        key, page = _day_key(day), 1
+        while True:
+            ask = f"world procedure={procedure} day={key}" + (f" page={page}" if page > 1 else "")
+            if ask not in asks:
+                asks.append(ask)
+            text = got.get((key, page)) or _fresh_day(procedure, key, page)
+            if text is None:
+                if ask not in unread:
+                    unread.append(ask)
+                break
+            ats = [at for at in (protocol.when(calendar.row(line).get("at", "")) for line in text.splitlines()
+                                 if "slot_id=" in line) if at is not None]
+            if page >= min(protocol.page(text)[1], _MAX_PAGE) or (ats and max(ats).date() > day):
+                break
+            page += 1
+    return asks, unread[:max(len(unread) - blank, 0)]
+
+
+def _page_count(procedure: str, end: datetime | None) -> int:
+    """Pages to ask at once without a day filter: up to the first page (of any age) whose last slot
+    is past ``end``, at most the pages page 1 says there are; _PAGES_UNKNOWN when none is known."""
+
+    first = _PAGES.get((procedure, 1))
+    total = min(protocol.page(first[2])[1], _MAX_PAGE) if first else _PAGES_UNKNOWN
+    for page in range(1, total + 1):
+        hit = _PAGES.get((procedure, page))
+        ats = [] if hit is None else [protocol.when(calendar.row(line).get("at", ""))
+                                      for line in hit[2].splitlines() if "slot_id=" in line]
+        if end is not None and ats and ats[-1] is not None and ats[-1] >= end:
+            return page
+    return total
+
+
+def _page_reads(rows: list[Message], agent: str, procedure: str, end: datetime | None) -> tuple[list[str], list[str]]:
+    """(the world pages to read, those still unanswered): all the pages page 1 says there are, else
+    _page_count. A refused page (detail=page, 21/11: page=2 of VIS-CARD, page=4 of VIS-FIS) is past
+    the last one: each refusal ends the highest asked page still unanswered, and every page after it."""
+
+    def answer(page: int) -> str | None:
+        return _fresh_page(procedure, page) or _world_page(rows, page)
+
+    first = answer(1)
+    total = min(protocol.page(first)[1], _MAX_PAGE) if first else _page_count(procedure, end)
+    asks = [f"world procedure={procedure} page={page}" for page in range(1, total + 1)]
+    refused = sum(row.sender == LEDGER and _world_refusal(row.text) == "page" for row in rows)
+    open_ = [page for page in range(_MAX_PAGE, 0, -1) if answer(page) is None
+             and protocol.exact(rows, agent, f"world procedure={procedure} page={page}")]
+    last = min(open_[:refused], default=_MAX_PAGE + 1)
+    return asks, [ask for page, ask in enumerate(asks, 1) if page < last and answer(page) is None]
+
+
+def _world_reads(
+    rows: list[Message], agent: str, procedure: str, priority: str | None, now: datetime | None,
+    born: datetime | None, *, relaxed: bool = False,
+) -> tuple[list[str], list[str]]:
+    """(every world read the case's window needs, those still unanswered in ``rows``): the days of
+    the window; pages instead once the Ledger refused day=, with no clock, or in a round that
+    already asked pages. ``relaxed``: the _RELAXED_DAYS weekdays after the window (none with pages,
+    which go past it already)."""
+
+    paged = any(row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "world"
+                and "page" in fields_of(row.text) and "day" not in fields_of(row.text) for row in rows)
+    days = [] if _NO_DAY or paged else _window_days(priority, now, born)
+    if not days:
+        return ([], []) if relaxed else _page_reads(rows, agent, procedure, calendar.deadline(priority, born or now))
+    if relaxed:
+        after = datetime.combine(days[-1] + timedelta(days=1), dtime(0), now.tzinfo if now else timezone.utc)
+        days = _weekdays(after, None, _RELAXED_DAYS)
+    return _day_reads(rows, procedure, days)
 
 
 def _now(chat: list[Message]) -> datetime | None:
