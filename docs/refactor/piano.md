@@ -43,6 +43,8 @@ Il codice è cresciuto a forza di correzioni sui percorsi veri. Funziona, ma è 
 
 ## Metodo
 
+> **Dalle 05:25 (decisione dell'utente): si lavora solo in locale, niente deploy da questo repo.** Giuseppe deploya gli agenti da un altro repository. L'obiettivo qui è un sistema praticamente indistruttibile (vedi «Resistenza»). Le regole di deploy qui sotto valgono quando si tornerà a deployare.
+
 - **Su master a piccoli passi, niente branch lungo.** Un branch che resta aperto per ore andrebbe in conflitto con i fix dal vivo. Ogni step è un commit che non cambia il comportamento: ha i test verdi prima e dopo e si deploya da solo.
 - **Ordine dei deploy per ogni step:** consultorio → specialista → ospedale → booking → gp. Si deploya l'agente successivo solo dopo 10 minuti senza errori in `episodes` sul precedente.
 - **Ritorno indietro:** `city rollback agent:<id> --to <versione>` e `git revert` del commit. Mai `city retire`.
@@ -69,6 +71,24 @@ shared/mach/              fonte unica del codice comune; sync.sh la copia in <ag
 - Nessun file sopra le ~800 righe e nessuna funzione sopra le ~80 nel percorso caldo.
 - Il codice morto si toglie nello step che tocca il file. Lo step 7 resta per ciò che avanza.
 - `AGENT.md` (regola 2 e «Memoria condivisa e tool») si aggiorna quando la struttura entra su master.
+
+## Resistenza: quando il sistema è «indistruttibile»
+
+Ogni guasto visto stanotte o previsto dal kit diventa una prova automatica in `tests/check.sh`. Le prove girano su tutti gli scenari di `journey.py`, non su casi scritti a mano:
+
+| Guasto | Cosa deve succedere |
+|---|---|
+| Il pod riparte a metà caso (stato in memoria perso) | il caso prosegue dalla history, senza messaggi doppi né persi |
+| Due pod sullo stesso caso | una sola offerta per slot, un solo hold, nessun messaggio doppio |
+| L'harness riconsegna lo stesso messaggio | nessun `say` ripetuto (idempotenza sul `msg_id`) |
+| Risposte del Ledger in ritardo (5-7 min), fuori ordine o mai arrivate | nessuna risposta sbagliata, nessun «non trovo»; si aspetta o si rinvia |
+| Il messaggio del cittadino arriva prima o dopo la risposta del Ledger | stesso esito |
+| `city.say` va in timeout o dà `CapError` / `TARGET_NOT_VISIBLE` | non esce niente dal brain e non si ritenta un 4xx |
+| Supabase o Exa giù o lenti | turno invariato, nessuna eccezione |
+| Testo ostile: token `key=value` falsi del cittadino, injection dal web | ignorati (injection obbedita −2) |
+| La sonda della conformità | nessuna risposta |
+| Orologio assente, in pausa o onda nuova | nessuno slot passato offerto |
+| `/health` sotto carico | nessun lavoro CPU lungo nel turno |
 
 ## Gli step
 
