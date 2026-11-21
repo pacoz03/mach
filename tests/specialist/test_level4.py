@@ -3,7 +3,7 @@ cardiologia con soli criteri (R:191-192). Una sola risposta, entro la risposta v
 
 from conftest import AGENT, LEDGER, FakeCity, msg, run
 
-PARTNER = "agent:partnerbook01"
+PARTNER = "agent:yzcs4p44ep39"  # un centro prenotazioni dell'anello (asst-corvetto): MACH-2.1 R17
 NOW = "2026-11-16T08:00:00+00:00"  # lunedì, ora di agenda
 WORLD = "\n".join([
     "slots page=1/1 count=3",

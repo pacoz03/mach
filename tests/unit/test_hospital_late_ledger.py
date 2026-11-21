@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "shared"))
 import facility  # noqa: E402
 
-ME, PARTNER, NEED = "agent:hospital", "agent:asst-altra-booking", "N-1"
+ME, PARTNER, NEED = "agent:hospital", "agent:yzcs4p44ep39", "N-1"  # PARTNER nell'anello (MACH-2.1 R17)
 REQUEST = "need.request service_type=hospital.physiatry procedure=VIS-FIS priority=B request_id=R-1"
 MONDAY = "2026-11-23T08:00:00+00:00"
 PAGE = "\n".join([

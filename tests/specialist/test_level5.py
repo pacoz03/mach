@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from conftest import AGENT, LEDGER, FakeCity, msg, run
 
-PARTNER = "agent:partnerbook01"
+PARTNER = "agent:yzcs4p44ep39"  # un centro prenotazioni dell'anello (asst-corvetto): MACH-2.1 R17
 NOW = "2026-11-16T08:00:00+00:00"  # lunedì
 
 

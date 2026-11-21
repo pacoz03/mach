@@ -8,7 +8,7 @@ from test_level4 import WORLD, _ledger
 
 OUR_BOOKING = "agent:sbdpbpqz5sxe"
 OUR_GP = "agent:ck9w60ejwnvw"
-PARTNER = "agent:partnerbook01"
+PARTNER = "agent:yzcs4p44ep39"  # un centro prenotazioni dell'anello (asst-corvetto): MACH-2.1 R17
 RX = "prescription_number-ABCD1234"
 
 

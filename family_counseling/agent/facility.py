@@ -31,6 +31,7 @@ from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope
 from mach import calendar, protocol
 from mach.protocol import fields_of, first_word, words
 from mach.safety import red_flag
+from mach.ring import in_ring
 
 _MAX_PAGE = 8
 # A hold is answered after a Ledger round trip: 5-7 real minutes, ~6 agenda hours at rate 60
@@ -245,6 +246,8 @@ async def _turn(role: str, need: Need, city: City) -> None:
         # The conformance probe (a search without cross-ASST criteria): no network at all, so the
         # turn ends well inside custody.ack's ~5 s wait for the renew (1.0.9 deploys failed there).
         # The consultorio too: 1.0.6 answered it live (21/11, TARGET_NOT_VISIBLE to t05/osp-x).
+        return
+    if _outside_ring(message):  # MACH-2.1 R17
         return
     global _RECALLED, _BY_DAY
     if not _CLOCK and not _RECALLED:
@@ -992,7 +995,8 @@ async def _confirm_alone(
         # Impostors (live 21/11, 10:00-16:00) confirm slots to make us hold them: an agent books only a
         # slot we offered it in this case. Our booking centre reads the Ledger itself, it gets no offers.
         if not _answered(chat, agent, message.msg_id, message.sender):
-            await _say(city, message.sender, f"cancel reason=invalid_offer slot_id={slot}")
+            await _say(city, message.sender, f"cancel reason=invalid_offer slot_id={slot}"
+                       + _tail(message.sender, fields.get("request_id", "")))
         return
     # We book only our own slots, never forward: a booking party's confirm (R:194), or a citizen's
     # for an offer of ours. A citizen's facility= never sends its confirm, consent and data to an
@@ -1002,7 +1006,7 @@ async def _confirm_alone(
         # Never silent (R:195): the sender learns which field is missing.
         missing = "slot_id" if not slot else "consent_ref" if not consent else "offer_id"
         head = f"cancel offer_id={offer_id}" if offer_id else "cancel"
-        text = f"{head} reason=missing_{missing}"
+        text = f"{head} reason=missing_{missing}" + _tail(message.sender, fields.get("request_id", ""))
         if message.sender.startswith("citizen:"):
             if _en(chat):
                 text += (
@@ -1277,7 +1281,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
                 reason = "missing_citizen"
             if reason:
                 rid = fields.get("request_id") or offer.get("request_id")  # the partner matches on it
-                await _say(city, message.sender, f"cancel reason={reason}" + (f" request_id={rid}" if rid else ""))
+                await _say(city, message.sender, f"cancel reason={reason}" + _tail(message.sender, rid or ""))
                 return
             # Direct access: discard any prescription and arbitrary partner fields. The consents stay:
             # under P2 the hold carries the cross-ASST one (_confirm_alone), else CONSENT_MISSING.
@@ -1289,7 +1293,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
         elif head == "need.request" or "need.request" in words(message.text) or message.type == "need.request":
             if fields.get("service_type", "family_counseling.gynecology") != "family_counseling.gynecology":
                 await _say(city, message.sender,
-                           f"cancel reason=no_availability request_id={fields.get('request_id', '')}")
+                           "cancel reason=no_availability" + _tail(message.sender, fields.get("request_id", "")))
                 return
             await _cross_asst(
                 city, message, procedures=("CONS-GIN",), ours="del nostro consultorio"
@@ -1905,6 +1909,7 @@ async def _cross_asst(
                     complete = False
                     break
                 lines = [line for line in world.splitlines() if "slot_id=" in line]
+                lines = _lead(lines, fields, now, after, priority)  # MACH-2.1 R5: no after=, lease_s ahead
                 seen += lines
                 if after or until:
                     lines = [line for line in lines if (when := protocol.when(_slot(line).get("at", "")))
@@ -1969,7 +1974,7 @@ async def _cross_asst(
                     seen, now=now, priority="P", lang="it", procedure=procedure)
                     if (when := protocol.when(slot["at"])) and when > until), "")
         if chosen:
-            lines = [f"{protocol.offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
+            lines = [protocol.offer_line(slot, None, priority) + _tail(sender, rid) for slot in chosen]
             beyond = (
                 f"Entro i tempi della priorità {priority or 'richiesta'} non abbiamo posti liberi: "
                 "queste sono le prime date libere subito dopo. "
@@ -1992,12 +1997,12 @@ async def _cross_asst(
         elif unavailable:
             # MACH-2.1: "struttura chiusa o non raggiungibile"; the asker offers the rest, no retry.
             text = (
-                f"cancel reason=facility_unavailable {tag}".rstrip()
+                "cancel reason=facility_unavailable" + _tail(sender, rid)
                 + " Mi dispiace, in questo momento non riusciamo a consultare la nostra agenda sul registro."
             )
         else:
             text = (
-                f"cancel reason=no_availability {tag}".rstrip()
+                "cancel reason=no_availability" + _tail(sender, rid)
                 + (f" next_free={free_after}" if free_after else "")
                 + " Mi dispiace, al momento non abbiamo disponibilità adatte a questa richiesta. "
                 "Riscriveteci pure più avanti: ricontrolliamo subito l'agenda."
@@ -2049,6 +2054,7 @@ async def _answer_pending(city: City, chat: list[Message], *, skip: str = "", **
             row.msg_id == skip
             or row.recipient != agent
             or not row.sender.startswith("agent:")
+            or not in_ring(row.sender)  # MACH-2.1 R17: never an answer outside the ring
             or "confirm" in kind
             or not ("need.request" in kind or row.type == "need.request")
             or not {"request_id", "procedure", "service_type"} & found.keys()
@@ -3353,7 +3359,9 @@ async def _on_refused(
     ):
         # A booking party matches the cancel on the slot too (partner CUPs); a citizen needs only the offer.
         where = f" slot_id={slot}" if target.startswith("agent:") else ""
-        text = f"cancel offer_id={offer_id}{where} reason={code}"
+        reason = _mach_reason(code, message) if _peer(target) else code  # MACH-2.1 R8: taken, past
+        text = f"cancel offer_id={offer_id}{where} reason={reason}" + _tail(
+            target, _offer_rid(chat, agent, target, slot) or fields.get("request_id", ""))
         if target.startswith("citizen:"):
             if _en(chat):
                 text += " I'm sorry, this appointment can no longer be booked." + (
@@ -3371,7 +3379,8 @@ async def _on_refused(
         # Proactive: a lost slot (taken, or expired) comes with other free ones. Only to another
         # ASST's booking centre: ours drops a facility's offer lines (its _desk has no branch for
         # them) and searches again by itself on the cancel; a citizen chooses from the first
-        # offers message only (R:95).
+        # offers message only (R:95). A message of their own, never after the cancel line:
+        # protocol.plain would capitalise their act (Offer), and MACH-2.1 parsers read ln.split()[0].
         if hospital and code in {"NO_CAPACITY", "EXPIRED"} and target.startswith("agent:") and (
             target != _OUR_BOOKING
         ):
@@ -3439,7 +3448,7 @@ async def _alternatives(city: City, chat: list[Message], partner: str, slot: str
     if not chosen:
         return
     await _say(city, partner, "\n".join([
-        *(f"{protocol.offer_line(found, None, priority)} request_id={rid}" for found in chosen[:3]),
+        *(protocol.offer_line(found, None, priority) + _tail(partner, rid) for found in chosen[:3]),
         "Ci dispiace, il posto scelto non è più disponibile. Per la stessa richiesta abbiamo "
         "ancora queste disponibilità del nostro ospedale. Per prenotarne una inviateci il confirm "
         "con offer_id, slot_id, citizen, prescription_number e consent_ref, più "
@@ -3767,3 +3776,73 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
             "tornare dal medico: può prenotarla direttamente al centro prenotazioni."
         ),
     )
+
+
+# --- MACH-2.1 (docs/protocol/mach-2.1.md): the ring, the lines other teams read, the lead -------
+
+_MACH = "mach=2.1"
+# R8, at the confirm, for another team ("chi manda usa taken"); our CUP keeps the Ledger's codes
+# (its calendar marks the slot gone on SLOT_TAKEN/EXPIRED, booking_centre _partner_cancel).
+_MACH_REASON = {"SLOT_TAKEN": "taken", "EXPIRED": "past"}
+# R14: a requester's lease_s= is at most this; read only for the lead (R5), we keep no leases.
+_LEASE_MAX = 1800
+
+
+def _outside_ring(message: Message) -> bool:
+    """R17: a need.request or confirm from an agent outside the ring gets nothing (no answer,
+    slot or hold), only a ``ring.alert`` log line. True: the turn ends here."""
+
+    sender, kind = message.sender, words(message.text) | {message.type}
+    if not sender.startswith("agent:") or not {"need.request", "confirm"} & kind or in_ring(sender):
+        return False
+    _LOG.warning("ring.alert suspect=%s reason=not_listed need=%s", sender, message.need_id)  # as booking
+    return True
+
+
+def _peer(to: str) -> bool:
+    """Another team's agent: it reads MACH-2.1 lines. Not our CUP (it reads the Ledger's codes)."""
+
+    return to.startswith("agent:") and to != _OUR_BOOKING
+
+
+def _tail(to: str, rid: str = "") -> str:
+    """The tokens closing an offer or cancel line to an agent: the request's ``request_id=`` when
+    known, ``mach=2.1`` for another team. "" to a citizen."""
+
+    if not to.startswith("agent:"):
+        return ""
+    return (f" request_id={rid}" if rid else "") + (f" {_MACH}" if _peer(to) else "")
+
+
+def _mach_reason(code: str, message: Message) -> str:
+    """R8 at the confirm: SLOT_TAKEN -> taken, EXPIRED -> past. At the confirm means our own check
+    before the hold (``message`` is the confirm) or the Ledger refusing the hold, not a hold that
+    lapsed before its commit."""
+
+    at_confirm = message.sender != LEDGER or bool({"hold", "op=hold"} & words(message.text))
+    return _MACH_REASON.get(code, code) if at_confirm else code
+
+
+def _offer_rid(chat: list[Message], agent: str, to: str, slot: str) -> str:
+    """The request_id of our offer of ``slot`` to ``to``, or ""."""
+
+    offers = _our_offers([row for row in chat if row.recipient == to], agent)
+    return next((o.get("request_id", "") for o in offers if o.get("slot_id") == slot), "")
+
+
+def _lead(
+    lines: list[str],
+    fields: dict[str, str],
+    now: datetime,
+    after: datetime | None,
+    priority: str | None,
+) -> list[str]:
+    """R5: without ``after=``, a partner request's slot lines from now + its ``lease_s=`` in agenda
+    minutes (1 real s = 1 agenda min; at most _LEASE_MAX). fitting still keeps _LEAD, so the lead
+    is the larger of the two; U keeps its _HOLD_LEAD fallback, untouched."""
+
+    asked = fields.get("lease_s", "")
+    if after is not None or priority == "U" or not asked.isdigit():
+        return lines
+    lead = now + timedelta(minutes=min(int(asked), _LEASE_MAX))
+    return [line for line in lines if (at := protocol.when(_slot(line).get("at", ""))) is not None and at >= lead]

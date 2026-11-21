@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "shared"))
 import facility  # noqa: E402
 
-ME, BOOKING = "agent:specialist", "agent:booking"
+ME, BOOKING = "agent:specialist", "agent:sbdpbpqz5sxe"  # il nostro centro: nell'anello (MACH-2.1 R17)
 
 
 class Relay:

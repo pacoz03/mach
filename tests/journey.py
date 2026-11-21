@@ -84,8 +84,9 @@ AGENT_DIRS = {str(REPO / f / "agent") for f in FOLDERS}
 START = datetime(2026, 11, 23, 8, tzinfo=UTC)  # lunedì 08:00 di agenda
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CIT, NEED = "citizen:T-1", "N-2026-11-23-0001"
-# Centro prenotazioni di un'altra ASST: fuori dal bus, scriptato in Bus.foreign (R:191-195).
-FOREIGN = "agent:asst-altra-booking"
+# Centro prenotazioni di un'altra ASST: fuori dal bus, scriptato in Bus.foreign (R:191-195). Un id vero
+# dell'anello (asst-corvetto): con MACH-2.1 R17 chi non è nell'anello non riceve nulla dalle strutture.
+FOREIGN = "agent:yzcs4p44ep39"
 MAX_TURNS = 200
 
 
@@ -1089,6 +1090,8 @@ def checkin_refused(b: Bus) -> str | None:
 # Chiave dell'offerta -> campo dello slot del Ledger: ogni altro attributo è inventato (R:243).
 SLOT_KEYS = {"slot_id": "slot_id", "doctor_id": "doctor_id", "facility": "facility", "procedure": "procedure",
              "agenda_date": "at", "expiry": "at", "agenda_day": "day"}
+# Token dell'offerta che non sono attributi dello slot: offer_id, request_id, priority e mach (MACH-2.1).
+OFFER_KEYS = ("offer_id", "request_id", "priority", "mach")
 
 
 def cross_reply(rid: str, priority: str | None):
@@ -1115,7 +1118,7 @@ def cross_reply(rid: str, priority: str | None):
             if o.get("request_id") != rid or o.get("priority") != priority or not o.get("offer_id"):
                 return f"offerta senza request_id={rid}, priority={priority} o offer_id: {o}"
             for k, v in o.items():
-                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                if k not in OFFER_KEYS and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
                     return f"attributo {k}={v} non dal Ledger (R:243)"
     return check
 
@@ -1490,7 +1493,7 @@ def lost_slot_alternatives(rid: str):
             if s is None or s["facility"] != hosp or o.get("request_id") != rid:
                 return f"alternativa non dell'ospedale o senza request_id={rid}: {o}"
             for k, v in o.items():
-                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                if k not in OFFER_KEYS and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
                     return f"attributo {k}={v} non dal Ledger (R:243)"
     return check
 
@@ -1530,10 +1533,10 @@ def silent_after_duplicate(folder: str):
     return check
 
 
-def late_confirm(hours: int):
-    """Da quando il centro dell'altra ASST conferma, l'orologio di agenda dell'ospedale è ``hours`` ore avanti."""
+def late_confirm(hours: int, folder: str = "hospital"):
+    """Da quando il centro dell'altra ASST conferma, l'orologio di agenda di ``folder`` è ``hours`` ore avanti."""
     def setup(b: Bus) -> None:
-        fac = b.agents[b.ids["hospital"]].mods["facility"]
+        fac = b.agents[b.ids[folder]].mods["facility"]
         now = fac._city_now
 
         def later():
@@ -1546,8 +1549,9 @@ def late_confirm(hours: int):
 
 
 def expired_before_hold(rid: str, hours: int):
-    """Nel turno del confirm: cancel reason=EXPIRED al centro dell'altra ASST, poi 1-3 date nuove con
-    il suo request_id, che iniziano oltre 6 ore di agenda e non sono lo slot perso."""
+    """Nel turno del confirm: cancel reason=past al centro dell'altra ASST (MACH-2.1 R8, prima EXPIRED), poi in un
+    messaggio a parte (mai «Offer» dopo un cancel: protocol.plain) 1-3 date nuove con il suo request_id, che iniziano
+    oltre 6 ore di agenda e non sono lo slot perso."""
     def check(b: Bus) -> str | None:
         hosp = b.ids["hospital"]
         conf = next((m for m in b.log if m.sender == FOREIGN and m.text.startswith("confirm")), None)
@@ -1555,9 +1559,10 @@ def expired_before_hold(rid: str, hours: int):
             return "il centro dell'altra ASST non ha confermato"
         lost, turn = fields(conf.text).get("slot_id"), next(t for t, m in b.opened.items() if m is conf)
         sent = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN and b.turn_of[m.msg_id] == turn]
-        if not sent or act(sent[0]) != "cancel" or "reason=EXPIRED" not in sent[0].text.split():
-            return f"nel turno del confirm nessun cancel reason=EXPIRED per {lost}: {[m.text[:50] for m in sent]}"
-        offers = [o for m in sent[1:] if f"request_id={rid}" in m.text.split() for o in parse_offers(m.text)]
+        if not sent or act(sent[0]) != "cancel" or "reason=past" not in sent[0].text.split():
+            return f"nel turno del confirm nessun cancel reason=past per {lost}: {[m.text[:50] for m in sent]}"
+        offers = [o for m in sent[1:] if act(m) == "offer" and f"request_id={rid}" in m.text.split()
+                  for o in parse_offers(m.text)]
         soon = b.ledger.now + timedelta(hours=hours + 6)
         if not 1 <= len(offers) <= 3 or any(o.get("slot_id") == lost for o in offers):
             return f"nel turno del confirm {len(offers)} date nuove (attese 1-3, mai {lost})"
@@ -1866,7 +1871,7 @@ SCENARIOS.update({
     "ospedale_slot_rubato": dict(
         start=("hospital", XFIS.format(rid="R-40", extra="")), foreign=True, steal="S-h3-01-10",
         foreign_after=[XFIS.format(rid="R-41", extra="")],
-        expect=[cancel_told(FOREIGN, "SLOT_TAKEN", 1), cross_reply("R-41", "B"), not_offered("R-41", "S-h3-01-10")]),
+        expect=[cancel_told(FOREIGN, "taken", 1), cross_reply("R-41", "B"), not_offered("R-41", "S-h3-01-10")]),
 })
 
 
@@ -3872,13 +3877,14 @@ def second_confirm(rid: str):
 
 
 def taken_told(b: Bus) -> str | None:
-    """Il secondo confirm riceve cancel reason=SLOT_TAKEN con lo slot_id (centro dell'altra ASST, EPICA), nessun hold."""
+    """Il secondo confirm riceve cancel reason=taken (MACH-2.1, prima SLOT_TAKEN) con lo slot_id (centro dell'altra
+    ASST, EPICA), nessun hold."""
     got = [m for m in b.log if m.sender == b.ids["specialist_care"] and m.recipient == FOREIGN and m.need_id == WALKIN
            and act(m) != "offer"]
     slot = next((fields(m.text)["slot_id"] for m in b.log if m.sender == FOREIGN and m.need_id == WALKIN
                  and m.text.startswith("confirm")), "")
-    if not got or act(got[0]) != "cancel" or not has(got[0].text, ("reason=SLOT_TAKEN", f"slot_id={slot}")):
-        return f"al secondo confirm su {slot}: «{got[0].text[:90] if got else ''}», atteso cancel reason=SLOT_TAKEN slot_id={slot}"
+    if not got or act(got[0]) != "cancel" or not has(got[0].text, ("reason=taken", f"slot_id={slot}")):
+        return f"al secondo confirm su {slot}: «{got[0].text[:90] if got else ''}», atteso cancel reason=taken slot_id={slot}"
 
 
 IMPOSTOR_CONFIRM = ("confirm offer_id=of-S-h1-01-10 slot_id=S-h1-01-10 citizen=citizen:T-1 consent_ref=cons-X-1 "
@@ -3939,7 +3945,7 @@ SCENARIOS.update({
     # lo slot è ancora oltre _HOLD_LEAD, quindi l'hold parte, mai un cancel EXPIRED nostro (prima: 18 in 2 ore).
     "cross_asst_scelta_lenta": dict(
         start=("hospital", XFIS.format(rid="R-61", extra=" lang=en")), foreign=True, setup=late_confirm(10),
-        expect=[wrote("hold", "un solo margine"), cancel_told(FOREIGN, "EXPIRED", 0)]),
+        expect=[wrote("hold", "un solo margine"), cancel_told(FOREIGN, "past", 0)]),
     # Due richieste incrociate dello stesso partner: la seconda ha la sua risposta anche se nella history
     # viene prima della nostra risposta alla prima.
     "specialista_richieste_incrociate": dict(
@@ -3980,6 +3986,103 @@ SCENARIOS.update({
     "consultorio_cancel_correlabile": dict(
         start=("family_counseling", XGIN.format(rid="R-66", extra="")), foreign=True, setup=unconsented_confirm,
         expect=[family_cancel_rid("R-66")]),
+})
+
+# --- Strutture e MACH-2.1 (docs/protocol/mach-2.1.md): solo l'anello (R17), mach=2.1 e request_id= su ogni offer e
+# cancel a un'altra squadra, taken e past al confirm (R8), il no con next_free= e mai offer_id= (R16), l'anticipo
+# senza after= (R5). Niente lease (R14, R15): le nostre offerte non portano lease_s=.
+
+
+def quiet_foreign(b: Bus) -> None:
+    """Il centro dell'altra ASST non conferma da sé la prima offerta (Bus.foreign tace)."""
+    b.confirmed = True
+
+
+def from_agent(sender: str, *says: tuple[str, str], need: str = WALKIN):
+    """Prima del primo turno ``sender`` scrive alle strutture, ogni (cartella, testo) nel caso ``need``."""
+    def setup(b: Bus) -> None:
+        quiet_foreign(b)
+        for folder, text in says:
+            b.queue.append(b.add(sender, b.ids[folder], {"text": text}, need))
+    return setup
+
+
+def silent_to(peer: str):
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender in b.agents and m.recipient == peer]
+        if got:
+            return f"{b.name(got[0].sender)} ha scritto a {peer}, fuori dall'anello: «{got[0].text[:80]}» (R17)"
+    return check
+
+
+def no_ledger_in(need: str):
+    """Nessuna scrittura né lettura sul Ledger nel caso ``need`` (richieste fuori dall'anello: niente world, niente hold)."""
+    def check(b: Bus) -> str | None:
+        got = [m for m in b.log if m.sender in b.agents and m.recipient == LEDGER and m.need_id == need]
+        if got:
+            return f"{b.name(got[0].sender)} ha chiesto «{got[0].text[:60]}» al Ledger per chi è fuori dall'anello (R17)"
+    return check
+
+
+def answer_lines(rid: str, role: str, word: str, *tokens: str, absent: tuple[str, ...] = ()):
+    """Ogni riga ``word`` di ``role`` al partner per ``rid`` porta ``tokens`` e nessun token che inizi con ``absent``."""
+    def check(b: Bus) -> str | None:
+        lines = [line for m in _cross_answer(b, rid, role) for line in m.text.splitlines()
+                 if line.split()[:1] == [word]]
+        if not lines:
+            return f"{role}: nessuna riga {word} per {rid}: {[m.text[:60] for m in _cross_answer(b, rid, role)]}"
+        for line in lines:
+            if not has(line, tokens) or any(w.startswith(t) for w in line.split() for t in absent):
+                return f"{role} a {rid}: «{line[:170]}», attesi {list(tokens)}, mai {list(absent)}"
+    return check
+
+
+LEASE = " mach=2.1 lease_s=600"
+SCENARIOS.update({
+    # R17: richieste e confirm da un agente fuori dall'anello, a ogni struttura: nessuna risposta, nessuna lettura
+    # del Ledger, nessun hold; il centro dell'anello (R-80) ha la sua risposta.
+    "strutture_mach21_fuori_anello": dict(
+        start=("hospital", XFIS.format(rid="R-80", extra=LEASE)), foreign=True,
+        setup=from_agent(NOT_RING, ("hospital", XFIS.format(rid="R-81", extra="")),
+                         ("specialist_care", XCARD.format(rid="R-82", extra="")),
+                         ("family_counseling", XGIN.format(rid="R-83", extra=""))),
+        expect=[silent_to(NOT_RING), no_ledger_in(WALKIN), answer_lines("R-80", "hospital", "offer", "mach=2.1")]),
+    # La stessa richiesta nel caso del partner vero: nemmeno la risposta in ritardo (_answer_pending) le arriva.
+    "strutture_mach21_fuori_anello_stesso_caso": dict(
+        start=("hospital", XFIS.format(rid="R-84", extra="")), foreign=True,
+        setup=from_agent(NOT_RING, ("hospital", XFIS.format(rid="R-85", extra="")),
+                         ("specialist_care", XCARD.format(rid="R-86", extra="")), need=NEED),
+        expect=[silent_to(NOT_RING), answer_lines("R-84", "hospital", "offer", "mach=2.1")]),
+    "strutture_mach21_confirm_fuori_anello": dict(
+        start=("hospital", XFIS.format(rid="R-87", extra="")), foreign=True,
+        setup=from_agent(NOT_RING, *((f, IMPOSTOR_CONFIRM.replace("h1-01-10", s)) for f, s in (
+            ("hospital", "h1-01-10"), ("specialist_care", "s2-01-10"), ("family_counseling", "c1-01-10")))),
+        expect=[silent_to(NOT_RING), no_ledger_in(WALKIN), no_write("hold", "R17")]),
+    # Offerte a una richiesta mach=2.1 lease_s=600: ogni riga con mach=2.1 e request_id=, mai lease_s= (niente lease).
+    **{f"strutture_mach21_offerta_{role}": dict(
+        start=(role, req.format(rid=f"R-9{i}", extra=LEASE)), foreign=True, setup=quiet_foreign,
+        expect=[answer_lines(f"R-9{i}", role, "offer", "mach=2.1", f"request_id=R-9{i}", absent=("lease_s=",))])
+       for i, (role, req) in enumerate((("hospital", XFIS), ("specialist_care", XCARD), ("family_counseling", XGIN)))},
+    # Senza after=, lease_s=1800: niente prima di adesso + 30 ore di agenda (R5), oltre le 16 h di _LEAD.
+    "strutture_mach21_anticipo": dict(
+        start=("hospital", XFIS.format(rid="R-111", extra=" mach=2.1 lease_s=1800")), foreign=True, setup=quiet_foreign,
+        expect=[cross_window("R-111", START + timedelta(hours=30), START + timedelta(days=14))]),
+    # Il no (finestra vuota) porta mach=2.1, request_id= e next_free=, mai offer_id=: ospedale e consultorio.
+    **{f"strutture_mach21_no_{role}": dict(
+        start=(role, req.format(rid=f"R-11{i + 2}", extra=" mach=2.1 deadline=2026-11-24T09:00")), foreign=True,
+        expect=[answer_lines(f"R-11{i + 2}", role, "cancel", "reason=no_availability", "mach=2.1", f"request_id=R-11{i + 2}",
+                             "next_free=2026-11-24T10:00", absent=("offer_id=",))])
+       for i, (role, req) in enumerate((("hospital", XFIS), ("family_counseling", XGIN)))},
+    # Confirm su uno slot preso da un'altra ASST: reason=taken (non SLOT_TAKEN), mach=2.1, request_id=.
+    "strutture_mach21_confirm_preso": dict(
+        start=("hospital", XFIS.format(rid="R-114", extra="")), foreign=True, steal="S-h3-01-10",
+        expect=[answer_lines("R-114", "hospital", "cancel", "reason=taken", "mach=2.1", "offer_id=", "slot_id=S-h3-01-10")]),
+    # Confirm su uno slot ormai troppo vicino (22 ore di agenda dopo l'offerta): reason=past, mai un hold.
+    "strutture_mach21_confirm_passato": dict(
+        start=("specialist_care", XCARD.format(rid="R-115", extra="")), foreign=True,
+        setup=late_confirm(22, "specialist_care"),
+        expect=[answer_lines("R-115", "specialist_care", "cancel", "reason=past", "mach=2.1", "offer_id=", "slot_id="),
+                no_write("hold", "R8")]),
 })
 
 
