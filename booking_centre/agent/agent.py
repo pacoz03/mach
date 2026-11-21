@@ -108,7 +108,9 @@ _LEARNED_MAX = 16384
 # ponytail: per process; 4 real minutes = 4 agenda hours at 60x. A slot taken since comes back as
 # a refused hold (calendar GONE, answered in the same turn): shorten it if those refusals climb.
 _PAGES: dict[tuple[str, int], tuple[float, datetime | None, str]] = {}
-_PAGE_FRESH = 240.0
+# 21/11 15:30: the Relay delivers every message ~13 minutes late, so a page is never younger than
+# that; pages come from team memory too (_recall). A slot taken since is a refused hold.
+_PAGE_FRESH = 1800.0
 # The window's days, asked all in the first turn (21/11 ~12:00: ~10 minutes each way to the Ledger, and
 # 123 of 161 cases read 2-5 world pages one after the other): ``world procedure=X day=<day>``, one per
 # agenda weekday that can hold an offerable slot (_window_days), never more than _DAY_MAX. The filter
@@ -381,6 +383,7 @@ async def main(need: Need, city: City) -> None:
     # The turn's own message belongs to the case even when history does not show it yet.
     if all(row.msg_id != message.msg_id for row in chat):
         chat = [*chat, message]
+    await _recall(city.agent_id)
     _learn(chat, city.agent_id)
     if message.need_id and any(
         row.sender == city.agent_id and first_word(row.text) == "escalate.emergency" for row in chat
@@ -670,7 +673,7 @@ async def _advance_alone(
     # starts at once and the Ledger's check runs beside it (21/11: 5-7 minutes for that answer).
     # The Ledger's answer prevails when it comes (expired, used: the renewal below). P1 in force,
     # or the citizen writing the number themselves (maybe days later): only the Ledger's answer.
-    handed = None if since or (rules is not None and "P1" in rules) else case.handed(chat, number, _GP)
+    handed = None if (rules is not None and "P1" in rules) else case.handed(chat, number, _GP)
     # A language none of our doctors speaks (the registry, calendar.DOCTORS: no Ledger row needed, so
     # also on a pod just restarted): the partners are asked in this turn, before any Ledger wait
     # (21/11, N-...0002770010: a restarted pod got the citizen's lang=sw and waited ~3 minutes for
@@ -768,7 +771,7 @@ async def _advance_alone(
     renewal, refresh = renewal or stale, refresh or (stale and not clock_asked)
     days = [] if _NO_DAY else _window_days(priority, now, _born(chat))
     # Fresh slots for the window: each of its days read, or page 1 (a pod with no clock yet reads pages).
-    cached = _fresh_page(procedure, 1) is not None or bool(days) and all(
+    cached = _fresh_page(procedure, 1) is not None or bool(days) and any(
         _fresh_day(procedure, _day_key(day), 1) for day in days)
     first = not replacing and not sent.offers and not case.offered(chat, agent, number) and cached
     quick = not stale and _now(chat) is not None and (
@@ -2080,6 +2083,45 @@ def _world_page(chat: list[Message], page: int) -> str | None:
         ):
             return row.text
     return None
+
+
+_RECALL_EVERY = 20.0  # seconds between two reads of team memory by this process
+_RECALLED_AT = 0.0
+
+
+async def _recall(agent: str) -> None:
+    """Team memory instead of a Ledger round trip (21/11: ~13 minutes per hop through the Relay, a
+    memory read is immediate): the clock anchor and the world answers our facilities noted
+    (city:clock, city:world; facility ``_keep_world``) are learned as a Ledger answer of a case
+    would be, once per answer (its sent_at). Best effort: never raises, 3 s at most."""
+
+    global _RECALLED_AT
+    if time.monotonic() - _RECALLED_AT < _RECALL_EVERY:
+        return
+    _RECALLED_AT = time.monotonic()
+    try:
+        ctx = await asyncio.wait_for(tools.context(), 3.0)
+        anchor = tools.fact(ctx, "city:clock", "anchor")
+        if not _CLOCK and isinstance(anchor, dict) and anchor.get("epoch_real") and anchor.get("epoch_agenda"):
+            _CLOCK.update({key: str(anchor.get(key, "")) for key in ("epoch_real", "epoch_agenda", "rate", "paused")})
+        rows: list[Message] = []
+        for predicate in list((ctx.get("facts", {}) or {}).get("city:world") or {}):
+            value = tools.fact(ctx, "city:world", predicate)
+            procedure, _, key = str(predicate).partition(":")
+            if not key or not isinstance(value, dict) or not isinstance(value.get("text"), str):
+                continue
+            sent = str(value.get("sent_at") or "")
+            seen = f"mem:{predicate}:{sent}"
+            if seen in _LEARNED:
+                continue
+            ask = f"world procedure={procedure} " + (f"page={key}" if key.isdigit() else f"day={key} page=1")
+            rows.append(Message("chat", agent, seen + ":ask", "", body={"text": ask}, recipient=LEDGER))
+            rows.append(Message("chat", LEDGER, seen, "", body={"text": value["text"]}, recipient=agent,
+                                sent_at=sent))
+        if rows:
+            _learn(rows, agent)
+    except Exception:  # noqa: BLE001 - memory is a help, never a requirement
+        logging.getLogger("care").exception("care.recall.failed")
 
 
 def _learn(chat: list[Message], agent: str) -> None:
