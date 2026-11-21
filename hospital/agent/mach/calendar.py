@@ -38,7 +38,7 @@ _WEEK = ("lunedì martedì mercoledì giovedì venerdì sabato domenica".split()
          "Monday Tuesday Wednesday Thursday Friday Saturday Sunday".split())
 _MONTHS = ("gennaio febbraio marzo aprile maggio giugno luglio agosto settembre ottobre novembre dicembre".split(),
            "January February March April May June July August September October November December".split())
-DEADLINE_DAYS = {"B": 2, "D": 5}  # agenda days; U is the same day, P has none (R:91)
+DEADLINE_DAYS = {"B": 2, "D": 5}  # calendar days (48 h, 120 h); U is the same day, P has none (R:91)
 OFFER, HOLD = "offer", "hold"
 TTL = {OFFER: 1200.0, HOLD: 1200.0}  # real seconds a claim lives: weak (offer; 21/11 p90 offer -> confirm 1033 s), strong (confirm/hold)
 DOWN_TTL = 600.0
@@ -101,19 +101,14 @@ def preferred(slot: Slot, prefs: Prefs) -> bool:
 
 def deadline(priority: str | None, start: datetime | None) -> datetime | None:
     """The first agenda instant past the priority window (R:91) from ``start`` (the need's birth,
-    R:253, or now); None for P or without a start. Unknown priority: 14 days. Agenda days: the
-    agenda has no Saturday or Sunday (R:80), so a B born Friday 11:38 ends Tuesday 11:38 (fixture
-    offerte_oltre_scadenza os-1: the citizen turned Tuesday 16:00 down with reason=deadline)."""
+    R:253, or now); None for P or without a start. Unknown priority: 14 days. Calendar hours,
+    weekends included: the agenda skips Saturday and Sunday (R:80), so a B born Friday ends on
+    Sunday and Monday is out (21/11: 51 citizen refusals reason=deadline, every B one >= 87.9 h)."""
     if start is None or priority == "P":
         return None
     if priority == "U":
         return start.replace(hour=23, minute=59, second=59, microsecond=0)
-    end = start
-    for _ in range(DEADLINE_DAYS.get(priority or "", 14)):
-        end += timedelta(days=1)
-        while end.weekday() >= 5:
-            end += timedelta(days=1)
-    return end
+    return start + timedelta(days=DEADLINE_DAYS.get(priority or "", 14))
 
 
 def describe(slot: Slot, lang: str = "it") -> str:

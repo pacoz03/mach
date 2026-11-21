@@ -2002,6 +2002,19 @@ def offers_ahead(hours: float):
     return check
 
 
+def offers_before(when: datetime, cite: str):
+    """Ogni offerta del centro a un cittadino cade prima di ``when`` (la scadenza della priorità)."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        for m in b.log:
+            if m.sender == bc and m.recipient.startswith("citizen:") and act(m) == "offer":
+                for o in parse_offers(m.text):
+                    at = o.get("agenda_date")
+                    if at and datetime.fromisoformat(at) >= when:
+                        return f"offerto {o.get('slot_id')} per le {at[5:16]}, oltre {when.isoformat()[5:16]} ({cite})"
+    return check
+
+
 def distinct_offers(b: Bus) -> str | None:
     """Due cittadini vivi non ricevono lo stesso slot finché la finestra ne ha altri (città: lo
     stesso slot a 5 cittadini, poi NO_CAPACITY ed EXPIRED)."""
@@ -3335,8 +3348,8 @@ SCENARIOS.update({
 
 
 # --- Centro prenotazioni, 21/11: lo stesso slot a 13 casi in 10 minuti (le offerte deboli riempivano anche con
-# slot già offerti ad altri casi aperti, poi STALE_FENCE), il confirm doppio a 22 ms, la scadenza B o D che
-# contava anche sabato e domenica (B nati giovedì o venerdì: 38 su 41 alternativa rilassata, 0 ricevute).
+# slot già offerti ad altri casi aperti, poi STALE_FENCE), il confirm doppio a 22 ms, la scadenza B o D in ore
+# di calendario, sabato e domenica compresi (51 rifiuti reason=deadline con il conteggio a giorni feriali).
 
 
 def ring_before_shared(b: Bus) -> str | None:
@@ -3384,10 +3397,14 @@ SCENARIOS.update({
     # Lo stesso confirm due volte insieme: un solo confirm alla struttura, e la prenotazione va.
     "booking_confirm_doppio": dict(start=BACK, race=True, setup=double_confirm, expect=[
         one_confirm_per_slot, wrote("checkin", "R:234")]),
-    # B nato venerdì 08:00 di agenda, venerdì pieno: la scadenza è martedì (R:80, niente sabato e domenica di
-    # agenda; R:91), quindi lunedì è dentro S. Prima: domenica, S vuoto, alternativa rilassata (os-1).
-    "booking_b_nato_venerdi": dict(start=BACK, late_days=4, full_days=1, expect=[
-        never_told("booking_centre", "entro la scadenza della priorità non ci sono posti", cite="R:80, R:91"),
+    # B nato venerdì 27/11 08:00 di agenda: la scadenza è domenica 08:00 (48 h di calendario, sabato e domenica
+    # contati anche se l'agenda non li ha; R:91). Città 21/11: ogni B rifiutato reason=deadline aveva lo slot
+    # oltre 87,9 h, altre squadre da 48,3 h. Solo slot di venerdì, mai lunedì.
+    "booking_b_nato_venerdi": dict(start=BACK, late_days=4, expect=[
+        offers_before(datetime(2026, 11, 29, 8, tzinfo=UTC), "R:91, 48 h di calendario"), wrote("checkin", "R:234")]),
+    # Lo stesso con venerdì pieno: S vuoto, alternativa rilassata (os-1: martedì rifiutato reason=deadline).
+    "booking_b_nato_venerdi_pieno": dict(start=BACK, late_days=4, full_days=1, expect=[
+        told_text("booking_centre", "entro la scadenza della priorità non ci sono posti", cite="R:91, R:232"),
         wrote("checkin", "R:234")]),
 })
 

@@ -167,10 +167,10 @@ def test_exact_result_on_the_0403_block(priority):
 
 def test_the_deadline_counts_from_birth_and_relaxed_drops_only_it():
     cal = fed(SLOTS[1], SLOTS[3], SLOTS[4])  # Monday 30 Nov - Tuesday 1 Dec, Thu 3 - Fri 4, Thu 10 - Fri 11
-    now, born = at("2026-11-30T07:00:00Z"), at("2026-11-25T00:00:00Z")
+    now, born = at("2026-11-30T07:00:00Z"), at("2026-11-27T00:00:00Z")
     days = lambda found: sorted({sid.split("-")[-2] for sid in ids(found)})  # noqa: E731
-    fresh = pick(cal, priority="D", now=now)  # from now: before Mon 7 Dec 07:00 (no agenda weekend)
-    aged = pick(cal, priority="D", now=now, born=born)  # from birth Wed 25 Nov: before Wed 2 Dec 00:00 (R:253)
+    fresh = pick(cal, priority="D", now=now)  # from now: before Sat 5 Dec 07:00
+    aged = pick(cal, priority="D", now=now, born=born)  # from birth Fri 27 Nov: before Wed 2 Dec 00:00 (R:253)
     relaxed = pick(cal, priority="D", now=now, born=born, relaxed=True)
     assert days(fresh) == ["20261130", "20261201", "20261203", "20261204"]
     assert days(aged) == ["20261130", "20261201"]
@@ -182,13 +182,14 @@ def test_the_deadline_counts_from_birth_and_relaxed_drops_only_it():
     assert set(pick(cal, priority="U", now=now, born=at("2026-11-27T12:00:00Z")).why.values()) <= {"deadline", "past"}
 
 
-def test_the_deadline_skips_the_agenda_weekend():
-    # R:80: no agenda Saturday or Sunday, after Friday comes Monday; R:91: B 2 agenda days, D 5.
-    fri, thu = at("2026-12-04T11:38:00Z"), at("2026-12-03T10:00:00Z")
-    assert calendar.deadline("B", fri) == at("2026-12-08T11:38:00Z")  # os-1: Tuesday, not Sunday
-    assert calendar.deadline("B", thu) == at("2026-12-07T10:00:00Z")  # Monday
-    assert calendar.deadline("D", thu) == at("2026-12-10T10:00:00Z")  # Fri Mon Tue Wed Thu
-    assert calendar.deadline("B", at("2026-12-01T09:00:00Z")) == at("2026-12-03T09:00:00Z")  # no weekend crossed
+def test_the_deadline_counts_calendar_hours_weekend_included():
+    # R:91: B 48 h, D 120 h from birth, Saturday and Sunday counted although the agenda has none (R:80).
+    # City 21/11: citizens refused every B slot >= 87.9 h after birth, ours and another team's from 48.3 h.
+    fri, thu = at("2026-12-04T11:38:00Z"), at("2026-12-03T20:06:00Z")
+    assert calendar.deadline("B", thu) == at("2026-12-05T20:06:00Z")  # Saturday: only Thursday and Friday
+    assert calendar.deadline("B", fri) == at("2026-12-06T11:38:00Z")  # Sunday: only Friday
+    assert calendar.deadline("B", fri) < at("2026-12-07T00:00:00Z")  # Monday is out (os-1 refused Tuesday too)
+    assert calendar.deadline("D", at("2026-12-02T10:00:00Z")) == at("2026-12-07T10:00:00Z")  # Wednesday -> Monday
     assert calendar.deadline("U", fri) == at("2026-12-04T23:59:59Z")  # the same agenda day
     assert calendar.deadline("P", fri) is None and calendar.deadline("B", None) is None
 
@@ -732,17 +733,9 @@ def load(source: str, **names) -> SimpleNamespace:
     return SimpleNamespace(**space)
 
 
-def swapped(source: str, old: str) -> str:
-    """Declared change (21/11): the deadline counts agenda days, no Saturday or Sunday (R:80). The
-    copies' calendar-day horizon becomes calendar.deadline; every other line stays verbatim."""
-    assert source.count(old) == 1
-    return source.replace(old, f"deadline(priority, {old.split(' + ')[0]})")
-
-
 LEAD = [HOUR]
-B = load(swapped(BOOKING, '(born or now) + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))'),
-         _lead=lambda: LEAD[0], deadline=calendar.deadline)
-F = load(swapped(FACILITY, 'now + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))'), deadline=calendar.deadline)
+B = load(BOOKING, _lead=lambda: LEAD[0])
+F = load(FACILITY)
 # Every real row, once per slot id, plus rows the fixtures lack: a doctor we do not know, the sdk
 # format, a free=0 row.
 ROWS = list({protocol.fields_of(r)["slot_id"]: r for b in SLOTS for r in b.splitlines() if "slot_id=" in r}.values()) + [
@@ -1006,10 +999,8 @@ class Run:
     def verify(self, found: Pick, case: dict, now: datetime, relaxed: bool) -> None:
         self.checks += 1
         wall, prio, born = self.wall(), case["priority"], case["born"]
-        # n agenda days from a weekday: n calendar days plus a weekend for every Friday crossed (R:80).
-        span = lambda n: born + timedelta(days=n + 2 * ((born.weekday() + n) // 5))  # noqa: E731
         horizon = None if relaxed else {"U": born.replace(hour=23, minute=59, second=59, microsecond=0),
-                                         "B": span(2), "D": span(5)}[prio]
+                                         "B": born + timedelta(days=2), "D": born + timedelta(days=5)}[prio]
         classes = []
         for slot in found.slots:
             sid = slot["slot_id"]
