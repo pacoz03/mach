@@ -21,6 +21,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -243,7 +244,11 @@ async def handle(role: str, need: Need, city: City) -> None:
         await city.say(message.sender, f"address={street}")
         return
     if role == "hospital":
-        await _hospital(city, message, chat)
+        flag = _HOSPITAL.set(True)
+        try:
+            await _hospital(city, message, chat)
+        finally:
+            _HOSPITAL.reset(flag)
     elif role == "specialist_care":
         kind = words(message.text)
         if (
@@ -366,10 +371,25 @@ def _exact(chat: list[Message], agent: str, text: str) -> bool:
     return any(row.sender == agent and row.text.strip() == text for row in chat)
 
 
+# True only inside a hospital turn (handle): the booking lifecycle fixes gated on it (one commit,
+# re-hold, duplicate confirm, Ledger cancel, no resend after TARGET_NOT_VISIBLE) leave the
+# specialist and the consultorio as they were. ponytail: a ContextVar, not a flag threaded
+# through six shared signatures.
+_HOSPITAL: ContextVar[bool] = ContextVar("hospital", default=False)
+# Hospital: (to, text) the Relay refused with TARGET_NOT_VISIBLE. A later turn (the held or
+# committed push) must not send the same message again (R:701). ponytail: grows by bounced
+# messages only, never trimmed.
+_BOUNCED: set[tuple[str, str]] = set()
+
+
 async def _say(city: City, to: str, text: str) -> bool:
+    if _HOSPITAL.get() and (to, text) in _BOUNCED:
+        return False
     try:
         msg_id = await city.say(to, text)
     except CapError as exc:
+        if _HOSPITAL.get() and exc.code == "TARGET_NOT_VISIBLE":
+            _BOUNCED.add((to, text))
         tools.said(to, text, error=exc.code)
         return False
     tools.said(to, text, msg_id)
@@ -416,8 +436,10 @@ async def _await_line(
     token: str,
     *,
     op: str,
+    new: bool = False,
 ) -> tuple[Message, list[Message]] | None:
-    """The ledger line for ``token``, or a refusal of ``op`` that was not already in ``chat``."""
+    """The ledger line for ``token``, or a refusal of ``op`` that was not already in ``chat``.
+    ``new``: the line too must not be in ``chat`` (a re-hold: the old ``held`` is stale)."""
 
     known = {row.msg_id for row in chat}
     fresh = chat
@@ -426,7 +448,7 @@ async def _await_line(
             fresh = await city.history(need_id=need_id)
         except CapError:
             fresh = chat
-        hit = _latest(fresh, head, token)
+        hit = _latest([row for row in fresh if row.msg_id not in known] if new else fresh, head, token)
         if hit is not None:
             tools.observe(hit)
             return hit, fresh
@@ -1068,7 +1090,23 @@ async def _confirm_alone(
     book_here = hold_self or message.sender.startswith("agent:") or facility == agent
     if book_here:
         sent = _sent(key)
-        held = slot in sent.holds or _we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
+        if _HOSPITAL.get():
+            booked = _booked(chat, agent, slot)
+            if booked:
+                # A duplicate confirm of a booking the Ledger committed: the same receipt again
+                # to whoever asked. Never a new hold or commit; once per confirm message.
+                if not _answered(chat, agent, message.msg_id, message.sender):
+                    await _say(
+                        city,
+                        message.sender,
+                        f"booking.receipt booking_id={booked[0]} ledger_ref={booked[1]}",
+                    )
+                return
+            # After a refusal, expiry or cancellation the old hold is gone: hold again.
+            since = _since_hold(chat, agent, slot)
+            held = since is not None and not any(_drops_hold(row) for row in since)
+        else:
+            held = slot in sent.holds or _we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
         if not held:
             parts = ["hold", f"slot_id={slot}"]
             if citizen:
@@ -1080,7 +1118,9 @@ async def _confirm_alone(
             if not await _say(city, LEDGER, " ".join(parts)):
                 return
             sent.holds.add(slot)
-        await _finish_booking(city, message, chat, slot, hold_self=hold_self)
+        await _finish_booking(
+            city, message, chat, slot, hold_self=hold_self, new=_HOSPITAL.get() and not held
+        )
         return
     if not facility or not citizen:
         return
@@ -1664,13 +1704,30 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
     ):
         await _cross_asst(city, message)
     else:
-        booking = _facility(city, message, chat, reports=False, hold_self=False)
-        if confirm and message.sender != LEDGER:
-            # The visit's time, read alongside the hold: world goes out first, so it still
-            # lists the slot, and the hold, commit and receipt do not wait for it.
-            await asyncio.gather(_ask_slots(city, message, chat), booking)
-        else:
-            await booking
+        # One booking step at a time per case, on a fresh read of it: the held and committed
+        # pushes open turns of their own while the confirm turn waits for the same lines, and
+        # both committed the hold (live: every commit twice, DUPLICATE) and sent the receipt.
+        # ponytail: in-process lock; two pods during a roll out can still race.
+        async with _gated(f"book:{message.need_id or message.msg_id}"):
+            try:
+                chat = await city.history(need_id=message.need_id)
+            except CapError:
+                pass
+            if message.sender == LEDGER and (
+                head in {"cancelled", "cancel"}
+                or head == "refused" and bool({"commit", "op=commit"} & kind)
+            ):
+                # The Ledger dropped our booking, or refused a commit after the confirm turn
+                # stopped waiting: whoever asked hears it once.
+                await _on_refused(city, message, chat, hold_self=False)
+            else:
+                booking = _facility(city, message, chat, reports=False, hold_self=False)
+                if confirm and message.sender != LEDGER:
+                    # The visit's time, read alongside the hold: world goes out first, so it
+                    # still lists the slot, and the hold, commit and receipt do not wait for it.
+                    await asyncio.gather(_ask_slots(city, message, chat), booking)
+                else:
+                    await booking
         if confirm or (message.sender == LEDGER and head in {"held", "committed"}):
             await _welcome(city, message)
 
@@ -2052,6 +2109,61 @@ def _bookings(chat: list[Message], agent: str) -> dict[str, dict[str, str]]:
     return found
 
 
+def _cancelled(chat: list[Message], booking_id: str) -> bool:
+    """The Ledger cancelled ``booking_id`` (a ``cancelled``/``cancel`` row naming it)."""
+
+    ids = {f"booking_id={booking_id}", f"hold_id={booking_id}"}
+    return any(
+        row.sender == LEDGER
+        and first_word(row.text) in {"cancelled", "cancel"}
+        and bool(ids & set(row.text.split()))
+        for row in chat
+    )
+
+
+def _booked(chat: list[Message], agent: str, slot: str) -> tuple[str, str] | None:
+    """``(booking_id, ledger_ref)`` of a Ledger ``committed`` row of ours for ``slot`` that no
+    later row cancelled, else None: the only receipt we may send again."""
+
+    for booking_id, entry in _bookings(chat, agent).items():
+        token = f"booking_id={booking_id}"
+        if (
+            entry["slot"] == slot
+            and entry["ledger_ref"]
+            and _latest(chat, "committed", token) is not None
+            and not _cancelled(chat, booking_id)
+        ):
+            return booking_id, entry["ledger_ref"]
+    return None
+
+
+def _since_hold(chat: list[Message], agent: str, slot: str) -> list[Message] | None:
+    """The rows after our latest ``hold`` on ``slot``, or None if we never held it."""
+
+    start = None
+    for i, row in enumerate(chat):
+        if (
+            row.sender == agent
+            and row.recipient == LEDGER
+            and first_word(row.text) == "hold"
+            and f"slot_id={slot}" in row.text.split()
+        ):
+            start = i + 1
+    return None if start is None else chat[start:]
+
+
+def _drops_hold(row: Message) -> bool:
+    """A Ledger row that ends a hold: a refused hold or commit, a cancellation, an expiry.
+    ponytail: not matched to the hold's id (real refusals carry only op/code/detail); one slot
+    in flight per case."""
+
+    head = first_word(row.text)
+    return row.sender == LEDGER and (
+        head in {"cancelled", "cancel", "expired"}
+        or head == "refused" and bool({"hold", "commit", "op=hold", "op=commit"} & words(row.text))
+    )
+
+
 def _slot_facts(chat: list[Message], agent: str, slot: str) -> dict[str, str]:
     """What the Ledger or we wrote about ``slot`` (``at``, ``procedure``...). Never a citizen's
     or another agent's word: a time we tell the citizen must be a fact."""
@@ -2273,7 +2385,8 @@ async def _answer(city: City, message: Message, chat: list[Message]) -> None:
     ours = {
         booking: entry
         for booking, entry in _bookings(chat, agent).items()
-        if _holder(chat, agent, entry["slot"]) in ("", citizen)
+        # A booking the Ledger cancelled is never told as confirmed.
+        if _holder(chat, agent, entry["slot"]) in ("", citizen) and not _cancelled(chat, booking)
     }
     if len(ours) != 1:
         await _redirect(city, message, chat, en=_english(chat, message.text))
@@ -2514,11 +2627,20 @@ async def _family_wait(city: City, chat: list[Message]) -> None:
 
 
 async def _finish_booking(
-    city: City, message: Message, chat: list[Message], slot: str, *, hold_self: bool
+    city: City,
+    message: Message,
+    chat: list[Message],
+    slot: str,
+    *,
+    hold_self: bool,
+    new: bool = False,
 ) -> None:
-    """Hold is in the mailbox. Read the held line and commit before this turn ends."""
+    """Hold is in the mailbox. Read the held line and commit before this turn ends.
+    ``new``: a hold just sent, so a ``held`` already in ``chat`` belongs to an older one."""
 
-    found = await _await_line(city, message.need_id, chat, "held", f"slot_id={slot}", op="hold")
+    found = await _await_line(
+        city, message.need_id, chat, "held", f"slot_id={slot}", op="hold", new=new
+    )
     if found is None:
         _LOG.info("care.held.missing", extra={"need_id": (message.need_id or "")[:48]})
         if hold_self:
@@ -2648,14 +2770,22 @@ async def _on_refused(
         for line in row.text.splitlines():
             if f"slot_id={slot}" in line.split():
                 offer_id = fields_of(line).get("offer_id", offer_id)
+    fields = fields_of(message.text)
+    # The Ledger's code goes on, so the booking centre can react: PRESCRIPTION_EXPIRED →
+    # renewal (P1), CONSENT_MISSING → consent (P2), NO_CAPACITY → another slot (P3).
+    code = fields.get("code") or fields.get("reason") or "facility_cancelled"
+    hospital = _HOSPITAL.get()
+    if hospital and code == "DUPLICATE":
+        # A second commit of a hold already committed (its committed line brings the receipt)
+        # or a prescription already booked: nothing was lost, so no cancel to anyone.
+        return
+    # Hospital: once per hold, so a re-hold of the same offer can be cancelled again.
+    seen = (_since_hold(chat, agent, slot) or []) if hospital else chat
     if (
         target
         and offer_id
-        and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
+        and not _we(seen, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        # The Ledger's code goes on, so the booking centre can react: PRESCRIPTION_EXPIRED →
-        # renewal (P1), CONSENT_MISSING → consent (P2), NO_CAPACITY → another slot (P3).
-        code = fields_of(message.text).get("code") or "facility_cancelled"
         text = f"cancel offer_id={offer_id} reason={code}"
         if target.startswith("citizen:"):
             if _en(chat):
@@ -2671,6 +2801,23 @@ async def _on_refused(
                     else " Il centro prenotazioni può trovarle un'altra data."
                 )
         await _say(city, target, text)
+    citizen = (_holder(chat, agent, slot) or _citizen(chat) or "") if hospital else ""
+    if (
+        offer_id
+        and citizen.startswith("citizen:")
+        and citizen != target
+        # Only a citizen we already wrote to (the welcome): the booking party tells the rest.
+        and any(row.sender == agent and row.recipient == citizen for row in chat)
+        and not _we(seen, agent, f"offer_id={offer_id}", to=citizen, word="cancel")
+    ):
+        note = (
+            "I'm sorry, your booking with us has been cancelled. The booking centre can find "
+            "you a new date."
+            if _english(chat)
+            else "Mi dispiace, la sua prenotazione da noi è stata annullata. Il centro "
+            "prenotazioni può trovarle una nuova data."
+        )
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason={code} {note}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 
