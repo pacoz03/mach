@@ -1028,8 +1028,12 @@ def _partner_speaks(slot: dict[str, str], lang: str) -> bool:
     if "*" not in spec[0]:
         return False
     known = next((rare for name, rare in _RARE_BY_ASST.items() if f"-{name}-" in f"-{doctor}-"), None)
-    # Unknown ASST: its rare language is unknown, so we never claim it (a false attribute is -2).
-    return known == lang
+    if known is not None:
+        return known == lang
+    # An ASST that did not publish its rare language, and a language no published ASST has
+    # (journey 0141, Korean: S had five slots and we offered none): by elimination its rare
+    # doctor may be the one. Our offer states no language, so a miss is a refusal, not a claim.
+    return lang not in _RARE_BY_ASST.values()
 
 
 def _partner_fit(
@@ -1129,6 +1133,12 @@ async def _ask_partners(
         # The ASST whose doctor speaks the citizen's rare language first, then the Index's best,
         # then the published ones the Index did not return. The language itself is never sent.
         first = [agent_id for agent_id, rare in known.items() if rare and rare == lang]
+        limit = _MAX_PARTNERS
+        if not first and lang not in ("it", "en"):
+            # Nobody published this language: the ASSTs that published none come first, and
+            # every published partner is asked, since any of them may have that doctor.
+            first = [agent_id for agent_id, rare in known.items() if not rare]
+            limit = len(known)
         partners = list(dict.fromkeys([*first, *found, *known]))
         request = "x-" + hashlib.sha256(f"{agent}/{key}".encode()).hexdigest()[:12]
         text = f"need.request service_type={service} procedure={procedure}"
@@ -1140,7 +1150,7 @@ async def _ask_partners(
             "richiesta: ve li mandiamo solo dopo il suo consenso. Grazie!"
         )
         reached = 0
-        for partner in partners[:_MAX_PARTNERS]:
+        for partner in partners[:limit]:
             if _down(partner):
                 continue
             try:
@@ -1157,7 +1167,10 @@ async def _ask_partners(
     def answered(rows: list[Message]) -> bool:
         asked = _asked_partners(rows, agent)
         heard = {row.sender for row in _partner_rows(rows, agent)}
-        return bool(_partner_slots(rows, agent)) or (bool(asked) and set(asked) <= heard)
+        # One partner's slots are enough, unless the citizen needs a language: then a slot whose
+        # doctor speaks it, or every partner's answer.
+        slots = [slot for slot in _partner_slots(rows, agent) if _partner_speaks(slot, lang)]
+        return bool(slots) or (bool(asked) and set(asked) <= heard)
 
     if not answered(chat):
         # The citizen chooses from our first offers message (R:95) and waits minutes for it:
