@@ -1881,7 +1881,8 @@ def _by_constraints(slots: list[dict[str, str]], fields: dict[str, str]) -> list
     A doctor missing from _DOCTORS meets no gender or language constraint: never claimed."""
 
     lang = (fields.get("lang") or "").strip().lower()
-    gender = _GENDERS.get((fields.get("gender") or "").strip().lower(), "")
+    raw_gender = fields.get("gender") or fields.get("gender_preference") or ""
+    gender = _GENDERS.get(raw_gender.strip().lower(), "")
     days = {d for d in re.split(r"[\s,/;|]+", (fields.get("days") or "").lower()) if d}
     if not (lang or gender or days):
         return slots

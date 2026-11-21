@@ -82,3 +82,8 @@ def test_empty_priority_window_offers_the_first_dates_after(brain):
     reply = [t for to, t in fake.sent if to == PARTNER][0]
     assert reply.startswith("offer ")
     assert "Entro i tempi della priorità U" in reply
+
+
+def test_gender_preference_field_is_read_too(brain):
+    # Our teams' booking centres name it gender_preference (booking_centre, consultorio).
+    assert _run(brain, [[S1_WED, S2_THU, S1_FRI]], "gender_preference=f")[0] == "S-s2-thu"
