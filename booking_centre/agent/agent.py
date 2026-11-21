@@ -326,6 +326,12 @@ async def main(need: Need, city: City) -> None:
     if street and _asks_address(message):
         await city.say(message.sender, f"address={street}")
         return
+    if message.sender.startswith("agent:"):
+        # Only booking messages from peers need the case. An unrelated request can finish
+        # without waiting for a remote history read before the harness renews its delivery.
+        kind = words(message.text) | {message.type}
+        if not (kind & {"offer", "booking.receipt", "cancel", "cancelled"}) and _fields(message).get("handoff") != "gp":
+            return
     chat = await city.history(need_id=message.need_id)
     # The turn's own message belongs to the case even when history does not show it yet.
     if all(row.msg_id != message.msg_id for row in chat):
