@@ -856,8 +856,10 @@ async def _preadvise(city: City, history: list[Message], request: Prescription, 
     try:
         if not any(row.sender == city.agent_id and row.recipient == agent_id and token in row.text.split()
                    for row in history):
-            if not any(peer.agent_id == agent_id for peer in await city.find(capability)):
-                return ""
+            try:  # the Index may leave our own clinic out (1.0.20 live: 0 of 25 found): it is ours
+                await city.find(capability)
+            except Exception:  # noqa: BLE001
+                pass
             text = (f"data.response purpose=referral {token} procedure={request.procedure} "
                     f"priority={request.priority} Buongiorno collega, le segnalo che ho appena prescritto "
                     "questa visita a un mio paziente: il centro prenotazioni gli proporrà i vostri orari. "
