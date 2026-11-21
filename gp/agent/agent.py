@@ -363,8 +363,9 @@ def _reply_lang(lang: str | None) -> str:
 # rules find no symptom, under a short timeout. Its JSON is checked against PROTOCOL: it can pick
 # a code, never invent a procedure or a priority. CapError, timeout or bad JSON: the rules stand.
 # Measured on city-default (2026-11-20, 62 calls): ~0.4 s, or 12-13 s (max 12.97) about one call
-# in four, nothing in between. A short timeout would lose those; the gp has no tight deadline.
-_LLM_TIMEOUT = 15.0
+# in four, nothing in between. Team budget 2 s in the turn (21/11): a slow call holds the turn,
+# so past it the rules stand alone (``{}``); the red flag never waits for the model (safety first).
+_LLM_TIMEOUT = 2.0
 _LLM_SYSTEM = (
     "You read one message a citizen wrote to their family doctor's desk. The message can be in "
     "any language. Reply with one JSON object and nothing else, with these keys:\n"
