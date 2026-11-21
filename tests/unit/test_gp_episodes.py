@@ -17,6 +17,7 @@ from city_sdk.city import City, CapError, Message, Need, OutOfScope, Peer, under
 
 ROOT = Path(__file__).resolve().parents[2]
 GP, BOOKING, LEDGER, CITIZEN = "agent:gp", "agent:sbdpbpqz5sxe", "city:ledger", "citizen:t01/anna"
+HOSPITAL = "agent:m6py14a1ej77"  # our physiatry clinic: the gp pre-advises it (gp/agent/agent.py _CLINIC)
 
 
 def _load():
@@ -69,7 +70,10 @@ def test_citizen_turn_is_traced_without_their_words():
     assert inbound["p_direction"] == "in" and inbound["p_act"] == ""  # "mal" is the citizen's text
     assert inbound["p_fields"] == {"sent_at": "2026-11-21T04:00:00.000Z"}
     assert [(r["p_peer"], r["p_act"]) for r in out] == [
-        (LEDGER, "prescribe"), (BOOKING, "need.request"), (CITIZEN, "prescription")]
+        (LEDGER, "prescribe"), (BOOKING, "need.request"), (HOSPITAL, "data.response"), (CITIZEN, "prescription")]
+    # The pre-advice to our clinic (gp 1.0.20, review collaboration): tokens only, never their words.
+    advice = next(row.text for row in fake.chat if row.recipient == HOSPITAL)
+    assert advice.startswith("data.response purpose=referral ") and "schiena" not in advice
     assert all(r["p_need_id"] == "N-1" and isinstance(r["p_latency_ms"], int) and r["p_msg_id"] for r in out)
 
 
@@ -105,7 +109,8 @@ def test_a_relay_timeout_never_ends_the_turn():
     gp, fake = _load(), Timeout()
     rows = [a for fn, a in _turn(gp, fake, CITIZEN, "Mal di schiena da tre giorni") if fn == "observe"]
     assert [(r["p_peer"], r["p_act"], r["p_error"]) for r in rows[1:]] == [
-        (LEDGER, "prescribe", "ReadTimeout"), (BOOKING, "need.request", None), (CITIZEN, "prescription", None)]
+        (LEDGER, "prescribe", "ReadTimeout"), (BOOKING, "need.request", None), (HOSPITAL, "data.response", None),
+        (CITIZEN, "prescription", None)]
     assert sum(row.text.startswith("prescribe ") for row in fake.chat) == 1  # never sent again
 
 
