@@ -3,9 +3,11 @@
 # 2026-11-21 booking C D E F: 301 (26 risolte; 14 nuove: 12 negli scenari nuovi su debolezze note, più booking_world_in_cache sotto restart e ledger_lost, da R2 «mai muto»)
 # 2026-11-21 gp (red flag prima delle letture, safety, msg_id già fatto): 269 (34 risolte; 2 nuove in gp_grazie_prima_del_ledger: il booking tace con ledger_lost, R2)
 # 2026-11-21 ospedale R3 (niente pagina, niente no_availability; _recover; pagine per contenuto): 224 (51 risolte; 6 nuove negli scenari aggiunti, gemelle di righe già qui: redeliver come ospedale_alternative, say_tnv come cross_asst_distribuite, booking muto con clock_lost (R2) e crash del booking su say_timeout)
+# 2026-11-21 booking col calendario e R1: 232 (14 risolte, tutti i say_timeout; 22 nuove solo nei 3 scenari aggiunti e nei 2 P1 prima saltati, gemelle di booking_rifiuto_subito: hostile, ledger_lost, say_tnv, redeliver)
 clock_lost plain booking_letture_rare
 clock_lost plain booking_margine_ledger_lento
 clock_lost plain booking_orologio_vecchio
+clock_lost plain booking_redirect_pagina_due
 clock_lost plain booking_riserva_senza_p3
 clock_lost plain booking_scelta_tardiva
 clock_lost plain booking_slot_condivisi
@@ -46,6 +48,7 @@ clock_lost plain welcome_lang_en
 clock_lost turns booking_letture_rare
 clock_lost turns booking_margine_ledger_lento
 clock_lost turns booking_orologio_vecchio
+clock_lost turns booking_redirect_pagina_due
 clock_lost turns booking_riserva_senza_p3
 clock_lost turns booking_scelta_tardiva
 clock_lost turns booking_slot_condivisi
@@ -86,10 +89,12 @@ clock_lost turns p1_ricetta_scaduta
 clock_lost turns p3_riserva_urgente
 clock_lost turns welcome_indirizzo
 clock_lost turns welcome_lang_en
+hostile plain booking_rifiuto_giorno
 hostile plain booking_rifiuto_subito
 hostile plain checkin_codice_prosa
 hostile plain gp_rinnovo_a_parole_lento
 hostile plain richiesta_clinica
+hostile turns booking_rifiuto_giorno
 hostile turns booking_rifiuto_subito
 hostile turns checkin_codice_prosa
 hostile turns gp_rinnovo_a_parole_lento
@@ -98,6 +103,7 @@ ledger_late turns booking_nostro_consultorio
 ledger_late turns booking_nostro_ospedale
 ledger_late turns booking_nostro_specialista
 ledger_late turns booking_passaggio_subito
+ledger_late turns booking_rifiuto_giorno
 ledger_late turns booking_world_in_cache
 ledger_late turns consultorio_alternativa_offerta
 ledger_late turns consultorio_hold_duplicate
@@ -107,9 +113,12 @@ ledger_late turns ospedale_confirm_doppio
 ledger_late turns ospedale_giu_poi_su
 ledger_late turns ospedale_rehold
 ledger_late turns p1_ricetta_scaduta
+ledger_late turns p1_rinnovo_prenota
+ledger_late turns p1_rinnovo_prenota_cittadino
 ledger_late turns specialista_hold_duplicate
 ledger_lost plain booking_ricetta_altrui
 ledger_lost plain booking_ricetta_inesistente
+ledger_lost plain booking_rifiuto_giorno
 ledger_lost plain booking_rifiuto_subito
 ledger_lost plain booking_world_in_cache
 ledger_lost plain consultorio_alternativa_offerta
@@ -117,7 +126,6 @@ ledger_lost plain facility_cancel
 ledger_lost plain gp_alternativa_primo_posto
 ledger_lost plain gp_grazie_prima_del_ledger
 ledger_lost plain gp_preferenze_falsi
-ledger_lost plain gp_rinnovo_p1_lento
 ledger_lost plain gp_secondo_sintomo
 ledger_lost plain injection_slot
 ledger_lost plain ospedale_annullata
@@ -128,6 +136,7 @@ ledger_lost plain p1_ricetta_scaduta
 ledger_lost plain p3_riserva_urgente
 ledger_lost turns booking_ricetta_altrui
 ledger_lost turns booking_ricetta_inesistente
+ledger_lost turns booking_rifiuto_giorno
 ledger_lost turns booking_rifiuto_subito
 ledger_lost turns booking_world_in_cache
 ledger_lost turns consultorio_alternativa_offerta
@@ -135,7 +144,6 @@ ledger_lost turns facility_cancel
 ledger_lost turns gp_alternativa_primo_posto
 ledger_lost turns gp_grazie_prima_del_ledger
 ledger_lost turns gp_preferenze_falsi
-ledger_lost turns gp_rinnovo_p1_lento
 ledger_lost turns gp_secondo_sintomo
 ledger_lost turns injection_slot
 ledger_lost turns ospedale_annullata
@@ -149,12 +157,15 @@ ledger_reorder turns booking_nostro_consultorio
 ledger_reorder turns booking_nostro_ospedale
 ledger_reorder turns booking_nostro_specialista
 ledger_reorder turns booking_passaggio_subito
+ledger_reorder turns booking_rifiuto_giorno
 ledger_reorder turns booking_world_in_cache
 ledger_reorder turns consultorio_alternativa_offerta
 ledger_reorder turns consultorio_hold_duplicate
 ledger_reorder turns gp_rinnovo_p1_lento
 ledger_reorder turns ospedale_confirm_doppio
 ledger_reorder turns ospedale_giu_poi_su
+ledger_reorder turns p1_rinnovo_prenota
+ledger_reorder turns p1_rinnovo_prenota_cittadino
 ledger_reorder turns specialista_hold_duplicate
 redeliver plain checkin_rifiutato
 redeliver plain facility_cancel
@@ -166,6 +177,8 @@ redeliver plain ospedale_hold_scaduto
 redeliver plain ospedale_regola_p3
 redeliver plain ospedale_riavvio_alternative
 redeliver plain ospedale_slot_rubato
+redeliver plain p1_rinnovo_prenota
+redeliver plain p1_rinnovo_prenota_cittadino
 redeliver turns checkin_rifiutato
 redeliver turns facility_cancel
 redeliver turns gp_rinnovo_p1_lento
@@ -176,28 +189,22 @@ redeliver turns ospedale_hold_scaduto
 redeliver turns ospedale_regola_p3
 redeliver turns ospedale_riavvio_alternative
 redeliver turns ospedale_slot_rubato
+redeliver turns p1_rinnovo_prenota
+redeliver turns p1_rinnovo_prenota_cittadino
 restart plain booking_letture_rare
 restart plain ospedale_commit_unico
 restart turns booking_world_in_cache
-say_timeout plain booking_offerta_senza_domande
-say_timeout plain booking_ricetta_inesistente
 say_timeout plain booking_ricetta_riscritta
-say_timeout plain checkin_codice_prosa
-say_timeout plain ospedale_hold_scaduto
-say_timeout plain ospedale_rifiuto_tardivo
 say_timeout turns booking_ricetta_riscritta
-say_timeout turns checkin_codice_prosa
-say_timeout turns ospedale_annullo_lento
-say_timeout turns ospedale_hold_scaduto
-say_timeout turns ospedale_rifiuto_tardivo
-say_tnv plain booking_slot_condivisi
+say_tnv plain booking_redirect_pagina_due
 say_tnv plain ospedale_annullata
 say_tnv plain ospedale_rehold
 say_tnv turns booking_offerta_senza_domande
 say_tnv turns booking_orologio_vecchio
+say_tnv turns booking_redirect_pagina_due
 say_tnv turns booking_ricetta_inesistente
+say_tnv turns booking_rifiuto_giorno
 say_tnv turns booking_rifiuto_subito
-say_tnv turns booking_slot_condivisi
 say_tnv turns booking_world_in_cache
 say_tnv turns cardiologia_referto
 say_tnv turns checkin_conferma_prosa
@@ -218,13 +225,15 @@ say_tnv turns ospedale_commit_unico
 say_tnv turns ospedale_rehold
 say_tnv turns ospedale_scritture_lente
 say_tnv turns ospedale_slot_rubato
+say_tnv turns p1_rinnovo_prenota_cittadino
 two_pods plain booking_letture_rare
 two_pods plain booking_slot_condivisi
+two_pods plain booking_slot_raffica
 two_pods plain cross_asst_orologio_memoria
 two_pods plain ospedale_alternative
 two_pods plain ospedale_commit_unico
 two_pods turns booking_letture_rare
-two_pods turns booking_slot_condivisi
+two_pods turns booking_slot_raffica
 two_pods turns cross_asst_cittadino_invisibile
 two_pods turns cross_asst_orologio_memoria
 two_pods turns cross_asst_orologio_nota

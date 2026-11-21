@@ -86,6 +86,12 @@ def speaks(doctor_id: str, lang: str) -> bool:
     return spec is not None and lang in spec[0]
 
 
+def gender(doctor_id: str) -> str | None:
+    """Our registry's gender of the doctor ("f" or "m"); None for one we do not know."""
+    spec = _doctor(doctor_id)
+    return spec[1] if spec is not None else None
+
+
 def preferred(slot: Slot, prefs: Prefs) -> bool:
     """In S_pref: a doctor we know who speaks the language, is the gender, on one of the days."""
     spec = _doctor(slot.get("doctor_id", ""))
@@ -242,6 +248,18 @@ class Calendar:
             self._down[key] = at or wall
         elif code in GONE or code == "BOOKED":
             self._mark(key, code, (at or wall, ""))
+
+    @_safe(lambda: False)
+    def down(self, facility: str) -> bool:
+        """``facility`` was marked DOWN less than DOWN_TTL s ago."""
+        at = self._down.get(facility)
+        return at is not None and (self._wall() - at).total_seconds() < DOWN_TTL
+
+    @_safe(lambda: False)
+    def shared(self, slot_id: str, case: str) -> bool:
+        """Offered to another case and that claim still lives (D1): its confirm may come first."""
+        who, what = self._live(slot_id, self._wall())
+        return what == OFFER and who not in ("", case)
 
     @_safe(lambda: False)
     def claim(self, slot_id: str, case: str, kind: str = OFFER) -> bool:

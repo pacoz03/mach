@@ -2041,6 +2041,95 @@ SCENARIOS.update({
 })
 
 
+# --- Centro prenotazioni e calendario degli slot (wave W01QQQ, tests/fixtures/city_journeys/): il rinvio
+# al posto dell'offerta, lo stesso slot a molti cittadini, il silenzio dopo i rifiuti per giorno.
+
+KNEE = ("gp", "Salve, mi fa male il ginocchio quando salgo le scale.")  # VIS-FIS D: 5 giorni di agenda
+RAFFICA = 10
+
+
+def writes_to_booking(b: Bus) -> None:
+    """Ricevuta la ricetta dal gp, il cittadino scrive anche lui al centro, come in città: il suo
+    need.request incrocia le offerte del passaggio (redirect_invece_di_offerta, caso 2)."""
+    c, react = b.citizen, b.citizen.react
+
+    def wrapped(m: Message) -> None:
+        react(m)
+        if m.sender == b.ids["gp"] and act(m) == "prescription" and not getattr(c, "wrote", False):
+            c.wrote = True
+            c.say(b.ids["booking_centre"], f"Buongiorno, vorrei prenotare. prescription_number={c.rx} lang=it")
+    c.react = wrapped
+
+
+def offers_first(b: Bus) -> str | None:
+    """Il primo messaggio del centro al cittadino è un'offerta (redirect_invece_di_offerta, caso 1)."""
+    first = next((m for m in b.log if m.sender == b.ids["booking_centre"] and m.recipient == CIT), None)
+    if first is None or act(first) != "offer":
+        return f"primo messaggio del centro al cittadino: «{first.text[:60] if first else ''}», attesa un'offerta"
+
+
+def raffica(b: Bus) -> None:
+    """RAFFICA passaggi del gp al centro nello stesso istante, VIS-FIS D (città 21/11 04:10: lo stesso slot
+    prima scelta di 9 cittadini in 4 s). I turni del centro girano insieme (race: la rete cede il loop).
+    Tre ore per medico e mezza giornata, così la finestra D ha posto per tutti (48 slot)."""
+    L, gp, bc = b.ledger, b.ids["gp"], b.ids["booking_centre"]
+    for s in [s for s in L.slots.values() if s["procedure"] == "VIS-FIS"]:
+        start = datetime.fromisoformat(s["at"])
+        for hour in (start.hour + 1, start.hour + 2):
+            sid = f"{s['slot_id'][:-2]}{hour}"
+            L.slots[sid] = dict(s, slot_id=sid, at=start.replace(hour=hour).isoformat(), reserve=False)
+    for k in range(RAFFICA):
+        cid, need, rx = f"citizen:T-R{k}", f"N-2026-11-23-{80 + k:04d}", f"RX-R{k}"
+        L.rx[rx] = dict(prescription_number=rx, patient=cid, procedure="VIS-FIS", priority="D", issued=L.now)
+        m = b.add(gp, bc, {"text": f"need.request handoff=gp citizen={cid} prescription_number={rx} procedure=VIS-FIS "
+                                   "priority=D lang=it Buongiorno, vi passo la ricetta."}, need)
+        b.tasks.append(asyncio.create_task(b.deliver(m)))
+
+
+def raffica_first_offers(b: Bus) -> str | None:
+    """Le prime offerte dei RAFFICA cittadini non hanno uno slot in comune: ognuno ha scelte che nessun
+    altro tiene (calendario D1, claim all'offerta prima della say)."""
+    bc, first = b.ids["booking_centre"], {}
+    for m in b.log:
+        if m.sender == bc and m.recipient.startswith("citizen:T-R") and act(m) == "offer":
+            first.setdefault(m.recipient, [o.get("slot_id") for o in parse_offers(m.text)])
+    if len(first) < RAFFICA:
+        return f"prime offerte a {len(first)} cittadini della raffica su {RAFFICA}"
+    seen: dict[str, str] = {}
+    for cid, slots in first.items():
+        for slot in slots:
+            if slot in seen:
+                return f"{slot} nelle prime offerte sia di {seen[slot]} sia di {cid}"
+            seen[slot] = cid
+
+
+def refused_days_avoided(b: Bus) -> str | None:
+    """Dopo i rifiuti reason=day (uno per offerta, nello stesso istante) le offerte nuove non cadono più in
+    quei giorni della settimana (muto_dopo_rifiuto: il cittadino dice i suoi giorni solo rifiutando)."""
+    offers = [m for m in b.log if m.sender == b.ids["booking_centre"] and m.recipient == CIT and act(m) == "offer"]
+    if len(offers) < 2:
+        return "nessuna offerta nuova dopo i rifiuti per giorno"
+    refused = {o.get("agenda_day") for o in parse_offers(offers[0].text)}
+    again = {o.get("slot_id"): o.get("agenda_day") for o in parse_offers(offers[1].text)}
+    if refused & set(again.values()):
+        return f"offerti ancora {sorted(again)} nei giorni rifiutati {sorted(refused)}"
+
+
+SCENARIOS.update({
+    # Pagina 1 piena, posti D in pagina 2; il need.request del cittadino incrocia le offerte: mai il
+    # rinvio a chi ha una ricetta valida (città: 20 percorsi, `_GONE` in `taken` e niente pagina 2).
+    "booking_redirect_pagina_due": dict(start=KNEE, handoff=True, full_days=3, setup=writes_to_booking, expect=[
+        offers_first, never_told("booking_centre", "informazione sicura", cite="redirect_invece_di_offerta"),
+        wrote("checkin", "R:234")]),
+    # Dieci passaggi insieme: le prime offerte non si sovrappongono (stesso_slot_a_molti).
+    "booking_slot_raffica": dict(start=BACK, race=True, setup=raffica, expect=[
+        raffica_first_offers, wrote("checkin", "R:234")]),
+    # Rifiuti reason=day: il giorno diventa un vincolo del caso, le offerte nuove arrivano nello stesso turno.
+    "booking_rifiuto_giorno": dict(start=KNEE, handoff=True, refuse_first="day", expect=[
+        answered_fast(2.0), refused_days_avoided, wrote("checkin", "R:234")]),
+})
+
+
 # --- Orologio della città dopo un riavvio: l'ancora di agenda dalla memoria condivisa (city:clock)
 
 ANCHOR = ("epoch_real", "epoch_agenda", "rate", "paused")
@@ -2382,8 +2471,6 @@ def no_rx_read(b: Bus) -> str | None:
 
 
 NO_CHECK = never_told("gp", "Non riesco a verificare", cite="la risposta del Ledger è in viaggio, non mancante")
-P1_BOOKING = ("booking_centre: dopo commit PRESCRIPTION_EXPIRED e rinnovo non rioffre (nel trascritto "
-              "rilegge solo world page=1) e risponde «Su questo non posso…»; il gp passa il numero nuovo")
 GRAZIE_RINNOVO = "Grazie mille per il rinnovo!"
 SPEC_RX = "RX-SPEC-1"  # ricetta di controllo dello specialista (prescribe ... follow_up_of=)
 OTHER_RX = "RX-ALTRUI-1"
@@ -2399,13 +2486,14 @@ SCENARIOS.update({
         told("booking_centre", "data.request", "purpose=prescription_renewal", cite="R:716/720"),
         gp_renewed(None, "VIS-FIS", "B", at_once=True), NO_CHECK]),
     # Fine del percorso P1: dopo il rinnovo il centro rioffre e la visita si fa. Il numero nuovo
-    # arriva al centro dal passaggio del gp, oppure anche dal cittadino.
+    # arriva al centro dal passaggio del gp, oppure anche dal cittadino. Le offerte fatte con la
+    # ricetta scaduta non contano più come tenute, e la pagina 1 tutta passata non ferma la ricerca.
     "p1_rinnovo_prenota": dict(start=BACK, handoff=True, rules={"P1": "on"}, wait_days=3,
-                               setup=setups(typed_renewal, expired_commit_expected), xfail=P1_BOOKING, expect=[
+                               setup=setups(typed_renewal, expired_commit_expected), expect=[
         gp_renewed(None, "VIS-FIS", "B", at_once=True), wrote("checkin", "R:716")]),
     "p1_rinnovo_prenota_cittadino": dict(start=BACK, handoff=True, rules={"P1": "on"}, wait_days=3,
                                          setup=setups(typed_renewal, renewal_to_booking, expired_commit_expected),
-                                         xfail=P1_BOOKING, expect=[
+                                         expect=[
         gp_renewed(None, "VIS-FIS", "B", at_once=True), wrote("checkin", "R:716")]),
     # Rinnovo chiesto a parole, Ledger a 3 s: dal caso, nel turno, senza leggere il Ledger.
     "gp_rinnovo_a_parole_lento": dict(start=BACK, handoff=True, after=[RINNOVO], llm={RINNOVO: NONE_IT},

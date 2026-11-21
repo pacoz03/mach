@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from typing import NamedTuple
 
 from city_sdk.city import LEDGER, Message, is_citizen
 
@@ -171,10 +172,14 @@ def _our_offers(chat: list[Message], agent: str) -> list[dict[str, str]]:
     return [offer for row in chat if row.sender == agent and "offer" in words(row.text) for offer in offers_in(row.text)]
 
 
-def offered(chat: list[Message], agent: str) -> set[str]:
-    """Slots we offered in the case."""
+def offered(chat: list[Message], agent: str, number: str | None = None) -> set[str]:
+    """Slots we offered in the case; with ``number``, only with that prescription (after a
+    renewal the offers of the expired one are no longer held)."""
 
-    return {offer["slot_id"] for offer in _our_offers(chat, agent) if offer.get("slot_id")}
+    return {
+        offer["slot_id"] for offer in _our_offers(chat, agent)
+        if offer.get("slot_id") and number in (None, offer.get("prescription_number", number))
+    }
 
 
 def withdrawn(chat: list[Message], agent: str) -> set[str]:
@@ -197,6 +202,50 @@ def our_offer(chat: list[Message], agent: str, offer_id: str) -> dict[str, str]:
     """Tokens of our first offer ``offer_id``; {} when we made none."""
 
     return next((offer for offer in _our_offers(chat, agent) if offer.get("offer_id") == offer_id), {})
+
+
+class Refusals(NamedTuple):
+    """What the citizen's ``cancel offer_id=<ours> reason=...`` teach, for the rest of the case."""
+
+    slots: frozenset[str] = frozenset()  # every slot of ours they turned down
+    doctors: frozenset[str] = frozenset()  # turned down for who they are (lang, doctor; gender unknown)
+    days: frozenset[str] = frozenset()  # weekdays turned down (reason=day), mon..fri
+    genders: frozenset[str] = frozenset()  # doctor genders turned down (reason=gender); both: not the reason
+    reasons: frozenset[str] = frozenset()
+
+
+def refusals(chat: list[Message], agent: str, gender: Callable[[str], str | None] = lambda doctor: None) -> Refusals:
+    """The citizen's refusals of our offers as constraints (v2 core.refusals): a citizen who tells
+    their days or the doctor they want only by turning offers down (wave W01QQQ: 14 journeys in
+    silence after reason=day or reason=gender) is never offered that day or gender again.
+    ``gender``: doctor_id -> "f"/"m" from the caller's registry."""
+
+    slots: set[str] = set()
+    doctors: set[str] = set()
+    days: set[str] = set()
+    genders: set[str] = set()
+    reasons: set[str] = set()
+    for row in chat:
+        said = words(row.text)
+        if not is_citizen(row.sender) or "cancel" not in said or "confirm" in said:
+            continue
+        got = fields_of(row.text)
+        offer = our_offer(chat, agent, got.get("offer_id", ""))
+        if not offer.get("slot_id"):
+            continue
+        reason, doctor = got.get("reason", "").lower(), offer.get("doctor_id", "")
+        slots.add(offer["slot_id"])
+        reasons.add(reason)
+        day = offer.get("agenda_day", "").lower()[:3]
+        if reason.startswith("day") and _IT_WEEK.get(day, day) in _WEEK:
+            days.add(_IT_WEEK.get(day, day))
+        elif reason.startswith("gender") and (found := gender(doctor)):
+            genders.add(found)
+        elif reason in ("lang", "language", "gender", "doctor") and doctor:
+            doctors.add(doctor)
+    if genders >= {"f", "m"}:
+        genders = set()
+    return Refusals(frozenset(slots), frozenset(doctors), frozenset(days), frozenset(genders), frozenset(reasons))
 
 
 # --- consents ----------------------------------------------------------------------------------

@@ -37,19 +37,19 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tools  # noqa: E402  (shared/tools.py, copied by shared/sync.sh; best effort, never raises)
-from mach import case, protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
+from mach import calendar, case, protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
 from mach.protocol import fields_of, first_word, words  # noqa: E402
 
 # Module state (plan step 5: a = from history, b = declared cache with TTL and size, c = fact).
-# The case itself (prescription, offers, consents, preferences, hand-off) is read from history
-# by mach.case on every turn and kept nowhere. ponytail: the b's without a TTL or a cap are
-# listed as such; step 3 (clock, calendar) and step 5 give them one.
+# The case itself (prescription, offers, refusals, consents, preferences, hand-off) is read from
+# history by mach.case on every turn and kept nowhere. ponytail: the b's without a TTL or a cap
+# are listed as such; step 5 gives them one.
 #   _CLOCK    b  freshest agenda answer of any case; replaced by a newer one, no TTL (c: city:clock)
 #   _RTT      b  latest Ledger round trip, one value
-#   _OFFERED  b  slot -> (citizen, when): 900 s, pruned on each offer, no cap
+#   CAL       b  the slot calendar (mach.calendar): world rows by version, a day past their slot;
+#                claims (offer 600 s, confirm 1200 s); the Ledger's marks; facilities DOWN 600 s
+#   _LEARNED  b  msg_ids CAL has seen, LRU _LEARNED_MAX
 #   _PAGES    b  (procedure, page) -> world page: fresh 240 s on read, never evicted (~4x8 keys)
-#   _GONE     b  slots lost or booked: no TTL, no cap
-#   _DOWN     b  facility -> refusal time: 600 s on read, never evicted
 #   _RULES    b  rules of the latest answer of any case, no TTL (c: city:rules)
 #   _ASKED    b  agenda/rules -> our latest ask in any case: asked again after _EVERY
 #   _GATES       per-need lock, dropped when its last turn ends
@@ -72,46 +72,36 @@ _CLOCK: dict[str, str] = {}
 # Ledger's answers swing (21/11: median ~270 s, max 648 s).
 _RTT: tuple[datetime, float] | None = None
 _RTT_MAX = 600.0
-# Slots offered to a citizen (slot -> citizen, when): another citizen gets them only after
-# every unshared slot (21/11: one slot to five citizens in three minutes, four holds lost).
-# ponytail: per process and a fixed window; a second pod does not see them.
-_OFFERED: dict[str, tuple[str, float]] = {}
-_OFFER_SECONDS = 900.0
+# Real time on the monotonic clock: the calendar's claims and DOWN marks age with it (the arena
+# moves time.monotonic to play the citizen's 16-minute waits; in the city both run together).
+_BOOT = (datetime.now(timezone.utc), time.monotonic())
+
+
+def _wall() -> datetime:
+    return _BOOT[0] + timedelta(seconds=time.monotonic() - _BOOT[1])
+
+
+# Every slot decision goes through the calendar: what the world pages say, who was offered or
+# holds which slot (wave W01QQQ: one slot to 23 citizens), what the Ledger refused, which facility
+# did not take our message. The Ledger stays the truth: a hold it refuses comes back as a cancel.
+# ponytail: per pod; a second pod learns the claims from the histories it reads.
+CAL = calendar.Calendar(wall=_wall)
+_LEARNED: OrderedDict[str, None] = OrderedDict()
+_LEARNED_MAX = 16384
 # World pages of any case, answers and pushes alike (the slots are the ASST's, not the case's):
 # (procedure, page) -> (time.monotonic() when first seen, Ledger sent_at, page text). A new case
 # offers from a page younger than _PAGE_FRESH in the turn it becomes offerable, then asks the
 # Ledger itself (21/11: world answers in ~270 s, max 648 s; the Relay adds 2-6 minutes).
 # ponytail: per process; 4 real minutes = 4 agenda hours at 60x. A slot taken since comes back as
-# a refused hold (_GONE, answered in the same turn): shorten it if those refusals climb.
+# a refused hold (calendar GONE, answered in the same turn): shorten it if those refusals climb.
 _PAGES: dict[tuple[str, int], tuple[float, datetime | None, str]] = {}
 _PAGE_FRESH = 240.0
-# Slots a facility lost on the Ledger (taken, expired), or that we asked a facility to book:
-# never offered again by this process.
-_GONE: set[str] = set()
 # need_id -> we already tried escalate.emergency on it (sent or refused): never twice (R:701).
 # ponytail: per pod and lost on restart; the history check still covers a sent one.
 _ESCALATED: set[str] = set()
-_GONE_CODES = frozenset({"NO_CAPACITY", "EXPIRED", "SLOT_TAKEN"})
-# Doctor key (the last segment of doctor_id) -> languages, gender, days. ``*`` is the ASST's
-# rare language. The Ledger's slot line names the doctor; it does not repeat this table.
-_DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
-    "h1": (frozenset({"it", "en"}), "f", frozenset({"mon", "tue", "wed"})),
-    "h2": (frozenset({"it"}), "m", frozenset({"wed", "thu", "fri"})),
-    "h3": (frozenset({"it", "*"}), "m", frozenset({"tue", "thu"})),
-    "s1": (frozenset({"it", "en"}), "m", frozenset({"mon", "wed", "fri"})),
-    "s2": (frozenset({"it"}), "f", frozenset({"tue", "thu"})),
-    "c1": (frozenset({"it", "en"}), "f", frozenset({"mon", "tue", "wed", "thu", "fri"})),
-}
-# Priority -> agenda days to the deadline. U is the same agenda day, P is the waiting list.
-_DEADLINE_DAYS = {"B": 2, "D": 5}
 _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
 _SENT_NEEDS = 4096
-# A facility whose mailbox refused our confirm (TARGET_NOT_VISIBLE, partner_down) is left out
-# of new offers for a while; the city does not say when it is back.
-# ponytail: fixed pause per process, a probe or a city signal if outages get shorter.
-_DOWN_SECONDS = 600.0
-_DOWN: dict[str, float] = {}
 # Rules in force from the latest ``rules`` answer of any case: (rule ids, effective from).
 # None until the Ledger has answered once in this process.
 _RULES: list[tuple[frozenset[str], datetime | None]] | None = None
@@ -204,6 +194,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "down": (
             "Mi scusi, la struttura non è raggiungibile in questo momento: annullo questa offerta e "
             "cerco subito un'alternativa."
+        ),
+        "unreachable": (
+            "Mi scusi, la struttura di questa visita non è raggiungibile in questo momento: riprovo appena "
+            "torna disponibile e le scrivo io."
         ),
         "cancelled": "Mi dispiace, la struttura ha annullato questo posto: cerco subito un'alternativa per lei.",
         "past": "Mi dispiace, nel frattempo questo orario non è più prenotabile: le propongo subito altre date.",
@@ -299,6 +293,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "down": (
             "Sorry, the facility cannot be reached right now, so this slot is withdrawn: I am "
             "looking for an alternative straight away."
+        ),
+        "unreachable": (
+            "Sorry, the facility for this visit cannot be reached right now: I will try again as soon as "
+            "it is back and write to you."
         ),
         "cancelled": "I am sorry, the facility withdrew this slot: I am looking for an alternative for you.",
         "past": "I am sorry, this time can no longer be booked: here are other dates straight away.",
@@ -408,7 +406,7 @@ async def main(need: Need, city: City) -> None:
     # The turn's own message belongs to the case even when history does not show it yet.
     if all(row.msg_id != message.msg_id for row in chat):
         chat = [*chat, message]
-    _keep_pages(chat)
+    _learn(chat, city.agent_id)
     if message.need_id and any(
         row.sender == city.agent_id and first_word(row.text) == "escalate.emergency" for row in chat
     ):
@@ -465,6 +463,13 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
     # "cancel offer_id=... reason=lang": the citizen turns an offer down. Never a choice.
     if sender.startswith("citizen:") and "cancel" in kind and "confirm" not in kind and picked.get("offer_id"):
         await _citizen_cancel(city, message, chat)
+        return
+    booked = _offer_of_booking(chat, city.agent_id, sender, picked.get("booking_id", ""))
+    if (sender.startswith("citizen:") and "cancel" not in kind and picked.get("reason") and booked
+            and not protocol.we(chat, city.agent_id, f"offer_id={booked}", to=sender, word="cancel")):
+        # The citizen tells us the city or the facility cancelled the booking we forwarded (level 6:
+        # the facility may not tell us): answered as that facility's cancel, with new offers at once.
+        await _partner_cancel(city, message, chat)
         return
     # A choice, a consent, or the answer to our consent request (a "no" comes in plain words).
     if sender.startswith("citizen:") and (
@@ -527,10 +532,12 @@ class _Gate:
 class _Sent:
     """Offers this process sent for one need, which the case history may not show yet."""
 
-    __slots__ = ("offers", "trigger", "again", "mark", "before", "cancelled", "said", "pending", "reread")
+    __slots__ = ("offers", "number", "trigger", "again", "mark", "before", "cancelled", "said", "pending", "reread")
 
     def __init__(self) -> None:
+        # Offers sent for the case's prescription ``number``; a renewal (a new number) drops them.
         self.offers: set[str] = set()
+        self.number = ""
         # Offers whose cancel we already told the citizen (two facility turns can race).
         self.cancelled: set[str] = set()
         # Sentences and receipts already sent in this process: said once, whatever the race.
@@ -643,7 +650,10 @@ async def _advance_alone(
         if sent.trigger != trigger:
             sent.trigger, sent.again, refresh = trigger, set(), True
         elif message.sender.startswith("citizen:"):
-            return
+            if not (again and "confirm" in words(message.text)):
+                return  # one more search only for a citizen choosing again an offer we withdrew
+        elif sent.again:
+            return  # this cancel was answered with new offers already (a redelivery)
     if replacing:
         sent.pending = True  # cleared by the next message the citizen gets from us
     # Once the citizen names the number, only a Ledger answer sent after their message counts: the
@@ -660,8 +670,9 @@ async def _advance_alone(
         known = None
     fresh = case.prescription(chat, agent, number, since)
     if known is None and fresh is None and not case.asked(chat, agent, number, since):
-        if not await _say(city, LEDGER, f"prescription prescription_number={number}"):
-            return
+        # A say that timed out may have reached the Ledger (httpx.ReadTimeout after the Relay took
+        # it): the wait below decides, its answer may be in history already.
+        await _say(city, LEDGER, f"prescription prescription_number={number}")
         # A number seen for the first time after an earlier phase: fresh pages. After another number
         # (a renewal, agenda days later): a fresh agenda too.
         renewal = any(
@@ -714,7 +725,7 @@ async def _advance_alone(
     # No round of questions before the first offer (21/11: 4-6 minutes per journey): up to three
     # slots as different as can be (_spread: days, then doctors), with the preferences already
     # known; the offer's closing asks for days and doctor if none fits (R:95, R:253).
-    days, gender = case.days(chat, _heard), case.gender(chat, _heard)
+    prefs = calendar.Prefs(case.lang(chat, _heard, doctor=True), case.gender(chat, _heard), case.days(chat, _heard))
 
     def page_of(rows: list[Message], page: int) -> str | None:
         """The page from _PAGES while fresh (the latest answer any case saw), else the case's own."""
@@ -724,8 +735,14 @@ async def _advance_alone(
     # already holds and the clock run forward (21/11: re-reading agenda, rules and world first
     # left the citizen 4-5 minutes in silence). So is a new case, from the pages another case
     # read (_PAGES): every new citizen waited minutes for world. The reads go out after the answer.
-    first = not replacing and not sent.offers and not case.offered(chat, agent) and _fresh_page(procedure, 1) is not None
-    quick = _now(chat) is not None and (first or (replacing and not resumed and page_of(chat, 1) is not None))
+    if sent.number != number:
+        sent.number, sent.offers = number, set()
+    # After a renewal the clock is read again before any offer, also in a later turn than the one
+    # that asked about the new number (ledger_late: offers on the reading of days before).
+    stale, clock_asked = _renewal_clock(chat, agent, number)
+    renewal, refresh = renewal or stale, refresh or (stale and not clock_asked)
+    first = not replacing and not sent.offers and not case.offered(chat, agent, number) and _fresh_page(procedure, 1) is not None
+    quick = not stale and _now(chat) is not None and (first or (replacing and not resumed and page_of(chat, 1) is not None))
     if quick:
         recent = chat
         if replacing:
@@ -759,6 +776,8 @@ async def _advance_alone(
         if not fresh(chat):
             chat = await _until(city, need_id, chat, fresh)
         recent = _recent(chat, sent)
+        if stale and not _has_agenda(recent):
+            return  # the agenda answer opens a turn of its own, which offers
     _round_trip(chat, agent)
     now = _now(chat)
     born = _born(chat)
@@ -766,132 +785,111 @@ async def _advance_alone(
     if now is None or world is None:
         return
     _rules(chat, now)  # the case's rules answer, for every case (_RULES)
-    if replacing:
-        taken = case.withdrawn(chat, agent) | sent.again
-    else:
-        # Offers we cancelled are not held (an expired prescription renewed: the new number books).
-        taken = (case.offered(chat, agent) | sent.offers) - case.withdrawn(chat, agent)
-        # A Ledger turn does not add offers to the ones the citizen already holds.
-        if taken and not again:
-            return
-    pick = {
-        "now": now,
-        "born": born,
-        "priority": priority,
-        "lang": case.lang(chat, _heard, doctor=True),
-        "gender": gender,
-        "days": days,
-        "procedure": procedure,
-    }
-    fallback: list[dict[str, str]] = []
-    all_lines: dict[str, str] = {}
+    no = case.refusals(chat, agent, calendar.gender)
+    # Never again for this case: turned down, withdrawn by anyone, or lost in this very turn (a
+    # facility's cancel we just told: history does not show it yet).
+    skip = no.slots | case.withdrawn(chat, agent) | {
+        case.our_offer(chat, agent, offer_id).get("slot_id", "") for offer_id in sent.cancelled}
+    # A Ledger turn does not add offers to the ones the citizen already holds for this prescription
+    # (after a renewal, the expired one's are not); the citizen writing again gets the best ones
+    # again (their live offers, or better with what they just said).
+    if not replacing and (case.offered(chat, agent, number) | sent.offers) - skip and not again:
+        return
     # A language one of our doctors speaks is a hard need (the citizen refuses anyone else,
     # journey 0071): only those doctors, on every page, then past the deadline. A language none
     # of ours speaks filters only once the citizen turned a doctor down for it (21/11, journey
     # 238: three offers refused reason=lang): any other doctor of ours would be refused again.
-    ours = any(pick["lang"] in spec[0] or (
-        "*" in spec[0] and pick["lang"] == _RARE_LANG) for spec in _DOCTORS.values())
-    spoken = pick["lang"] != "it" and (ours or _refused_for(chat, {"lang", "language"}))
-    refused_slots, refused_doctors = _refused(chat, agent)
-    taken = taken | refused_slots | _GONE
-    cross = (city, message, chat, citizen, number, priority, procedure, pick, taken, refused_doctors, sent, replacing)
+    ours = any(prefs.lang in spec[0] for spec in calendar.DOCTORS.values())
+    spoken = prefs.lang != "it" and (ours or bool(no.reasons & {"lang", "language"}))
+
+    def search(*, relaxed: bool = False, lang: bool = True) -> tuple[list[dict[str, str]], dict[str, str]]:
+        """S from the calendar (``relaxed``: past the priority window, R:232), S_pref first, minus
+        what the citizen's refusals rule out; ``lang``: the language filter when it is a hard need."""
+        found = CAL.candidates(procedure=procedure, priority=priority, now=now, margin=_lead(), case=key,
+                               born=born, prefs=prefs, relaxed=relaxed, skip=skip)
+        return [slot for slot in found.slots if _allowed(slot, no) and (
+            not lang or not spoken or calendar.speaks(slot["doctor_id"], prefs.lang))], found.why
+
+    async def partners() -> bool:
+        return await _try_partners(
+            city, message, chat, citizen, number, priority, procedure, prefs.lang, now, born, no, skip, replacing)
+
     # A language none of our doctors speaks: only a partner ASST can have that doctor.
-    if pick["lang"] != "it" and not ours and await _try_partners(*cross):
+    if prefs.lang != "it" and not ours and await partners():
         return
     # After the citizen turned an offer down, the new ones come with a word about it.
     opening = "offers_again" if replacing and message.sender.startswith("citizen:") else "offers"
+    pages = min(protocol.page(world)[1], _MAX_PAGE)
     while True:
-        lines = [line for line in world.splitlines() if "slot_id=" in line]
-        for line in lines:
-            if slot_id := fields_of(line).get("slot_id"):
-                all_lines[slot_id] = line
-        chosen = [
-            slot
-            for slot in fitting(lines, **pick)
-            if slot.get("slot_id") not in taken
-            and slot.get("doctor_id") not in refused_doctors
-            and (not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
-            and not _down(slot.get("facility", ""))
-        ]
-        if chosen:
-            preferred = [slot for slot in chosen if _preferred(slot, pick["lang"], gender, days)]
-            if preferred or not (days or gender):
-                picked = _spread(preferred or chosen, _MAX_OFFERS, citizen)
-                await _offer(city, citizen, picked, number, priority, sent, replacing, chat, opening)
-                return
-            fallback.extend(_fresh_first(chosen, citizen)[:_MAX_OFFERS - len(fallback)])
-        if taken and not replacing and not fallback:
-            # Nothing new to offer. A booked citizen (a "grazie") needs no rinvio.
-            if not any(r.sender == agent and first_word(r.text) == "booking.receipt" for r in chat):
-                await _tell(city, chat, citizen, _phrase(chat, "redirect"), again=again)
+        slots, why = search()
+        # With days or a gender asked, S_pref while the pages left may hold it (R:230).
+        best = [slot for slot in slots if calendar.preferred(slot, prefs)] if prefs.days or prefs.gender else slots
+        missing = [page for page in range(2, pages + 1) if page_of(recent, page) is None]
+        # Offered once three slots no other case holds are known (wave W01QQQ: one slot to 23
+        # citizens), or the pages left are past the priority window, or none is left.
+        unshared = [slot for slot in best if not CAL.shared(slot["slot_id"], key)]
+        if best and (len(unshared) >= _MAX_OFFERS or not missing or "deadline" in why.values()):
+            await _offer(city, key, citizen, _spread(best, key), number, priority, replacing, chat, opening)
             return
-        page, pages = protocol.page(world)
-        if page >= pages or page >= _MAX_PAGE:
+        if not missing:
             break
-        next_page = page + 1
-        if page_of(recent, next_page) is None:
-            # Every missing page in one go, never one after the other (21/11: ~5 minutes a Ledger
-            # round, up to _MAX_PAGE rounds in a row). The answers land in history as they come.
-            for later in range(next_page, min(pages, _MAX_PAGE) + 1):
-                if (
-                    page_of(recent, later) is None
-                    and not protocol.asked(recent, agent, procedure, later)
-                    and not await _say(city, LEDGER, f"world procedure={procedure} page={later}")
-                    and later == next_page
-                ):
-                    return
-            if quick and replacing:
-                # One look, no wait: offer what fits so far, else say we are on it. The Ledger's
-                # answer opens a turn of its own, which resumes the search (pending).
-                chat = recent = await _until(
-                    city, need_id, chat, lambda rows: page_of(rows, next_page) is not None, tries=1
-                )
-                if page_of(recent, next_page) is None:
-                    if fallback:
-                        break
-                    if f"searching:{sent.trigger}" not in sent.said:
-                        sent.said.add(f"searching:{sent.trigger}")
-                        await _say(city, citizen, _phrase(chat, "searching"))
-                    sent.pending = True
-                    return
-            else:
-                chat = await _until(
-                    city, need_id, chat, lambda rows: page_of(_recent(rows, sent), next_page) is not None
-                )
-                recent = _recent(chat, sent)
-        world = page_of(recent, next_page)
-        if world is None:
-            return  # On the Ledger's next turn, start with the pages already in history.
-    if fallback:
-        await _offer(city, citizen, fallback, number, priority, sent, replacing, chat, opening)
+        # Every missing page in one go, never one after the other (21/11: ~5 minutes a Ledger
+        # round, up to _MAX_PAGE rounds in a row). The answers land in history as they come.
+        for later in missing:
+            if (
+                not protocol.asked(recent, agent, procedure, later)
+                and not await _say(city, LEDGER, f"world procedure={procedure} page={later}")
+                and later == missing[0]
+            ):
+                return
+        if quick and replacing:
+            # One look, no wait: offer what fits so far, else say we are on it. The Ledger's
+            # answer opens a turn of its own, which resumes the search (pending).
+            chat = recent = await _until(city, need_id, chat, lambda rows: page_of(rows, missing[0]) is not None, tries=1)
+            if page_of(recent, missing[0]) is None:
+                if slots:
+                    break
+                if f"searching:{sent.trigger}" not in sent.said:
+                    sent.said.add(f"searching:{sent.trigger}")
+                    await _say(city, citizen, _phrase(chat, "searching"))
+                sent.pending = True
+                return
+        else:
+            chat = await _until(city, need_id, chat, lambda rows: page_of(_recent(rows, sent), missing[0]) is not None)
+            recent = _recent(chat, sent)
+            if page_of(recent, missing[0]) is None:
+                return  # On the Ledger's next turn, start with the pages already in history.
+    if slots:
+        await _offer(city, key, citizen, _spread(best or slots, key), number, priority, replacing, chat, opening)
         return
     # S is empty on every page: a relaxed alternative (past the priority deadline), else the
-    # waiting list. Never silence. The partners are asked only for a language none of our
-    # doctors speaks (above): for a full agenda they gave no usable slot (0 of 15 answers,
-    # 85 s median wait), so the citizen gets our alternative at once.
-    late = _refused_for(chat, {"deadline", "priority", "late", "time"})
-
-    def alternatives(keep_lang: bool) -> list[dict[str, str]]:
-        return [
-            slot
-            for slot in fitting(list(all_lines.values()), **pick, relaxed=not late)
-            if slot.get("slot_id") not in taken
-            and slot.get("doctor_id") not in refused_doctors
-            and (not keep_lang or not spoken or _speaks(slot.get("doctor_id", ""), pick["lang"]))
-            and not _down(slot.get("facility", ""))
-        ]
-
-    relaxed, phrase = ([] if late else alternatives(True)), "relaxed"
-    if not relaxed and spoken and not ours:
+    # waiting list. Never silence. The partners are asked for a language none of our doctors
+    # speaks (above), or once the citizen turned our alternative down for its date: for a full
+    # agenda they gave no usable slot (0 of 15 answers, 85 s median wait) before that.
+    late = bool(no.reasons & {"deadline", "priority", "late", "time"})
+    alternatives, why = search(relaxed=True)
+    phrase = "relaxed"
+    if late:
+        alternatives = []
+    if not alternatives and spoken and not ours:
         # None of our doctors speaks it, and the citizen said it matters: the honest alternative
         # is a doctor who speaks Italian, said as such.
-        relaxed, phrase = alternatives(False), "relaxed_lang"
-    if relaxed:
+        alternatives, phrase = search(relaxed=not late, lang=False)[0], "relaxed_lang"
+    if alternatives:
         # The relaxed offer gives the closest real dates, even when they were on earlier pages.
-        picked = sorted(
-            relaxed, key=lambda slot: (_shared(slot, citizen), datetime.fromisoformat(slot["at"]))
-        )[:_MAX_OFFERS]
-        await _offer(city, citizen, picked, number, priority, sent, replacing, chat, phrase)
+        picked = sorted(alternatives, key=lambda slot: (CAL.shared(slot["slot_id"], key), protocol.when(slot["at"])))
+        await _offer(city, key, citizen, picked[:_MAX_OFFERS], number, priority, replacing, chat, phrase)
+        return
+    if "down" in why.values():
+        # A facility of ours did not take our message (TARGET_NOT_VISIBLE): its slots come back
+        # with it (calendar.DOWN_TTL). No waiting list, which would close the case: the next turn
+        # of the case looks again. The citizen writing meanwhile is answered (R:248).
+        if again or "unreachable" not in sent.said:
+            sent.said.add("unreachable")
+            await _say(city, citizen, _phrase(chat, "unreachable"))
+        sent.pending = True
+        return
+    if late and await partners():
         return
     offer_id = f"wl-{key}"
     if offer_id in sent.offers or protocol.we(chat, agent, f"offer_id={offer_id}", to=citizen, word="offer"):
@@ -928,22 +926,28 @@ async def _accept_handoff(city: City, message: Message, chat: list[Message]) -> 
 
 async def _offer(
     city: City,
+    key: str,
     citizen: str,
     slots: list[dict[str, str]],
     number: str,
     priority: str | None,
-    sent: _Sent,
     replacing: bool,
     chat: list[Message],
     phrase: str,
 ) -> None:
-    """Every offer in ONE message: the citizen chooses among what that message holds."""
+    """Every offer in ONE message: the citizen chooses among what that message holds. Each slot
+    is claimed on the calendar before the say, with no await since it was chosen: a turn of
+    another case running beside this one sees the claim. A say that fails releases them."""
 
+    claimed = slots = [slot for slot in slots if CAL.claim(slot["slot_id"], key)]
+    if not slots:
+        return
     lines = [protocol.offer_line(slot, number, priority) for slot in slots]
     lang = _talk(chat)
-    # Tokens for the citizen's choice, then the same slots in plain words (Ledger dates only)
-    # and one question: an answer and a next step in every message.
-    readable = [f"{i}) {_when_words(slot.get('at', ''), lang)}{_who(slot, lang)}" for i, slot in enumerate(slots, 1)]
+    # Tokens for the citizen's choice, then the same slots in plain words, written by the
+    # calendar from the Ledger's row and our registry only (a false attribute is -2), and one
+    # question: an answer and a next step in every message.
+    readable = [f"{i}) {calendar.describe(slot, lang)}" for i, slot in enumerate(slots, 1)]
     closing = _phrase(chat, phrase)
     if all(label.split(") ", 1)[1] for label in readable):
         text = "\n".join([*lines, _phrases(chat)["found"], *readable, closing])
@@ -955,43 +959,16 @@ async def _offer(
         text = "\n".join([*lines, closing])
     if len(text) > _SAY_MAX:
         text = lines[0][:_SAY_MAX]
-    if await _say(city, citizen, text):
-        clock = time.monotonic()
-        for key, (_, at) in list(_OFFERED.items()):
-            if clock - at >= _OFFER_SECONDS:
-                del _OFFERED[key]
+    said = await _say(city, citizen, text)
+    for slot in claimed:
+        if not said or slot not in slots:
+            CAL.release(slot["slot_id"], key)
+    if said:
+        sent = _sent(key)
         for slot in slots:
             sent.offers.add(slot["slot_id"])
-            _OFFERED[slot["slot_id"]] = (citizen, clock)
             if replacing:
                 sent.again.add(slot["slot_id"])
-
-
-def _shared(slot: dict[str, str], citizen: str) -> bool:
-    """Offered to another citizen in the last few minutes: their confirm may take it first."""
-
-    owner = _OFFERED.get(slot.get("slot_id", ""))
-    return owner is not None and owner[0] != citizen and time.monotonic() - owner[1] < _OFFER_SECONDS
-
-
-def _fresh_first(slots: list[dict[str, str]], citizen: str) -> list[dict[str, str]]:
-    """The same slots, the ones no other citizen holds first (a refusal beats no offer)."""
-
-    return sorted(slots, key=lambda slot: _shared(slot, citizen))
-
-
-def _who(slot: dict[str, str], lang: str) -> str:
-    """The doctor in a few words, from our registry only (a partner's doctor is not described:
-    a false attribute costs -2). Two offers at the same hour then read differently."""
-
-    if slot.get("facility") not in _OUR_FACILITIES:
-        return ""
-    spec = _DOCTORS.get(slot.get("doctor_id", "").rsplit("-", 1)[-1])
-    if spec is None:
-        return ""
-    if lang == "en":
-        return ", female doctor" if spec[1] == "f" else ", male doctor"
-    return ", con una dottoressa" if spec[1] == "f" else ", con un dottore"
 
 
 async def _renewal(city: City, chat: list[Message], citizen: str, *, again: bool) -> None:
@@ -1023,10 +1000,16 @@ async def _on_confirm(
         return  # The waiting list ends the case here: nothing to book.
     slot = offer.get("slot_id", "")
     facility = offer.get("facility", "")
+    key = message.need_id or message.msg_id
     if not slot or not facility or protocol.we(chat, agent, f"offer_id={offer_id}", to=citizen, word="cancel"):
         # Not one of our live offers: nothing goes to a facility on the citizen's word.
         if _answered(chat, agent, message):
             return  # the same confirm again (a redelivery): we withdrew its offer when it came
+        if slot and facility:
+            # An offer we withdrew (its facility did not answer, its slot went): chosen again, it
+            # asks for a slot, and the facility may be back. What is free now, never a question.
+            await _advance(city, message, chat, replacing=True)
+            return
         ask = f"data.request purpose=booking fields=offer_id {_phrase(chat, 'which')}"
         await _tell(city, chat, citizen, ask, again=True)
         return
@@ -1041,13 +1024,15 @@ async def _on_confirm(
         return
     _round_trip(chat, agent)  # a new pod measures it from the case, not the 6 h of an unmeasured one
     at, now = protocol.when(offer.get("agenda_date", "")), _now(chat)
-    if at is not None and now is not None and at <= now + _lead() and not protocol.we(
-        chat, agent, f"slot_id={slot}", to=facility, word="confirm"
-    ):
-        # Chosen too late (journey 099: 16 agenda hours after the offer): its hold would come back
-        # EXPIRED after a Ledger round. The offer goes, new ones follow in this turn.
-        _GONE.add(slot)
-        await _say(city, citizen, f"cancel offer_id={offer_id} reason=slot_expired {_phrase(chat, 'past')}")
+    why = CAL.check(slot, now=now, margin=_lead(), case=key)
+    if not why and at is not None and now is not None and at <= now + _lead():
+        why = "margin"  # a partner's slot: our calendar has no row for it
+    if why and not protocol.we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
+        # Chosen too late (journey 099: 16 agenda hours after the offer), or gone to another case
+        # meanwhile: its hold would come back refused after a Ledger round. The offer goes, new
+        # ones follow in this turn.
+        reason = "slot_expired" if why in ("past", "margin") else "slot_taken"
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason={reason} {_phrase(chat, 'past')}")
         await _advance(city, message, chat, replacing=True)
         return
     consent = fields.get("consent_ref", "")
@@ -1121,21 +1106,25 @@ async def _on_confirm(
     lang = case.lang(chat, _heard)
     if re.fullmatch(r"[a-z]{2}", lang):
         parts.append(f"lang={lang}")
+    # The slot is being held for this citizen: no other case is offered it while the hold lives.
+    CAL.claim(slot, key, "confirm")
     try:
         await city.say(facility, " ".join(parts))
     except CapError:
-        # TARGET_NOT_VISIBLE (partner_down) or another refusal: never send it again. Tell the
-        # citizen with a reason, then offer what is still free elsewhere.
-        _DOWN[facility] = time.monotonic()
+        # TARGET_NOT_VISIBLE (partner_down) or another refusal: never send it again. Its slots
+        # leave the offers for a while (calendar.DOWN_TTL); tell the citizen with a reason, then
+        # offer what is still free elsewhere.
+        CAL.release(slot, key)
+        CAL.mark(facility, "DOWN")
+        _sent(key).said.add("unreachable")
         await _say(
             city,
             citizen,
             f"cancel offer_id={offer_id} reason=facility_unavailable {_phrase(chat, 'down')}",
         )
         await _advance(city, message, chat, replacing=True)
-        return
-    # The slot is being held for this citizen: a cached page (_PAGES) still shows it free.
-    _GONE.add(slot)
+    except Exception:  # noqa: BLE001 - a network error (httpx timeout): the Relay may have taken it, city.say
+        pass  # is not idempotent, so never again; the facility's answer or cancel moves the case on
 
 
 async def _forward_receipt(city: City, message: Message, chat: list[Message]) -> None:
@@ -1156,6 +1145,7 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     phrases = _phrases(chat)
     tail = [phrases["receipt"]]
     booked = _booked_offer(chat, city.agent_id, message.sender, citizen)
+    CAL.mark(booked.get("slot_id", ""), "BOOKED")  # until a newer world page says otherwise
     when = _when_words(booked.get("agenda_date", ""), _talk(chat))
     if when:
         what = _PROCEDURES.get(booked.get("procedure", ""), {}).get(_talk(chat))
@@ -1202,9 +1192,14 @@ async def _partner_cancel(city: City, message: Message, chat: list[Message]) -> 
             return
     if offer_id and not case.our_offer(chat, city.agent_id, offer_id):
         offer_id = ""  # not one of our offers: nothing the citizen holds was cancelled
-    if offer_id and fields_of(message.text).get("reason", "").upper() in _GONE_CODES:
-        # Taken by someone else, or its hold expired: no citizen of ours gets it again.
-        _GONE.add(case.our_offer(chat, city.agent_id, offer_id).get("slot_id", ""))
+    if offer_id:
+        # Through the facility, the Ledger's word: NO_CAPACITY, EXPIRED or SLOT_TAKEN lose the slot
+        # for every case (calendar GONE); any cancel ends this case's claim on it. Only the slot of
+        # our own offer: a slot_id= in the sender's text moves nothing.
+        slot = case.our_offer(chat, city.agent_id, offer_id).get("slot_id", "")
+        if (code := fields_of(message.text).get("reason", "").upper()) in calendar.GONE:
+            CAL.mark(slot, code)
+        CAL.release(slot, message.need_id or message.msg_id)
     if not offer_id and not fields_of(message.text).get("booking_id"):
         # Names neither an offer of ours nor a booking: a partner's "no availability" goes to
         # the ring, anything else is not ours to tell the citizen about.
@@ -1339,21 +1334,17 @@ def _partner_rows(chat: list[Message], agent: str) -> list[Message]:
 
 
 def _partner_slots(chat: list[Message], agent: str) -> list[dict[str, str]]:
-    """Slots the partners offered. ``facility`` is always the agent that answered: an offer
-    cannot point our confirm at someone else."""
+    """Slots the partners offered, as calendar rows (at, day). ``facility`` is always the agent
+    that answered: an offer cannot point our confirm at someone else."""
 
     found: list[dict[str, str]] = []
     for row in _partner_rows(chat, agent):
         if "offer" not in words(row.text):
             continue
         for offer in case.offers_in(row.text):
-            slot = dict(offer)
-            for key, alias in (("at", "agenda_date"), ("day", "agenda_day")):
-                if key not in slot and alias in slot:
-                    slot[key] = slot[alias]
+            slot = calendar.row(" ".join(f"{key}={value}" for key, value in offer.items()))
             if not slot.get("slot_id") or not slot.get("doctor_id") or protocol.when(slot.get("at", "")) is None:
                 continue
-            slot["day"] = _IT_DAYS.get(slot.get("day", "").lower()[:3], slot.get("day", "").lower()[:3])
             slot["facility"] = row.sender
             found.append(slot)
     return found
@@ -1369,12 +1360,12 @@ def _partner_speaks(slot: dict[str, str], lang: str) -> bool:
     if stated:
         return lang in stated
     doctor = slot.get("doctor_id", "")
-    spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
+    spec = calendar.DOCTORS.get(doctor.rsplit("-", 1)[-1])
     if spec is None:
         return False
-    if lang in spec[0]:
+    if lang in spec[0] - {_RARE_LANG}:
         return True
-    if "*" not in spec[0]:
+    if _RARE_LANG not in spec[0]:  # only each ASST's third hospital doctor speaks its rare language
         return False
     known = next((rare for name, rare in _RARE_BY_ASST.items() if f"-{name}-" in f"-{doctor}-"), None)
     if known is not None:
@@ -1386,31 +1377,27 @@ def _partner_speaks(slot: dict[str, str], lang: str) -> bool:
 
 
 def _partner_fit(
-    chat: list[Message],
-    agent: str,
-    pick: dict[str, object],
-    taken: set[str],
-    refused_doctors: set[str],
+    chat: list[Message], agent: str, key: str, procedure: str, priority: str | None, lang: str,
+    now: datetime, born: datetime | None, no: case.Refusals, skip: set[str] | frozenset[str],
 ) -> list[dict[str, str]]:
-    """Partner slots the citizen can accept, best first (same rules as our own)."""
+    """Partner slots the citizen can accept, earliest first, by our own rules: past the margin,
+    in the priority window, no U reserve but for U, not ruled out by a refusal, not held for
+    another case; the language as the partner states it. Their doctors are not in our registry."""
 
-    slots = [
-        slot
-        for slot in _partner_slots(chat, agent)
-        if slot["slot_id"] not in taken
-        and slot["doctor_id"] not in refused_doctors
-        and _partner_speaks(slot, str(pick["lang"]))
-        and not _down(slot["facility"])
-    ]
-    by_id = {slot["slot_id"]: slot for slot in slots}
-    lines = [
-        " ".join(f"{key}={value}" for key, value in slot.items() if key in _SLOT_KEYS and value)
-        for slot in slots
-    ]
-    return [by_id[slot["slot_id"]] | slot for slot in fitting(lines, **pick) if slot.get("slot_id") in by_id]
-
-
-_SLOT_KEYS = ("slot_id", "doctor_id", "facility", "procedure", "at", "day", "free", "urgent_reserve")
+    horizon, earliest = calendar.deadline(priority, born or now), now + _lead()
+    found: list[tuple[datetime, dict[str, str]]] = []
+    for slot in _partner_slots(chat, agent):
+        at = protocol.when(slot["at"])
+        if (
+            at is None or at <= earliest or (horizon is not None and at >= horizon)
+            or slot["slot_id"] in skip or not _allowed(slot, no) or slot.get("free") == "0"
+            or slot.get("procedure", procedure) != procedure or not _partner_speaks(slot, lang)
+            or (slot.get("urgent_reserve", "").lower() == "true" and priority != "U")
+            or CAL.down(slot["facility"]) or CAL.check(slot["slot_id"], now=None, margin=_lead(), case=key)
+        ):
+            continue
+        found.append((at, slot))
+    return [slot for _, slot in sorted(found, key=lambda item: item[0])]
 
 
 def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) -> tuple[str, str]:
@@ -1479,13 +1466,13 @@ async def _ask_partners(
         )
         reached = 0
         for partner in partners[:limit]:
-            if _down(partner):
+            if CAL.down(partner):
                 continue
             try:
                 await city.say(partner, text)
                 reached += 1
             except Exception:  # noqa: BLE001 - CapError or an httpx timeout: the next partner still gets it
-                _DOWN[partner] = time.monotonic()  # never the same message again
+                CAL.mark(partner, "DOWN")  # never the same message again
         if not reached:
             return chat, False
         notice = _phrase(chat, "partners")
@@ -1509,31 +1496,20 @@ async def _ask_partners(
 
 
 async def _try_partners(
-    city: City,
-    message: Message,
-    chat: list[Message],
-    citizen: str,
-    number: str,
-    priority: str | None,
-    procedure: str,
-    pick: dict[str, object],
-    taken: set[str],
-    refused_doctors: set[str],
-    sent: _Sent,
-    replacing: bool,
+    city: City, message: Message, chat: list[Message], citizen: str, number: str, priority: str | None,
+    procedure: str, lang: str, now: datetime, born: datetime | None, no: case.Refusals,
+    skip: set[str] | frozenset[str], replacing: bool,
 ) -> bool:
     """Ask the ring and offer what fits. False: nothing from the partners (yet), go on alone."""
 
     key = message.need_id or message.msg_id
-    chat, asked = await _ask_partners(city, chat, citizen, procedure, priority, key, str(pick["lang"]))
+    chat, asked = await _ask_partners(city, chat, citizen, procedure, priority, key, lang)
     if not asked:
         return False
-    slots = _partner_fit(chat, city.agent_id, pick, taken, refused_doctors)
+    slots = _partner_fit(chat, city.agent_id, key, procedure, priority, lang, now, born, no, skip)
     if not slots:
         return False
-    await _offer(
-        city, citizen, _spread(slots, _MAX_OFFERS, citizen), number, priority, sent, replacing, chat, "partner_offers"
-    )
+    await _offer(city, key, citizen, _spread(slots, key), number, priority, replacing, chat, "partner_offers")
     return True
 
 
@@ -1545,8 +1521,7 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     citizen = protocol.citizen(chat)
     if citizen is None or _booking_stage(chat, agent, citizen):
         return
-    sent = _sent(key)
-    offered = case.offered(chat, agent) | sent.offers
+    offered = case.offered(chat, agent) | _sent(key).offers
     if any(slot["slot_id"] in offered for slot in _partner_slots(chat, agent)):
         return
     number = case.number(chat)
@@ -1555,22 +1530,11 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     now = _now(chat)
     if not number or reply is None or not reply.get("procedure") or reply.get("patient", citizen) != citizen or now is None:
         return
-    pick = {
-        "now": now,
-        "born": _born(chat),
-        "priority": reply.get("priority"),
-        "lang": case.lang(chat, _heard, doctor=True),
-        "gender": case.gender(chat, _heard),
-        "days": case.days(chat, _heard),
-        "procedure": reply["procedure"],
-    }
-    refused_slots, refused_doctors = _refused(chat, agent)
-    slots = _partner_fit(chat, agent, pick, offered | refused_slots | _GONE, refused_doctors)
+    no = case.refusals(chat, agent, calendar.gender)
+    lang = case.lang(chat, _heard, doctor=True)
+    slots = _partner_fit(chat, agent, key, reply["procedure"], reply.get("priority"), lang, now, _born(chat), no, offered)
     if slots:
-        await _offer(
-            city, citizen, _fresh_first(slots, citizen)[:_MAX_OFFERS], number, reply.get("priority"), sent,
-            False, chat, "partner_offers",
-        )
+        await _offer(city, key, citizen, _spread(slots, key), number, reply.get("priority"), False, chat, "partner_offers")
 
 
 # --- conversation ------------------------------------------------------------------------------
@@ -1635,33 +1599,11 @@ def _when_words(at: str, lang: str) -> str:
     return f"{day} {when.day} {month} {joint} {when:%H:%M}"
 
 
-def _refused(chat: list[Message], agent: str) -> tuple[set[str], set[str]]:
-    """Slots the citizen turned down, and doctors turned down for who they are (language or
-    gender): another slot of the same doctor would be refused again."""
+def _allowed(slot: dict[str, str], no: case.Refusals) -> bool:
+    """Not ruled out by the citizen's refusals (case.refusals): the doctor, the weekday, the gender."""
 
-    slots: set[str] = set()
-    doctors: set[str] = set()
-    for row in chat:
-        if not row.sender.startswith("citizen:") or "cancel" not in words(row.text):
-            continue
-        fields = fields_of(row.text)
-        offer = case.our_offer(chat, agent, fields.get("offer_id", ""))
-        if not offer.get("slot_id"):
-            continue
-        slots.add(offer["slot_id"])
-        if fields.get("reason", "").lower() in {"lang", "language", "gender", "doctor"} and offer.get("doctor_id"):
-            doctors.add(offer["doctor_id"])
-    return slots, doctors
-
-
-def _refused_for(chat: list[Message], reasons: set[str]) -> bool:
-    """Whether the citizen turned one of our offers down for one of these reasons."""
-
-    return any(
-        row.sender.startswith("citizen:") and "cancel" in words(row.text)
-        and fields_of(row.text).get("reason", "").lower() in reasons
-        for row in chat
-    )
+    return (slot.get("doctor_id") not in no.doctors and slot.get("day") not in no.days
+            and calendar.gender(slot.get("doctor_id", "")) not in no.genders)
 
 
 def _offer_source(chat: list[Message], agent: str, offer_id: str) -> str:
@@ -1719,20 +1661,20 @@ async def _citizen_cancel(city: City, message: Message, chat: list[Message]) -> 
     agent, citizen = city.agent_id, message.sender
     if _booking_stage(chat, agent, citizen):
         return  # already booking another offer for them
-    refused, doctors = _refused(chat, agent)
-    for slot in refused:  # free again for the other citizens
-        if _OFFERED.get(slot, ("",))[0] == citizen:
-            del _OFFERED[slot]
+    no = case.refusals(chat, agent, calendar.gender)
+    for slot in no.slots:  # free again for the other citizens
+        CAL.release(slot, message.need_id or message.msg_id)
     reason = fields_of(message.text).get("reason", "").lower()
     live = _live_offers(chat, agent, citizen)
     if live and all(offer.get("offer_id") != protocol.fields(message).get("offer_id") for offer in live):
         # One cancel per offer, all at once (21/11): the first turn that read them all already
         # answered with new offers. This one refuses an offer they replaced.
         return
+    # The offers left that the refusals do not rule out (a day or a gender turned down rules out
+    # the other offers on that day or with that gender too).
     open_offers = [
-        offer
-        for offer in live
-        if offer.get("slot_id") not in refused and offer.get("doctor_id") not in doctors
+        offer for offer in live if offer.get("slot_id") not in no.slots
+        and _allowed({"doctor_id": offer.get("doctor_id", ""), "day": offer.get("agenda_day", "")}, no)
     ]
     # Refused for who the doctor is: the other offers may fail the same way, so we look again.
     if open_offers and reason not in {"lang", "language", "gender", "doctor"}:
@@ -1770,33 +1712,24 @@ def _booking_stage(chat: list[Message], agent: str, citizen: str) -> str:
 _RARE_LANG = "sq"
 
 
-def _speaks(doctor_id: str, lang: str) -> bool:
-    spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
-    if spec is None:
-        return False
-    if lang in spec[0]:
-        return True
-    return "*" in spec[0] and lang == _RARE_LANG
-
-
-def _spread(slots: list[dict[str, str]], limit: int, citizen: str = "") -> list[dict[str, str]]:
+def _spread(slots: list[dict[str, str]], key: str, limit: int = _MAX_OFFERS) -> list[dict[str, str]]:
     """Up to ``limit`` slots, one per day first and then one per doctor, in the order given.
     The citizen picks, among our offers, the one that meets what they did not tell us: the 15
     bookings in S outside S_pref were all Monday to Wednesday, their hidden days Thursday and
-    Friday, and we never offered one of those. Slots another citizen holds come only after
-    every other one (_shared)."""
+    Friday, and we never offered one of those. Slots another case was offered come only after
+    every other one (CAL.shared)."""
 
     picked: list[dict[str, str]] = []
-    for pool in ([slot for slot in slots if not _shared(slot, citizen)], slots):
-        for key in ("day", "doctor_id", ""):
-            seen = {slot.get(key) for slot in picked} if key else set()
+    for pool in ([slot for slot in slots if not CAL.shared(slot["slot_id"], key)], slots):
+        for field in ("day", "doctor_id", ""):
+            seen = {slot.get(field) for slot in picked} if field else set()
             for slot in pool:
                 if len(picked) >= limit:
                     return picked
-                if slot in picked or (key and slot.get(key) in seen):
+                if slot in picked or (field and slot.get(field) in seen):
                     continue
                 picked.append(slot)
-                seen.add(slot.get(key))
+                seen.add(slot.get(field))
     return picked
 
 
@@ -1813,89 +1746,7 @@ def _born(chat: list[Message]) -> datetime | None:
     return None if born is None else born - _BORN_MARGIN
 
 
-def _preferred(slot: dict[str, str], lang: str, gender: str | None, days: frozenset[str]) -> bool:
-    doctor = slot.get("doctor_id", "")
-    spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
-    return (
-        spec is not None and _speaks(doctor, lang)
-        and (not gender or spec[1] == gender) and (not days or slot.get("day") in days)
-    )
-
-
-def fitting(
-    lines: list[str],
-    *,
-    now: datetime,
-    priority: str | None,
-    lang: str,
-    gender: str | None = None,
-    procedure: str | None = None,
-    days: frozenset[str] = frozenset(),
-    relaxed: bool = False,
-    born: datetime | None = None,
-) -> list[dict[str, str]]:
-    """The answer set S: future, free, in the priority window, outside the urgent reserve (but for
-    U). S_pref first (doctor speaks ``lang``, is ``gender``, on one of ``days``), then the rest of
-    S, earliest first. ``relaxed`` drops the priority window (S is empty)."""
-
-    if relaxed or priority == "P":
-        horizon: datetime | None = None
-    elif priority == "U":
-        horizon = (born or now).replace(hour=23, minute=59, second=59, microsecond=0)
-    else:
-        # The deadline runs from the need's birth, not from now: the judge's S is computed when
-        # the need is born, and a slow chain eats the window (journey 0001340002: refused for
-        # the deadline a slot that was inside ours).
-        horizon = (born or now) + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))
-    earliest = now + _lead()
-    chosen: list[tuple[bool, datetime, str, dict[str, str]]] = []
-    for line in lines:
-        slot = _slot(line)
-        slot_id = slot.get("slot_id")
-        doctor = slot.get("doctor_id")
-        at = protocol.when(slot.get("at", ""))
-        if not slot_id or not doctor or not slot.get("facility") or at is None:
-            continue
-        if procedure and slot.get("procedure") not in (None, procedure):
-            continue
-        free = slot.get("free")
-        if free is not None and free.isdigit() and int(free) <= 0:
-            continue
-        # The urgent reserve is only for priority U, whatever rules says (R:718; 21/11: rules count=0
-        # and 153 of 304 offers were reserve slots given to B, D and P).
-        if slot.get("urgent_reserve", "").lower() == "true" and priority != "U":
-            continue
-        if not earliest < at or (horizon is not None and at >= horizon):
-            continue
-        spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
-        day = slot.get("day", "")
-        if spec is not None and day and day not in spec[2]:
-            continue
-        # A doctor missing from our table is still in S; we just cannot call it preferred.
-        preferred = _preferred(slot, lang, gender, days)
-        chosen.append((not preferred, at, slot_id, slot))
-    chosen.sort(key=lambda item: item[:3])
-    return [item[3] for item in chosen]
-
-
 # --- reading the case --------------------------------------------------------------------------
-
-
-_IT_DAYS = {"lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri", "sab": "sat", "dom": "sun"}
-
-
-def _slot(line: str) -> dict[str, str]:
-    """A Ledger slot row with our keys ``at``/``day``/``free``, from the kit example's format or
-    the Ledger schema's ``agenda_date``/``agenda_day``/``capacity`` (ledger.py Slot)."""
-
-    slot = fields_of(line)
-    for key, alias in (("at", "agenda_date"), ("day", "agenda_day"), ("free", "capacity")):
-        if key not in slot and alias in slot:
-            slot[key] = slot[alias]
-    if "day" in slot:
-        day = slot["day"].lower()[:3]  # Monday, MON, lunedì -> mon
-        slot["day"] = _IT_DAYS.get(day, day)
-    return slot
 
 
 _GP = "agent:ck9w60ejwnvw"
@@ -1928,19 +1779,27 @@ def _world_page(chat: list[Message], page: int) -> str | None:
     return None
 
 
-def _keep_pages(chat: list[Message]) -> None:
-    """Every world page in ``chat`` goes to _PAGES under the procedure its slot lines name (an
-    empty page: the one our latest world ask named), unless _PAGES holds a later Ledger answer."""
+def _learn(chat: list[Message], agent: str) -> None:
+    """Every row of a case history, once, to the calendar: world pages and the Ledger's answers,
+    our offers, confirms and cancels (the claims of the pod before a restart, or of another pod).
+    Every world page also to _PAGES under the procedure its slot lines name (an empty page: the
+    one our latest world ask named), unless _PAGES holds a later Ledger answer."""
 
     asked = ""
     for row in chat:
         if row.recipient == LEDGER and first_word(row.text) == "world":
             asked = fields_of(row.text).get("procedure", "")
+        if row.msg_id in _LEARNED:
             continue
+        if row.msg_id:
+            _LEARNED[row.msg_id] = None
+            while len(_LEARNED) > _LEARNED_MAX:
+                _LEARNED.popitem(last=False)
+        CAL.learn(row, me=agent)
         page = protocol.page(row.text)[0]
         if _world_page([row], page) is None:
             continue
-        named = {_slot(line).get("procedure") for line in row.text.splitlines() if "slot_id=" in line} - {None, ""}
+        named = {calendar.row(line).get("procedure") for line in row.text.splitlines() if "slot_id=" in line} - {None, ""}
         procedure = named.pop() if len(named) == 1 else "" if named else asked
         if not procedure:
             continue
@@ -2027,6 +1886,20 @@ def _lead() -> timedelta:
     return _LEAD + timedelta(seconds=_RTT[1] * _rate())
 
 
+def _renewal_clock(chat: list[Message], agent: str, number: str) -> tuple[bool, bool]:
+    """After a renewal (we asked the Ledger about another number first: agenda days later, P1):
+    (no agenda answer since our first ask for ``number``, an agenda ask of ours since then)."""
+
+    asks = [i for i, row in enumerate(chat) if row.sender == agent and row.recipient == LEDGER
+            and first_word(row.text) == "prescription"]
+    first = next((i for i in asks if fields_of(chat[i].text).get("prescription_number") == number), None)
+    if first is None or all(fields_of(chat[i].text).get("prescription_number") == number for i in asks if i < first):
+        return False, False
+    later = chat[first + 1:]
+    return (not any(row.sender == LEDGER and first_word(row.text) == "agenda" for row in later),
+            any(row.sender == agent and row.recipient == LEDGER and row.text.strip() == "agenda" for row in later))
+
+
 def _has_agenda(chat: list[Message]) -> bool:
     agenda = protocol.ledger(chat, "agenda")
     return protocol.when("" if agenda is None else agenda.get("agenda_now", "")) is not None
@@ -2089,10 +1962,11 @@ async def _until(
     tries: int = _PULL_TRIES,
     deadline: float | None = None,
 ) -> list[Message]:
-    """protocol.until, keeping every world page it reads in _PAGES."""
+    """protocol.until, giving every history it reads to the calendar and _PAGES (_learn)."""
 
     return await protocol.until(
-        city, need_id, chat, ready, tries, deadline, pause=_PULL_PAUSE, on_read=_keep_pages
+        city, need_id, chat, ready, tries, deadline, pause=_PULL_PAUSE,
+        on_read=lambda rows: _learn(rows, city.agent_id),
     )
 
 
@@ -2104,11 +1978,6 @@ def _answered(chat: list[Message], agent: str, message: Message) -> bool:
         return False
     later = chat[ids.index(message.msg_id) + 1 :]
     return any(row.sender == agent and row.recipient == message.sender for row in later)
-
-
-def _down(facility: str) -> bool:
-    since = _DOWN.get(facility)
-    return since is not None and time.monotonic() - since < _DOWN_SECONDS
 
 
 # --- free text (level 3) -----------------------------------------------------------------------

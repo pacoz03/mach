@@ -204,6 +204,32 @@ def test_offers_and_a_withdrawn_one():
     assert case.our_offer(chat, ME, "of-S9") == {} and case.offered(chat, "agent:other") == set()
     chat.append(msg(ME, "cancel offer_id=of-S1 reason=facility_cancelled", "y", to=CITIZEN))
     assert case.withdrawn(chat, ME) == {"S1", "S2"}
+    # After a renewal (P1) only the offers with the new number are held.
+    chat.append(msg(ME, f"offer offer_id=of-S4 slot_id=S4 prescription_number={N2}", "z", to=CITIZEN))
+    assert case.offered(chat, ME, N2) == {"S1", "S2", "S3", "S4"}  # OFFERS name no number: any
+    chat[0] = msg(ME, OFFERS.replace("slot_id=S", f"prescription_number={N1} slot_id=S"), "o", to=CITIZEN)
+    assert case.offered(chat, ME, N2) == {"S4"} and case.offered(chat, ME, N1) == {"S1", "S2", "S3"}
+
+
+def test_refusals_become_constraints():
+    # Wave W01QQQ (muto_dopo_rifiuto): one cancel per offer at once, the citizen's days and doctor
+    # told only by turning offers down. v2 core.refusals: the day and the gender stay in the case.
+    days = ("lun", "tue", "wed")  # lun: the Italian name of Monday
+    offers = "\n".join(f"offer offer_id=of-S{i} slot_id=S{i} doctor_id=D-h{i} agenda_day={d}"
+                       for i, d in zip((1, 2, 3), days))
+    gender = {"D-h1": "f", "D-h2": "m"}.get  # D-h3: not in the registry
+    chat = [msg(ME, offers, "o", to=CITIZEN), msg(CITIZEN, "Quel giorno no. cancel offer_id=of-S1 reason=day", "a"),
+            msg(CITIZEN, "cancel offer_id=of-S2 reason=gender", "b"), msg(CITIZEN, "cancel offer_id=of-S3 reason=gender", "c"),
+            msg(CITIZEN, "cancel offer_id=of-S9 reason=day", "d"),  # not one of ours: teaches nothing
+            msg(CITIZEN, "confirm offer_id=of-S1 cancel", "e")]  # a confirm is never a refusal
+    got = case.refusals(chat, ME, gender)
+    assert got.slots == {"S1", "S2", "S3"} and got.days == {"mon"} and got.genders == {"m"}
+    assert got.doctors == {"D-h3"} and got.reasons == {"day", "gender"}  # gender of D-h3 unknown: that doctor
+    chat.append(msg(CITIZEN, "cancel offer_id=of-S1 reason=gender", "f"))
+    assert case.refusals(chat, ME, gender).genders == set()  # both genders turned down: gender was not the reason
+    chat.append(msg(CITIZEN, "cancel offer_id=of-S3 reason=day", "g"))
+    assert case.refusals(chat, ME, gender).days == {"mon", "wed"}
+    assert case.refusals(chat, "agent:other") == case.Refusals() and case.refusals([], ME) == case.Refusals()
 
 
 # --- consents ----------------------------------------------------------------------------------

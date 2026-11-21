@@ -385,10 +385,27 @@ def test_a_facility_marked_down_comes_back_after_600_s():
     cal = fed(SLOTS[0], wall=wall)
     cal.mark(HOSPITAL, "DOWN")
     assert set(pick(cal).why.values()) == {"down", "reserve"}
+    assert cal.down(HOSPITAL) and not cal.down(SPECIALIST)
     wall.tick(599)
-    assert pick(cal).slots == []
+    assert pick(cal).slots == [] and cal.down(HOSPITAL)
     wall.tick(1)
-    assert ids(pick(cal)) == EVERY[2:]
+    assert ids(pick(cal)) == EVERY[2:] and not cal.down(HOSPITAL)
+
+
+def test_shared_is_another_cases_live_offer():
+    wall = Wall()
+    cal = fed(SLOTS[0], wall=wall)
+    x, y = H1 + "1030", H3 + "1030"
+    assert cal.claim(x, N1) and cal.claim(y, N2, "confirm")
+    assert cal.shared(x, N2) and not cal.shared(x, N1)  # N1's own offer is not shared for N1
+    assert not cal.shared(y, N1) and not cal.shared(H1 + "1200", N1)  # a hold is not an offer; nobody's claim
+    wall.tick(600)  # the offer lapses
+    assert not cal.shared(x, N2)
+
+
+def test_gender_from_our_registry_only():
+    assert calendar.gender("asst-gorla-h1") == "f" and calendar.gender("W01QQQ-x-h3") == "m"
+    assert calendar.gender("asst-giambellino-h1") is None and calendar.gender("asst-gorla-x9") is None
 
 
 def test_check_before_the_hold():

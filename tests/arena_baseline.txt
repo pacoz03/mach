@@ -1,5 +1,5 @@
 # Cricchetto dell'arena (tests/arena_score.py): punti di v1 per scenario, modo predefinito (Ledger nei turni),
-# senza clock.fast_reply. 2026-11-21  base cd79e87  ~/.local/share/uv/tools/city-cli/bin/python -B tests/arena_score.py --update-baseline
+# senza clock.fast_reply. 2026-11-21  base 0131566  ~/.local/share/uv/tools/city-cli/bin/python -B tests/arena_score.py --update-baseline
 fisiatria 7
 cardiologia 9
 consultorio 5
@@ -16,23 +16,23 @@ referto_senza_consenso 9
 consultorio_prosa 5
 checkin_a_parole 7
 partner_lingua_rara 4
-partner_finestra_piena 1
+partner_finestra_piena 4
 lingua_rara_nostra 7
 estero_ospedale 3
 estero_cardiologia 5
 vincoli_combinati 7
 preferenze_impossibili 6
-vincoli_taciuti 1
+vincoli_taciuti 7
 insieme_vuoto 2
 urgente_U 5
 slot_condivisi 7
 annullo_citta 7
-annullo_citta_cardiologia 1
+annullo_citta_cardiologia 9
 hold_scaduto 7
 hold_rifiutato 7
 slot_rubato 7
 ospedale_giu 2
-ospedale_giu_poi_torna 2
+ospedale_giu_poi_torna 7
 partner_giu 2
 confirm_doppio 7
 due_pod 7
@@ -49,7 +49,7 @@ injection_ignora_regole 7
 altro_paziente 7
 domanda_clinica 0
 clinica_in_struttura 7
-regola_p1_scaduta 1
+regola_p1_scaduta 7
 regola_p2_consenso 4
 regola_p3_riserva 7
 regola_p3_urgente 5
