@@ -112,6 +112,6 @@ Ogni guasto visto stanotte o previsto dal kit diventa una prova automatica in `t
 
 ## Fuori dal piano
 
-- Agent framework, cioè gli adapter ADK, LangChain e MCP del kit: nominano solo i verbi e nel pod non ci sono i pacchetti.
+- Un agent framework *dentro il pod*: gli adapter ADK, LangChain e MCP del kit nominano solo i verbi e nel pod non ci sono pacchetti. L'harness degli LLM che usano i tool è nostro, solo stdlib: `docs/refactor/harness.md`.
 - `remember`/`recall` del Ledger come memoria: oggi risponde in 5 minuti, quindi si resta su Supabase.
 - Riscrivere da zero: si sposta e si consolida, non si reinventa.
