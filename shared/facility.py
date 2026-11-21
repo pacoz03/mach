@@ -1727,6 +1727,19 @@ async def _cross_asst(
         procedure = fields.get("procedure") or procedures[0]
         priority = fields.get("priority", "").upper()
         priority = priority if priority in {"U", "B", "D", "P"} else None
+        # MACH-1.3 (21/11, last 3 h: 179 of 669 partner requests to the hospital named deadline=, 44
+        # after=; the specialist 80 of 184): the asker's own window, agenda time, counted from the
+        # need's birth. Our relaxed slots past it fell outside its S (-1 to it, refused confirms).
+        # Zone optional (the agenda runs in UTC); unreadable = absent; without them nothing changes.
+        def agenda_at(key: str) -> datetime | None:
+            return protocol.when(fields.get(key, "")) or protocol.when(fields.get(key, "") + "Z")
+
+        after, until = agenda_at("after") or agenda_at("earliest"), agenda_at("deadline")
+        # A Sat/Sun bound (last 3 h: 26 of 224 hospital deadlines, 4 of 96 specialist) counts calendar days, the agenda has none: ignored.
+        if any(bound and bound.weekday() >= 5 for bound in (after, until)):
+            after = until = None
+        seen: list[str] = []  # every slot line of the pages read: next_free after the window
+        free_after = ""
         chosen: list[dict[str, str]] = []
         relaxed = False
         owed = 0  # hospital, specialist: the last world page answered without its reply
@@ -1815,7 +1828,13 @@ async def _cross_asst(
                 if world is None or now is None:
                     break
                 lines = [line for line in world.splitlines() if "slot_id=" in line]
-                found = fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
+                seen += lines
+                if after or until:
+                    lines = [line for line in lines if (when := protocol.when(_slot(line).get("at", "")))
+                             and (after is None or when >= after) and (until is None or when <= until)]
+                # The asker's deadline replaces our priority horizon (a U request keeps its reserve).
+                found = fitting(lines, now=now, priority="P" if until and priority != "U" else priority,
+                                lang="it", procedure=procedure)
                 if procedures == ("CONS-GIN",):
                     wanted_days = set(re.split(r"[/,]", fields.get("days", ""))) - {""}
                     found = [slot for slot in found
@@ -1865,6 +1884,10 @@ async def _cross_asst(
                 # Level 5: the partner's lang/gender/days, when named, rank the slots that meet
                 # the most of them first; time order within a tie. Only Ledger attributes go out.
                 chosen = _by_constraints(pool, fields)[:3]
+            if until is not None and not chosen and now is not None:
+                free_after = next((when.strftime("%Y-%m-%dT%H:%M") for slot in fitting(
+                    seen, now=now, priority="P", lang="it", procedure=procedure)
+                    if (when := protocol.when(slot["at"])) and when > until), "")
         if chosen:
             lines = [f"{protocol.offer_line(slot, None, priority)} {tag}".rstrip() for slot in chosen]
             beyond = (
@@ -1889,6 +1912,7 @@ async def _cross_asst(
         else:
             text = (
                 f"cancel reason=no_availability {tag}".rstrip()
+                + (f" next_free={free_after}" if free_after else "")
                 + " Mi dispiace, al momento non abbiamo disponibilità adatte a questa richiesta. "
                 "Riscriveteci pure più avanti: ricontrolliamo subito l'agenda."
             )

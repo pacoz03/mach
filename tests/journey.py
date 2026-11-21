@@ -2908,6 +2908,84 @@ SCENARIOS.update({
 })
 
 
+# --- MACH-1.3: la finestra del richiedente (after=/earliest=, deadline=, tempo di agenda). Città 21/11:
+# 179 richieste su 669 all'ospedale con deadline=, 44 con after=; lo specialista 80 su 184.
+
+
+def _cross_answer(b: Bus, rid: str, role: str) -> list[Message]:
+    return [m for m in b.log if m.sender == b.ids[role] and m.recipient == FOREIGN and f"request_id={rid}" in m.text.split()]
+
+
+def cross_window(rid: str, lo: datetime, hi: datetime, role: str = "hospital", must: tuple[str, ...] = ()):
+    """Una sola risposta a ``rid``: da 1 a 3 offerte, ogni slot del Ledger dentro [lo, hi]; ``must``:
+    slot che devono esserci (la deadline del richiedente sostituisce l'orizzonte della priorità)."""
+    def check(b: Bus) -> str | None:
+        got = _cross_answer(b, rid, role)
+        if len(got) != 1:
+            return f"{role} ha risposto {len(got)} volte a {rid} invece di una (R:192)"
+        offers = parse_offers(got[0].text)
+        if act(got[0]) != "offer" or not 1 <= len(offers) <= 3:
+            return f"{role} non ha offerto da 1 a 3 slot a {rid}: «{got[0].text[:80]}»"
+        out = [o.get("slot_id") for o in offers if (s := b.ledger.slots.get(o.get("slot_id", ""))) is None
+               or s["facility"] != b.ids[role] or not lo <= datetime.fromisoformat(s["at"]) <= hi]
+        if out:
+            return f"{role} ha offerto a {rid} slot fuori dalla finestra {lo:%a %H:%M}-{hi:%a %H:%M}: {out}"
+        if missing := set(must) - {o.get("slot_id") for o in offers}:
+            return f"{role} non ha offerto a {rid} {sorted(missing)}, dentro la finestra del richiedente"
+    return check
+
+
+def cross_next_free(rid: str, at: str, role: str = "hospital"):
+    """Niente libero nella finestra: cancel no_availability con next_free= (il primo slot libero dopo
+    la finestra, da una pagina letta), nessuna offerta e nessun slot oltre la deadline del richiedente."""
+    def check(b: Bus) -> str | None:
+        got = _cross_answer(b, rid, role)
+        if len(got) != 1:
+            return f"{role} ha risposto {len(got)} volte a {rid} invece di una (R:192)"
+        m = got[0]
+        if act(m) != "cancel" or parse_offers(m.text) or not has(
+                m.text, ("reason=no_availability", f"request_id={rid}", f"next_free={at}")):
+            return f"atteso cancel reason=no_availability request_id={rid} next_free={at}: «{m.text[:120]}»"
+    return check
+
+
+XCARD = XFIS.replace("hospital.physiatry", "specialist_care.cardiology").replace("VIS-FIS", "VIS-CARD")
+TUE, WED = (START + timedelta(days=d) for d in (1, 2))  # 08:00 di agenda; ora lun 08:00, lead 4 h
+
+SCENARIOS.update({
+    # after= mar 12:00, deadline= mer 09:30 (senza fuso): niente lun 15:00 né mar 10:00, solo mar 15:00.
+    "cross_asst_finestra": dict(
+        start=("hospital", XFIS.format(rid="R-50", extra=" after=2026-11-24T12:00 deadline=2026-11-25T09:30 mach=1.3")),
+        foreign=True, expect=[cross_reply("R-50", "B"),
+                              cross_window("R-50", TUE.replace(hour=12), WED.replace(hour=9, minute=30))]),
+    # earliest= vale after=; Z e millisecondi come li mandano alcune squadre.
+    "cross_asst_finestra_earliest": dict(
+        start=("hospital", XFIS.format(rid="R-51", extra=" earliest=2026-11-24T12:00Z deadline=2026-11-25T09:30:00.000Z")),
+        foreign=True, expect=[cross_reply("R-51", "B"),
+                              cross_window("R-51", TUE.replace(hour=12), WED.replace(hour=9, minute=30))]),
+    # Finestra lun 16:00 - mar 09:00 senza slot: cancel con next_free= mar 10:00, mai le date rilassate
+    # oltre la deadline (prenotazione fuori dalla S del richiedente: −1 suo, confirm rifiutati).
+    "cross_asst_finestra_vuota": dict(
+        start=("hospital", XFIS.format(rid="R-52", extra=" after=2026-11-23T16:00 deadline=2026-11-24T09:00")),
+        foreign=True, expect=[cross_reply("R-52", None), cross_next_free("R-52", "2026-11-24T10:00"),
+                              no_write("hold", "R:192")]),
+    # Lo specialista: mar 15:00 e mer 10:00 dentro mar 12:00 - mer 12:00; poi la finestra vuota.
+    "specialista_finestra": dict(
+        start=("specialist_care", XCARD.format(rid="R-53", extra=" after=2026-11-24T12:00 deadline=2026-11-25T12:00")),
+        foreign=True, expect=[cross_window("R-53", TUE.replace(hour=12), WED.replace(hour=12), "specialist_care",
+                                           must=("S-s2-01-15", "S-s1-02-10"))]),
+    "specialista_finestra_vuota": dict(
+        start=("specialist_care", XCARD.format(rid="R-54", extra=" after=2026-11-23T16:00 deadline=2026-11-24T09:00")),
+        foreign=True, expect=[cross_next_free("R-54", "2026-11-24T10:00", "specialist_care"), no_write("hold", "R:192")]),
+    # Finestra sab-dom (città 21/11: after sab 09:05, deadline dom 19:44): l'agenda non ha weekend, il
+    # richiedente conta giorni di calendario. Finestra ignorata: le offerte di oggi, da lun 15:00, non cancel.
+    "cross_asst_finestra_weekend": dict(
+        start=("hospital", XFIS.format(rid="R-55", extra=" after=2026-11-28T09:05 deadline=2026-11-29T19:44 mach=1.3")),
+        foreign=True, expect=[cross_reply("R-55", "B"),
+                              cross_window("R-55", START.replace(hour=12), WED, must=("S-h1-00-15",))]),
+})
+
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"
