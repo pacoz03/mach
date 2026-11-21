@@ -296,6 +296,7 @@ async def _turn(role: str, need: Need, city: City) -> None:
         by = _BOOK_BY.set(started + _BOOK_BUDGET)
         try:
             _unhold(message, chat, city.agent_id)
+            _recover(chat, city.agent_id)
             await _hospital(city, message, chat)
         finally:
             _BOOK_BY.reset(by)
@@ -1550,14 +1551,20 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         # sets the city clock that _cross_asst needs to answer from _WORLD. Ignored, every request
         # went cold and got no_availability (21/11 02:34, 22 of 22).
         _ledger([message], "agenda")
+        await _answer_pending(city, chat)
     elif message.sender == LEDGER and _latest_slots([message]) is not None:
         # A world reply as its own turn (live: most do): _cross_asst no longer waits for it, so
-        # it fills _WORLD here, when our latest world ask in the case named our procedure (a
-        # ``world page=1`` from _ask_slots lists every facility's slots).
-        asks = [row.text.split() for row in chat if row.sender == city.agent_id
-                and row.recipient == LEDGER and first_word(row.text) == "world"]
-        if asks and f"procedure={_PROCEDURE}" in asks[-1]:
+        # it fills _WORLD here when it is a page of our procedure we asked for, by its content
+        # and page, never by which ask came last (the Ledger answers out of order; a ``world
+        # page=1`` from _ask_slots lists every facility's slots; an empty page, the SDK format
+        # without taken slots, names none). Then the requests of the case still waiting for it
+        # get their answer.
+        world = _latest_slots([message]) or ""
+        if (_page_procedure(world) == _PROCEDURE or "slot_id=" not in world) and protocol.asked(
+            chat, city.agent_id, _PROCEDURE, protocol.page(world)[0]
+        ):
             _keep_world(_PROCEDURE, [message])
+            await _answer_pending(city, chat)
     elif (
         message.sender.startswith("agent:")
         and not confirm
@@ -1568,6 +1575,7 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         and {"request_id", "procedure", "service_type"} & _fields(message).keys()
     ):
         await _cross_asst(city, message)
+        await _answer_pending(city, chat, skip=message.msg_id)
     else:
         # One booking step at a time per case, on a fresh read of it: the held and committed
         # pushes open turns of their own while the confirm turn waits for the same lines, and
@@ -1591,6 +1599,15 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
                         # ponytail: no expired row in the kit or live yet; its code goes on if any.
                         row = replace(message, body={**message.body, "text": f"{message.text} reason=expired"})
                     await _on_refused(city, row, chat, hold_self=False)
+                else:
+                    # The answer to our own release, after its turn stopped waiting (a slow
+                    # Ledger): the booking party that asked hears the outcome now (_release).
+                    # ponytail: the case's latest release request; one release per case.
+                    asked = next((row for row in reversed(chat) if row.sender.startswith("agent:")
+                                  and row.recipient == city.agent_id
+                                  and (first_word(row.text) == "cancel" or row.type == "cancel")), None)
+                    if asked is not None:
+                        await _release(city, asked, chat)
             elif release:
                 await _release(city, message, chat)
             else:
@@ -1636,6 +1653,7 @@ async def _cross_asst(
     *,
     procedures: tuple[str, ...] = (_PROCEDURE,),
     ours: str = "del nostro ospedale",
+    pending: bool = False,
 ) -> None:
     """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
     per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
@@ -1646,7 +1664,12 @@ async def _cross_asst(
     The clock is _city_now (agenda is asked to refresh it, waited for only without it), else
     world's first day (_day_after). A partner asks because its own set is empty: with nothing
     in the priority window we offer the first free slots after it (relaxed alternative, R:232),
-    page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days."""
+    page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days.
+
+    Hospital: no page by then means we do not know, so no answer at all, never a no_availability
+    (a false attribute, -2): the turn ends (the fast reply is the ack) and _answer_pending answers
+    when page and clock are in. ``pending``: that late answer, from _WORLD and _city_now only,
+    without waiting (a page 2 it needs is asked, and its push turn answers)."""
 
     start = time.monotonic()
     # Hospital and specialist: the live Ledger answers world after ~12 s (21a6d28).
@@ -1666,7 +1689,8 @@ async def _cross_asst(
         completed_chat = [row for row in chat if not (
             procedures == ("CONS-GIN",) and row.sender == agent and row.recipient == sender
             and first_word(row.text) not in {"offer", "cancel", "booking.receipt"})]
-        if sent.offers or _answered(completed_chat, agent, message.msg_id, sender) or tag and any(
+        # ``pending``: a later message to the partner (another request's answer) does not answer it.
+        if sent.offers or not pending and _answered(completed_chat, agent, message.msg_id, sender) or tag and any(
             row.sender == agent and row.recipient == sender and tag in row.text.split()
             for row in completed_chat
         ):
@@ -1708,7 +1732,10 @@ async def _cross_asst(
                 return hit[1]
 
             if warm(1) is not None:
-                later.append("agenda")  # a say to the Ledger takes 1-5 s live: after the answer
+                if not pending:
+                    later.append("agenda")  # a say to the Ledger takes 1-5 s live: after the answer
+            elif pending:
+                return
             else:
                 if family:
                     await _say(city, sender, f"request_id={rid} Ricevuto: sto verificando le disponibilità sul registro. Non ho ancora un esito.")
@@ -1721,7 +1748,14 @@ async def _cross_asst(
                 if cached is not None:
                     # Answer now; the read goes out after the answer and refreshes the cache.
                     rows, world, owed = chat, cached, page
-                    later.append(f"world procedure={procedure} page={page}")
+                    if not pending:
+                        later.append(f"world procedure={procedure} page={page}")
+                elif pending:
+                    # Page 2 not read yet: asked once, its own push turn answers.
+                    if not protocol.asked(chat, agent, procedure, page):
+                        await _say(city, LEDGER, f"world procedure={procedure} page={page}")
+                    world = None
+                    break
                 else:
                     await _say(city, LEDGER, f"world procedure={procedure} page={page}")
                     rows = await _until(
@@ -1770,6 +1804,9 @@ async def _cross_asst(
                 if every or page >= min(protocol.page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
+            if hospital and world is None:
+                _LOG.info("care.cross.pending", extra={"request_id": rid})
+                return
             if hospital:
                 # Without slots we hold, least offered first: partners no longer race for one 3.
                 found, every = _spread(found), _spread(every)
@@ -1849,6 +1886,39 @@ async def _cross_asst(
             return
 
 
+async def _answer_pending(city: City, chat: list[Message], *, skip: str = "") -> None:
+    """Hospital: the partner searches of this case we have not answered (the Ledger's world came
+    after their turn, or before a restart), answered now from the cached page (_cross_asst
+    ``pending``). One we answered, in this process or in the history, is skipped."""
+
+    hit = _WORLD.get((_PROCEDURE, 1))
+    if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH:
+        return  # nothing to answer from: no history read in this turn
+    agent = city.agent_id
+    for row in chat:
+        found = _fields(row)
+        kind = words(row.text)
+        rid = found.get("request_id", "")
+        key = f"cross:{row.sender}:{rid or row.msg_id}"
+        if (
+            row.msg_id == skip
+            or row.recipient != agent
+            or not row.sender.startswith("agent:")
+            or "confirm" in kind
+            or not ("need.request" in kind or row.type == "need.request")
+            or not {"request_id", "procedure", "service_type"} & found.keys()
+            or key in _SENT and _SENT[key].offers
+        ):
+            continue
+        if rid:
+            done = any(r.sender == agent and r.recipient == row.sender and f"request_id={rid}" in r.text.split()
+                       for r in chat)
+        else:
+            done = _answered(chat, agent, row.msg_id, row.sender)
+        if not done:
+            await _cross_asst(city, row, pending=True)
+
+
 # Background work of this process (late Ledger reads): kept referenced until it is done.
 _TASKS: set[asyncio.Task] = set()
 
@@ -1876,12 +1946,55 @@ def _keep_world_reply(message: Message) -> bool:
     world = _latest_slots([message])
     if world is None:
         return False
+    procedure = _page_procedure(world)
+    if procedure:
+        _keep_world(procedure, [message])
+    return True
+
+
+def _page_procedure(world: str) -> str:
+    """The one procedure every slot line of a world page names, else "" (a mixed page)."""
+
     procedures = {
         _slot(line).get("procedure") for line in world.splitlines() if "slot_id=" in line
     } - {None, ""}
-    if len(procedures) == 1:
-        _keep_world(procedures.pop(), [message])
-    return True
+    return procedures.pop() if len(procedures) == 1 else ""
+
+
+def _recover(chat: list[Message], agent: str) -> None:
+    """Hospital, a pod that restarted or never saw this case (two pods): the city clock and our
+    world pages come back from the case's Ledger rows, never guessed, so the cross-ASST answer,
+    _alternatives and _starts_soon do not start cold. Only what this process lacks: _CLOCK when
+    empty (one anchor all night, _ANCHOR), a page it has not cached. A page counts as read when
+    the Ledger sent it (``sent_at``): older than _WORLD_FRESH it stays out. Every slot we sent a
+    hold for in the case leaves our cached pages, these and the ones we had: ours now, or lost
+    (_HELD and _on_refused, in the memory of the pod that sent the hold). The next world read
+    brings a freed one back."""
+
+    if not _CLOCK:
+        agenda = protocol.ledger(chat, "agenda")
+        _CLOCK.update(agenda or {})
+        if _city_now() is None:
+            _CLOCK.clear()
+    found: dict[tuple[str, int], tuple[float, str]] = {}
+    real = datetime.now().astimezone()
+    for row in chat:
+        world = _latest_slots([row])
+        sent = protocol.when(row.sent_at or "")
+        if world is None or sent is None or _page_procedure(world) != _PROCEDURE:
+            continue
+        at = time.monotonic() - max(0.0, (real - sent).total_seconds())
+        key = (_PROCEDURE, protocol.page(world)[0])
+        if time.monotonic() - at < _WORLD_FRESH and at >= found.get(key, (at, ""))[0]:
+            found[key] = (at, world)
+    held = {f"slot_id={fields_of(row.text).get('slot_id', '')}" for row in chat
+            if row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "hold"}
+    for key, hit in found.items():
+        _WORLD.setdefault(key, hit)
+    for key, (at, world) in list(_WORLD.items()) if held else ():
+        if key[0] == _PROCEDURE:
+            _WORLD[key] = (at, "\n".join(line for line in world.splitlines() if not held & set(line.split())))
+
 
 def _keep_world(procedure: str, rows: list[Message]) -> None:
     """Hospital, specialist: every ``world`` page in ``rows`` becomes the cached page of
@@ -2243,9 +2356,14 @@ async def _release(city: City, message: Message, chat: list[Message]) -> None:
         )
 
     fresh = await _until(city, message.need_id, chat, lambda rows: answer(rows) is not None)
-    if _answered(fresh, agent, message.msg_id, sender):
-        return
     reply = answer(fresh)
+    # Told already: the outcome once, the wait once (a later turn brings the outcome).
+    told = [row.text for row in fresh if row.sender == agent and row.recipient == sender
+            and token in row.text.split()]
+    if any(first_word(text) == "cancelled" or "reason=" in text for text in told) or (
+        reply is None and told
+    ):
+        return
     if reply is None:
         text = (f"{ids} {token} Ho chiesto al registro di liberare il posto: la conferma non è "
                 "ancora arrivata.")

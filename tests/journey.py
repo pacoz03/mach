@@ -1333,15 +1333,14 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_vincoli": dict(
         start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True,
         expect=[cross_reply("R-13", "B"), cross_only("R-13", "h1")]),
-    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e chiude il
-    # turno; R-12 arriva 6 s dopo. Con la risposta di world come turno suo (--ledger-turns, come in
-    # città) R-12 trova la pagina in memoria e offre in meno di 1 s; senza, R-12 è di nuovo a freddo.
+    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo chiude il turno entro 9,5 s (ack)
+    # senza risposta, perché senza pagina non sa: mai cancel no_availability (attributo falso, −2).
+    # La risposta parte quando arriva la pagina: dal suo turno (--ledger-turns, come in città) o,
+    # senza, dal turno di R-12, che arriva 6 s dopo e trova la pagina nella history del caso.
     "cross_asst_world_lento": dict(
         start=("hospital", XFIS.format(rid="R-11", extra="")), foreign_after=[XFIS.format(rid="R-12", extra="")],
         foreign=True, slow_world=12.0, gap=6.0,
-        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5),
-                by_turns(cross_reply("R-12", "B"), cross_reply("R-12", None)),
-                by_turns(cross_fast("R-12", 1.0), cross_fast("R-12", 9.5))]),
+        expect=[cross_reply("R-11", "B"), cross_reply("R-12", "B"), cross_fast("R-12", 1.0)]),
     "cross_asst_tutto_pieno": dict(
         start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
         expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
@@ -2599,6 +2598,74 @@ SCENARIOS.update({
     "booking_scelta_tardiva": dict(start=BACK, setup=chooses_late(16), expect=[
         stale_not_confirmed, told("booking_centre", "cancel", "reason=slot_expired", cite="journey 099"),
         wrote("checkin", "R:234")]),
+})
+
+
+# --- Ospedale con il Ledger tardivo o fuori ordine e con il pod riavviato (tests/chaos.py: ledger_late,
+# ledger_reorder, restart): senza pagina mai cancel no_availability, stato rifatto dalla history del caso.
+
+
+def restart_hospital(before: str):
+    """Il pod dell'ospedale riparte (moduli ricaricati: _WORLD, _CLOCK, _SENT vuoti) appena prima del
+    primo messaggio che gli arriva con il token ``before`` (es. ``request_id=R-31`` o ``confirm``)."""
+    def setup(b: Bus) -> None:
+        deliver, hosp, done = b.deliver, b.ids["hospital"], []
+
+        async def restarted(m: Message) -> None:
+            if not done and m.recipient == hosp and before in m.text.split():
+                done.append(m)
+                b.agents[hosp] = Agent("hospital")
+            await deliver(m)
+
+        b.deliver = restarted
+    return setup
+
+
+def slow_ledger(op: str, seconds: float):
+    """La risposta del Ledger a ``op`` arriva ``seconds`` s dopo (con --ledger-turns: turno suo)."""
+    def setup(b: Bus) -> None:
+        late = b.ledger.late
+        b.ledger.late = lambda text: seconds if (text.split() or [""])[0] == op else late(text)
+    return setup
+
+
+def first_agenda_slow(b: Bus) -> None:
+    b.ledger.agendas = 1  # sc["slow_agenda"] vale dalla seconda: qui anche la prima è lenta
+
+
+SCENARIOS.update({
+    # Riavvio prima di R-31 (world lento, 3 s): orologio e pagina tornano dalla history del caso,
+    # R-31 risponde subito invece di rileggere il Ledger a freddo.
+    "cross_asst_riavvio": dict(
+        start=("hospital", XFIS.format(rid="R-30", extra="")), foreign=True, slow_world=3.0,
+        foreign_after=[XFIS.format(rid="R-31", extra="")], setup=restart_hospital("request_id=R-31"),
+        expect=[cross_reply("R-31", "B"), cross_fast("R-31", 1.0)]),
+    # Riavvio prima del confirm, hold rifiutato NO_CAPACITY: le alternative vengono dalla pagina
+    # della history del caso, non da una memoria vuota.
+    "ospedale_riavvio_alternative": dict(
+        start=("hospital", XFIS.format(rid="R-20", extra="")), foreign=True, refuse_holds=1,
+        refuse_code="NO_CAPACITY", setup=restart_hospital("confirm"), expect=[lost_slot_alternatives("R-20")]),
+    # Fuori ordine: world (5 s) arriva prima di agenda (8 s), tutti e due dopo il turno della
+    # richiesta. La risposta parte quando ci sono pagina e orologio (turno di agenda), mai un cancel.
+    "cross_asst_world_prima_di_agenda": dict(
+        start=("hospital", XFIS.format(rid="R-1", extra="")), foreign=True, ledger_turns=True,
+        slow_world=5.0, slow_agenda=8.0, setup=first_agenda_slow,
+        expect=[cross_reply("R-1", "B"), wrote("commit", "R:194")]),
+    # Il centro annulla e il `cancelled` del Ledger arriva dopo il turno del cancel (3 s): il
+    # `cancelled` al centro parte dal turno della risposta.
+    "ospedale_annullo_lento": dict(start=BACK, booking_cancel="citizen_request", ledger_turns=True,
+                                   setup=slow_ledger("cancel", 3.0), expect=[released_once]),
+    # Guardie della risposta in sospeso. Pagina 1 tutta piena e world lento: la pagina 2 si chiede
+    # dal turno della pagina 1, e il cancel parte solo quando le due pagine dicono che non c'è posto.
+    "cross_asst_tutto_pieno_lento": dict(
+        start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15, slow_world=5.0,
+        ledger_turns=True, expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
+    # Riavvio dopo l'hold di R-20: la pagina della history non offre più lo slot trattenuto.
+    "cross_asst_riavvio_hold": dict(
+        start=("hospital", XFIS_D.format(rid="R-20", extra="")), foreign=True,
+        foreign_after=[XFIS_D.format(rid=r, extra="") for r in ("R-21", "R-22", "R-23")],
+        setup=restart_hospital("request_id=R-21"),
+        expect=[*(cross_reply(r, "D") for r in ("R-21", "R-22", "R-23")), cross_spread("R-21", "R-22", "R-23")]),
 })
 
 
