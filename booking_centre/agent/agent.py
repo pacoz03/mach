@@ -401,7 +401,7 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
         sender.startswith("agent:")
         # From level 6 the city cancels each citizen's first booking: whoever tells us (the
         # facility, or the city itself naming the booking), we rebook at once.
-        or (sender.startswith("city:") and (picked.get("offer_id") or picked.get("booking_id")))
+        or (sender.startswith("city:") and _names_ours(chat, city.agent_id, picked))
     ):
         await _partner_cancel(city, message, chat)
         return
@@ -1455,6 +1455,17 @@ def _offer_source(chat: list[Message], agent: str, offer_id: str) -> str:
             if any(offer.get("offer_id") == offer_id for offer in _offers_in(row.text)):
                 return row.msg_id
     return ""
+
+
+def _names_ours(chat: list[Message], agent: str, fields: dict[str, str]) -> bool:
+    """Whether a cancel names one of OUR offers or a booking made from one: anything else from
+    the city (a conformance probe, another case) is not ours to act on."""
+
+    citizen = _citizen(chat)
+    offer_id = fields.get("offer_id", "")
+    if offer_id and _our_offer(chat, agent, offer_id):
+        return True
+    return bool(citizen and _offer_of_booking(chat, agent, citizen, fields.get("booking_id", "")))
 
 
 def _offer_of_booking(chat: list[Message], agent: str, citizen: str, booking_id: str) -> str:
