@@ -62,6 +62,8 @@ SDK_REPLY = {
     "slot": "slot_id={slot_id} doctor_id={doctor_id} facility={facility} procedure={procedure} "
     "agenda_date={at} agenda_day={day} capacity={free}",
 }
+# La riga di slot vera (episodes, 21/11 02:33) ha gli stessi campi del kit: at/day/free.
+REAL_SLOT = REPLY["slot"]
 DOCTOR_ID = "D-{key}"  # i brain usano l'ultimo pezzo dopo '-' come chiave di _DOCTORS
 # Medici e giorni copiati da _DOCTORS dei brain, procedure dal PROTOCOL del gp: anche questi
 # vanno confrontati con il `world` vero.
@@ -308,6 +310,18 @@ class Ledger:
                 self.holds.setdefault("H-ALTRA", dict(hold_id="H-ALTRA", slot_id=self.steal, need_id=None, state="committed"))
             return "\n".join(lines)
         return REPLY["refused"].format(op=op or "?", code="UNKNOWN_OP")
+
+
+def real_page(L: Ledger) -> str:
+    """Pagina 1 di world VIS-FIS nel formato vero (episodes, 21/11 02:33): intestazione con page,
+    matching, asst, from, until e wave_id; una riga free=0; urgent_reserve=true; un secondo page=
+    per la pagina dopo. In episodes ci sono solo i campi: la riga di quel page=2 è un'ipotesi."""
+    rows = sorted((s for s in L.slots.values() if s["procedure"] == "VIS-FIS"), key=lambda s: (s["at"], s["slot_id"]))
+    head = (f"slots page=1/{-(-len(rows) // PAGE)} matching={len(rows)} asst=asst-gorla from={L.now.date()} "
+            f"until={(L.now + timedelta(days=14)).date()} wave_id=W01QQQ")
+    lines = [REAL_SLOT.format(**s, free=0 if i == 0 else 1) + (" urgent_reserve=true" if s["reserve"] else "")
+             for i, s in enumerate(rows[:PAGE])]
+    return "\n".join([head, *lines, "more: world procedure=VIS-FIS page=2"])
 
 
 class Agent:
@@ -619,6 +633,14 @@ class Bus:
         # {hold_id}/{ledger_ref} sono quelli della prenotazione annullata.
         # sc["booking_cancel"]: a prenotazione fatta il centro annulla la visita per il cittadino.
         sc = self.citizen.sc
+        # sc["push"]: prima della richiesta arrivano all'ospedale, ciascuna come turno suo, le risposte
+        # tardive del Ledger (world e agenda) a un caso vecchio, come in città il 21/11 alle 02:33.
+        if sc.get("push"):
+            hosp, old = self.ids["hospital"], "N-2026-11-23-0009"
+            for text in ("world procedure=VIS-FIS page=1", "agenda"):
+                self.add(hosp, LEDGER, {"text": text}, old)
+            for text in (real_page(self.ledger), self.ledger.read("agenda", {})):
+                self.queue.append(self.add(LEDGER, hosp, {"text": text}, old))
         cancel = (("ledger", sc["ledger_cancel"]), ("hospital", sc.get("after_cancel", ORARIO))) if "ledger_cancel" in sc else ()
         cancel += (("booking", sc["booking_cancel"]),) if "booking_cancel" in sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
@@ -1090,11 +1112,11 @@ def receipt_to_foreign(b: Bus) -> str | None:
         return "hospital non ha mandato booking.receipt al centro dell'altra ASST (R:195)"
 
 
-def never_from_hospital_to(peer: str):
+def never_from_hospital_to(peer: str, role: str = "hospital"):
     def check(b: Bus) -> str | None:
-        got = [m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == peer]
+        got = [m for m in b.log if m.sender == b.ids[role] and m.recipient == peer]
         if got:
-            return f"hospital ha scritto a {peer}: «{got[0].text[:80]}» (sonda senza criteri)"
+            return f"{role} ha scritto a {peer}: «{got[0].text[:80]}» (sonda senza criteri)"
     return check
 
 
@@ -1230,6 +1252,10 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_sonda": dict(
         start=("hospital", "need.request service=lab summary=visit district=8"), foreign=True,
         expect=[no_world_of("VIS-FIS"), never_from_hospital_to(FOREIGN)]),
+    # Live 21/11: il consultorio 1.0.6 rispondeva alla sonda (19 TARGET_NOT_VISIBLE verso agent:t05/osp-x).
+    "consultorio_sonda": dict(
+        start=("family_counseling", "need.request service=lab summary=visit district=8"), foreign=True,
+        expect=[never_from_hospital_to(FOREIGN, "family_counseling")]),
     "cross_asst_nessuno": dict(
         start=("hospital", XREQ.format(svc="hospital.physiatry", proc="VIS-FIS", rid="R-2")), foreign=True,
         late_days=15, expect=[cross_reply("R-2", None), no_write("hold", "R:192")]),
@@ -1523,6 +1549,12 @@ SCENARIOS.update({
         foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-31", "R-32")],
         expect=[cross_reply("R-31", "B"), cross_fast("R-31", 1.0), cross_turn_ends("R-31", "R-32"),
                 cross_reply("R-32", "B"), cross_fast("R-32", 1.0)]),
+    # Città 21/11 02:34 (1.0.9 appena partita, world e agenda in 25-96 s): le risposte tardive di un
+    # caso vecchio arrivano come turni suoi, poi R-14. La pagina e l'orologio vengono da quei push:
+    # offerte subito, non cancel no_availability (1.0.9: 22 richieste su 22).
+    "cross_asst_push_reale": dict(
+        start=("hospital", XFIS.format(rid="R-14", extra=" lang=it")), foreign=True, push=True, slow_world=5.0,
+        expect=[cross_reply("R-14", "B"), cross_fast("R-14", 1.0)]),
 })
 
 

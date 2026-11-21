@@ -249,6 +249,17 @@ async def handle(role: str, need: Need, city: City) -> None:
     message = city.inbound
     if message is None:
         return
+    if (
+        role in ("hospital", "family_counseling")
+        and message.sender.startswith("agent:")
+        and (message.type == "need.request" or "need.request" in words(message.text))
+        and "confirm" not in words(message.text)
+        and not {"request_id", "procedure", "service_type"} & _fields(message).keys()
+    ):
+        # The conformance probe (a search without cross-ASST criteria): no network at all, so the
+        # turn ends well inside custody.ack's ~5 s wait for the renew (1.0.9 deploys failed there).
+        # The consultorio too: 1.0.6 answered it live (21/11, TARGET_NOT_VISIBLE to t05/osp-x).
+        return
     if role == "family_counseling" and message.sender.startswith("agent:"):
         try:
             chat = await asyncio.wait_for(city.history(need_id=message.need_id), timeout=1.0)
@@ -1780,6 +1791,11 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         await _checkin_refused(city, message, chat, booking_id="", en=_english(chat))
     elif message.sender == LEDGER and head == "checked_in":
         await _on_checked_in(city, message, chat, reports=False, en=_english(chat))
+    elif message.sender == LEDGER and head == "agenda":
+        # A late agenda reply as its own turn (live 1.0.9: all of them, 2-4 min after the ask): it
+        # sets the city clock that _cross_asst needs to answer from _WORLD. Ignored, every request
+        # went cold and got no_availability (21/11 02:34, 22 of 22).
+        _ledger([message], "agenda")
     elif message.sender == LEDGER and _latest_slots([message]) is not None:
         # A world reply as its own turn (live: most do): _cross_asst no longer waits for it, so
         # it fills _WORLD here, when our latest world ask in the case named our procedure (a
