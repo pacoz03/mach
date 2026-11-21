@@ -3488,6 +3488,129 @@ SCENARIOS.update({
         setup=seeded_rx("RX-U8", CIT, "VIS-FIS", "U"), expect=[offered_today, wrote("commit", "R:91")]),
 })
 
+# --- Specialista e consultorio (diagnosi del 21/11, punti 5-8): referto sul Ledger prima del messaggio al
+# cittadino, tetto al turno del confirm di un partner, un «non» che non annulla una scelta, check-in rifiutato.
+
+
+def report_first(b: Bus) -> str | None:
+    """Lo specialista scrive `report` sul Ledger prima del `checkin` al cittadino, che chiude il percorso
+    (ADR-119: il giudice valuta un minuto dopo, sui fatti del Ledger fin lì); il `report` al cittadino solo
+    dopo il `reported` del Ledger."""
+    sp = b.ids["specialist_care"]
+
+    def at(pred) -> int | None:
+        return next((i for i, m in enumerate(b.log) if pred(m)), None)
+    filed = at(lambda m: m.sender == sp and m.recipient == LEDGER and m.text.startswith("report "))
+    note = at(lambda m: m.sender == sp and m.recipient == CIT and act(m) == "checkin")
+    done = at(lambda m: m.sender == LEDGER and m.recipient == sp and m.text.startswith("reported "))
+    told_ = at(lambda m: m.sender == sp and m.recipient == CIT and act(m) == "report")
+    if None in (filed, note, done, told_):
+        return f"specialist_care: report {filed}, checkin al cittadino {note}, reported {done}, report al cittadino {told_}"
+    if filed > note:
+        return "specialist_care: checkin al cittadino prima del report sul Ledger (ADR-119, R:214-218)"
+    if told_ < done:
+        return "specialist_care: report al cittadino prima del reported del Ledger"
+
+
+def pull_pause(folder: str, seconds: float):
+    """Ogni lettura della history di ``folder`` costa ``seconds`` (in città 0,25 s di pausa più la lettura)."""
+    def setup(b: Bus) -> None:
+        b.agents[b.ids[folder]].mods["facility"]._PULL_PAUSE = seconds
+    return setup
+
+
+def partner_confirm_ends(folder: str, partner: str):
+    """slow_booking per ``folder``: il turno del confirm di ``partner`` finisce entro 9,5 s (ack, R:246),
+    poi il push di held committa e quello di committed manda la ricevuta al partner, una volta."""
+    def check(b: Bus) -> str | None:
+        fac, bc = b.ids[folder], b.ids.get(partner, partner)
+        took = [round(b.took[m.msg_id], 1) for m in b.log
+                if m.sender == bc and m.recipient == fac and m.text.startswith("confirm") and m.msg_id in b.took]
+        if not took or max(took) >= 9.5:
+            return f"{folder}: turno del confirm {took} s, serve < 9,5 s (ack, R:246)"
+        for to, head, push in ((LEDGER, "commit", "held"), (bc, "booking.receipt", "committed")):
+            sent = [m for m in b.log if m.sender == fac and m.recipient == to and m.text.startswith(head + " ")]
+            opened = [b.opened[b.turn_of[m.msg_id]].text.split()[0] for m in sent]
+            if opened != [push]:
+                return f"{folder}: {head} nei turni aperti da {opened} invece che una volta dal push di {push}"
+    return check
+
+
+def picks_in_words(text: str):
+    """Alle prime offerte del consultorio il cittadino risponde ``text``, senza token; poi come sempre."""
+    def setup(b: Bus) -> None:
+        fc, react, done = b.ids["family_counseling"], b.citizen.react, []
+
+        def reacting(m: Message) -> None:
+            if m.sender == fc and act(m) == "offer" and not done:
+                done.append(m)
+                b.citizen.chosen = parse_offers(m.text)[0]
+                b.citizen.say(fc, text)
+                return
+            react(m)
+        b.citizen.react = reacting
+    return setup
+
+
+def booked_first_offer(b: Bus) -> str | None:
+    """Il consultorio prenota la prima delle offerte che il cittadino ha scelto a parole."""
+    fc = b.ids["family_counseling"]
+    first = next((m for m in b.log if m.sender == fc and m.recipient == CIT and act(m) == "offer"), None)
+    slot = parse_offers(first.text)[0].get("slot_id") if first else None
+    held = [w["f"].get("slot_id") for w in b.ledger.writes if w["op"] == "hold" and w["by"] == "family_counseling"]
+    if held != [slot]:
+        return f"family_counseling: hold su {held}, atteso uno solo sulla prima offerta {slot}"
+
+
+def checkin_refused_once(folder: str):
+    """Il Ledger rifiuta il checkin fuori dalla mezza giornata dello slot: ``folder`` lo dice una volta, con il
+    motivo e la fascia (_checkin_refused, come l'ospedale), senza «checkin» né «controlli il codice». Contano i
+    messaggi dei turni aperti dall'arrivo o dal Ledger, non le risposte ad altri messaggi (hostile)."""
+    def check(b: Bus) -> str | None:
+        fac = b.ids[folder]
+        tried = [w for w in b.ledger.writes if w["op"] == "checkin"]
+        if len(tried) != 1:
+            return f"{len(tried)} checkin sul Ledger invece di uno"
+        arrivals = {m.msg_id for m in b.log if m.sender == CIT and m.recipient == fac and act(m) == "checkin"}
+        after = [m for m in b.log[tried[0]["i"]:] if m.sender == fac and m.recipient == CIT
+                 and (b.opened[b.turn_of[m.msg_id]].msg_id in arrivals or b.opened[b.turn_of[m.msg_id]].sender == LEDGER)]
+        if len(after) != 1:
+            return f"{folder}: {len(after)} messaggi al cittadino dopo il checkin rifiutato, ne serve uno"
+        if act(after[0]) == "checkin" or "reason=" not in after[0].text or "mezza giornata" not in after[0].text:
+            return f"{folder}: dopo il checkin rifiutato «{after[0].text[:100]}»"
+    return check
+
+
+SCENARIOS.update({
+    # 5: report sul Ledger, poi il checkin al cittadino (chiude il percorso), il report al cittadino dopo reported.
+    "specialista_referto_prima": dict(start=PALPITAZIONI, expect=[report_first, wrote("report", "R:208/236")]),
+    # 6: hold e commit dello specialista rispondono dopo 8 s, ogni lettura 0,5 s: il turno del confirm del
+    # centro finisce entro il tetto, i push di held e committed finiscono la prenotazione.
+    "specialista_scritture_lente": dict(start=PALPITAZIONI, slow_writes=8.0, ledger_turns=True,
+                                        setup=pull_pause("specialist_care", 0.5),
+                                        expect=[partner_confirm_ends("specialist_care", "booking_centre"),
+                                                wrote("checkin", "R:234")]),
+    # 6: lo stesso per il consultorio con il centro di un'altra ASST.
+    "consultorio_scritture_lente": dict(
+        start=("family_counseling", XREQ.format(svc="family_counseling.gynecology", proc="CONS-GIN", rid="R-60")),
+        foreign=True, slow_writes=8.0, ledger_turns=True, setup=pull_pause("family_counseling", 0.5),
+        expect=[partner_confirm_ends("family_counseling", FOREIGN)]),
+    # 7: «va bene la prima, non vedo l'ora» sceglie la prima, non rifiuta tutto (città 10:18-10:27: 4 citizen_declined).
+    "consultorio_non_vedo_lora": dict(start=GINECOLOGIA, setup=picks_in_words("Va bene la prima, non vedo l'ora!"),
+                                      expect=[never_told("family_counseling", "reason=citizen_declined", cite="scelta"),
+                                              booked_first_offer, wrote("checkin", "R:234")]),
+    # 7: un rifiuto vero resta un rifiuto, anche con «va bene» dentro.
+    "consultorio_non_mi_va_bene": dict(start=GINECOLOGIA, setup=picks_in_words("No grazie, non mi va bene nessuna."),
+                                       expect=[told("family_counseling", "cancel", "reason=citizen_declined", cite="rifiuto")]),
+    # 8: checkin fuori dalla mezza giornata, rifiuto nel turno dell'arrivo e come push del Ledger.
+    "specialista_checkin_fuori_fascia": dict(start=PALPITAZIONI, refuse_checkin=CHECKIN_REFUSED,
+                                             expect=[checkin_refused_once("specialist_care")]),
+    "specialista_checkin_rifiutato_push": dict(start=PALPITAZIONI, refuse_checkin=CHECKIN_REFUSED, ledger_turns=True,
+                                               setup=slow_checkin(0.5), expect=[checkin_refused_once("specialist_care")]),
+    "consultorio_checkin_rifiutato_push": dict(start=GINECOLOGIA, refuse_checkin=CHECKIN_REFUSED, ledger_turns=True,
+                                               setup=slow_checkin(0.5), expect=[checkin_refused_once("family_counseling")]),
+})
+
 
 # --- Centro prenotazioni e MACH-2.1 (docs/protocol/mach-2.1.md): il need.request porta mach, after, deadline e
 # lease_s e mai lang= (R:191); 5 strutture per ondata, la seconda solo dopo il no di tutta la prima (R3); solo

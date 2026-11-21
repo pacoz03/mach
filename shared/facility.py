@@ -199,12 +199,22 @@ async def handle(role: str, need: Need, city: City) -> None:
     redelivery that says every message of the turn twice (city_sdk harness.py ``_think``).
     """
 
+    # Specialist and consultorio: a partner's turn (its confirm) stops waiting on the Ledger at
+    # _BOOK_BY, as every hospital turn (_turn); the held and committed pushes commit and send the
+    # receipt (_on_held, _on_committed). The citizen's own turns wait as before.
+    inbound = city.inbound
+    by = None
+    if role != "hospital" and inbound is not None and inbound.sender.startswith("agent:"):
+        by = _BOOK_BY.set(time.monotonic() + _BOOK_BUDGET)
     try:
         await _turn(role, need, city)
     except OutOfScope:
         raise
     except Exception:  # noqa: BLE001 - logged; the turn ends here, never redelivered
         _LOG.exception("care.turn.failed")
+    finally:
+        if by is not None:
+            _BOOK_BY.reset(by)
 
 
 async def _turn(role: str, need: Need, city: City) -> None:
@@ -344,7 +354,8 @@ _BOUNCED: dict[tuple[str, str, str], float] = {}
 # commit -> committed 30 s), so the held push commits and the committed push sends the receipt,
 # in turns of their own (_hospital: book: lock, fresh history).
 _BOOK_BUDGET = 5.0  # + a 1-5 s say for the commit, still < 10 s
-# Hospital: time.monotonic() at which this turn stops waiting on the Ledger (handle); else None.
+# Hospital, and a partner's turn at the specialist or the consultorio (handle): time.monotonic() at
+# which this turn stops waiting on the Ledger; else None.
 _BOOK_BY: ContextVar[float | None] = ContextVar("book_by", default=None)
 
 
@@ -1014,7 +1025,7 @@ def _facility_turn(message: Message) -> bool:
     kind = words(message.text)
     if message.sender == LEDGER and head in {"held", "committed", "checked_in", "reported"}:
         return True
-    if message.sender == LEDGER and head == "refused" and "hold" in kind or _dropped(message):
+    if message.sender == LEDGER and head == "refused" and {"hold", "checkin"} & kind or _dropped(message):
         return True
     if ("checkin" in kind or message.type == "checkin") and message.sender.startswith("citizen:"):
         return True
@@ -1030,6 +1041,10 @@ _FAMILY_DAYS = {
 }
 _FAMILY_NO = re.compile(r"\b(?:no|non|not|rifiuto|don't|cannot|can't)\b")
 _FAMILY_YES = re.compile(r"\b(?:si|va bene|ok|okay|confermo|accetto|yes|fine|book it)\b")
+# "Non mi va bene", "not ok": a negated assent is no assent.
+_FAMILY_NOT_YES = re.compile(
+    r"\b(?:no|non|not)\s+(?:(?:mi|ci|e|is|it's)\s+)?(?:si|va bene|ok|okay|confermo|accetto|fine)\b"
+)
 _ARRIVAL = re.compile(r"\b(?:check[- ]?in|sono arrivat[oa]|sono qui|sono all'accettazione|"
                       r"i(?: have|'ve) arrived|i(?: am|'m) here)\b")
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
@@ -1097,7 +1112,7 @@ def _family_preferences(chat: list[Message], citizen: str) -> dict:
 
 
 def _family_pick(plain: str, offers: list[dict[str, str]]) -> str:
-    if not offers or _FAMILY_NO.search(plain):
+    if not offers:
         return ""
     if re.fullmatch(r"[1-3]", plain.strip()):
         position = int(plain) - 1
@@ -1109,6 +1124,12 @@ def _family_pick(plain: str, offers: list[dict[str, str]]) -> str:
         if re.search(rf"\b(?:{names})\b", plain):
             matches &= {index}
             criteria = True
+    if _FAMILY_NO.search(plain):
+        # A "non" negates a day, an hour or a bare "va bene", never the offer chosen by its number
+        # ("va bene la prima, non vedo l'ora"), unless it negates that number ("la prima non").
+        negated = re.search(r"\b(?:no|non|not)\s+(?:(?:la|il|the)\s+)?(?:prim|second|terz|first|third)"
+                            r"|\b(?:prim|second|terz)[oa]\s+(?:no|non)\b", plain)
+        return offers[matches.pop()]["offer_id"] if criteria and len(matches) == 1 and not negated else ""
     if days := _family_days(plain):
         matches &= {i for i, offer in enumerate(offers) if offer.get("agenda_day") in days}
         criteria = True
@@ -1279,8 +1300,12 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
         return
     if last_act in {"booking.receipt", "checkin"}:
         return
+    # A "non" is a refusal only in a message that neither chooses an offer nor assents: "va bene la
+    # prima, non vedo l'ora" chooses (live 10:18-10:27: 4 citizen_declined cancelled every offer).
+    chose = (message.type == "confirm" or first_word(message.text) == "confirm" or data.get("offer_id")
+             or _family_pick(plain, offers) or _FAMILY_YES.search(_FAMILY_NOT_YES.sub(" ", plain)))
     denied = data.get("granted", "").lower() == "false" or (
-        not data.get("consent_ref") and bool(_FAMILY_NO.search(plain))
+        not data.get("consent_ref") and bool(_FAMILY_NO.search(plain)) and not chose
     )
     if pending and denied:
         await _say(city, citizen, f"cancel offer_id={pending} reason=consent_denied")
@@ -1410,6 +1435,9 @@ async def _facility_dispatch(
         await _on_refused(city, message, chat, hold_self=hold_self)
     elif message.sender == LEDGER and head == "checked_in":
         await _on_checked_in(city, message, chat, reports=reports)
+    elif message.sender == LEDGER and head == "refused" and "checkin" in kind:
+        # The refusal after the arrival turn stopped waiting for it: as the hospital, one answer.
+        await _checkin_refused(city, message, chat, booking_id="", en=_en(chat))
     elif message.sender == LEDGER and head == "reported":
         await _on_reported(city, message, chat)
     elif ("checkin" in kind or message.type == "checkin") and message.sender.startswith("citizen:"):
@@ -2522,8 +2550,13 @@ async def _arrive_alone(city: City, message: Message, chat: list[Message]) -> No
 async def _checkin_refused(
     city: City, message: Message, chat: list[Message], *, booking_id: str, en: bool
 ) -> None:
-    # The arrival turn and the refusal's own turn may both get here: one answer only.
+    # The arrival turn and the refusal's own turn may both get here: one answer only, on the case
+    # re-read inside the lock (specialist and consultorio push turns hold no other lock).
     async with _gated(f"refused:{message.need_id or message.msg_id}"):
+        try:
+            chat = await city.history(need_id=message.need_id)
+        except CapError:
+            pass
         await _refused_alone(city, message, chat, booking_id=booking_id, en=en)
 
 
@@ -2548,7 +2581,8 @@ async def _refused_alone(
         chat, agent, booking_id
     )
     at = protocol.when(_slot_facts(chat, agent, slot).get("at", ""))
-    if _WINDOW_CODE.search(code):
+    # The live window refusal is ``code=POLICY_VIOLATION detail=outside`` (tests/fixtures/refused.txt).
+    if _WINDOW_CODE.search(code) or fields.get("detail") == "outside":
         timing = ""
         if at:
             # The city's clock says whether it is another day or just early (never the pc's).
@@ -2891,7 +2925,8 @@ async def _finish_booking(
 ) -> None:
     """Hold is in the mailbox. Read the held line and commit before this turn ends.
     ``new``: a hold just sent, so a ``held`` already in ``chat`` belongs to an older one.
-    Hospital: only until _BOOK_BY; a line not read by then is the held or committed push's job
+    Only until _BOOK_BY (hospital; a partner's turn at the other two); a line not read by then is
+    the held or committed push's job
     (_on_held commits a hold we never committed, _on_committed sends a receipt not yet sent).
     ponytail: no sweeper. A lost held push leaves the hold uncommitted, a lost committed push
     leaves the receipt unsent, until the next confirm of the case reads the line from history
@@ -3181,24 +3216,8 @@ async def _on_checkin(city: City, message: Message, chat: list[Message], *, repo
     if first_word(reply.text) == "checked_in":
         await _on_checked_in(city, reply, fresh, reports=reports)
         return
-    # Refused by the Ledger: tell the citizen why. No ``checkin`` word, it was not honoured.
-    code = fields_of(reply.text).get("code") or "refused"
-    await _say(
-        city,
-        citizen,
-        f"{token} reason={code} "
-        + (
-            f"I'm sorry, I could not register your arrival with the code {booking_id}. Could "
-            "you check the code on the booking confirmation you received and send it to me "
-            "again? I will verify it right away. If it still does not work, whoever booked "
-            "the appointment for you can check the booking."
-            if _en(chat)
-            else f"Mi dispiace, non sono riuscito a registrare il suo arrivo con il codice "
-            f"{booking_id}. Può controllare il codice sulla conferma di prenotazione che ha "
-            "ricevuto e reinviarmelo? Lo verifico subito. Se il problema resta, chi le ha "
-            "fissato l'appuntamento può controllare la prenotazione."
-        ),
-    )
+    # Refused by the Ledger: the hospital's answer (the half day of the visit, or check the code).
+    await _checkin_refused(city, reply, fresh, booking_id=booking_id, en=_en(chat))
 
 
 async def _on_checked_in(
@@ -3210,6 +3229,13 @@ async def _on_checked_in(
     if not booking_id:
         return
     token = f"booking_id={booking_id}"
+    filed = None
+    if reports and not _reported(chat, city.agent_id, booking_id):
+        # The report on the Ledger before the check-in note: the note ends the journey and the judge
+        # rules about a minute later on the Ledger so far (ADR-119), so a report written after it
+        # scored report_missing. Unshared, without waiting: live citizens never answered a
+        # report_sharing ask (wave 1, judge report_missing every time) and R:210 allows it.
+        filed = await _file_report(city, message, chat, booking_id, citizen or "")
     if citizen and not protocol.we(chat, city.agent_id, token, to=citizen, word="checkin"):
         if reports:
             note = _specialist_arrival(chat, city.agent_id, booking_id, citizen, en)
@@ -3227,18 +3253,8 @@ async def _on_checked_in(
                 "le dico io a chi rivolgersi. Le auguro una buona visita."
             )
         await _say(city, citizen, f"checkin booking_id={booking_id} {note}")
-    if not reports:
-        return
-    if not citizen:
-        # Nobody to ask: file the report unshared (R:208).
-        await _file_report(city, message, chat, booking_id, "")
-        return
-    if _reported(chat, city.agent_id, booking_id):
-        return
-    # Live journeys (wave 1): citizens never answered a report_sharing ask and the judge scored
-    # report_missing every time. R:210 allows filing it unshared, which is never an
-    # over-disclosure: file the report now, in the check-in turn, without waiting.
-    await _file_report(city, message, chat, booking_id, citizen)
+    if filed is not None:
+        await _await_report(city, message, filed, booking_id)
 
 
 # A worry the citizen voices about the visit: acknowledged in plain words, never answered with
@@ -3398,23 +3414,28 @@ async def _file_report(
     chat: list[Message],
     booking_id: str,
     citizen: str,
-) -> None:
-    """Ledger first: the follow-up prescription when the case asks for one, then the report;
-    the citizen hears it after ``reported`` (_on_reported). Once per booking."""
+) -> list[Message] | None:
+    """Ledger first: the follow-up prescription when the case asks for one, then the report.
+    The case as read, or None if the report did not go out. The citizen hears it after
+    ``reported`` (_await_report, _on_reported). The caller sends it once per booking (_reported)."""
 
     token = f"booking_id={booking_id}"
-    if not protocol.we(chat, city.agent_id, token, to=LEDGER, word="report"):
-        number = ""
-        procedure = _follow_up(chat)
-        if procedure and citizen:
-            number, chat = await _prescribe_follow_up(
-                city, message.need_id, chat, booking_id, citizen, procedure
-            )
-        parts = ["report", token, f"outcome_code={_OUTCOME}"]
-        if number:
-            parts.append(f"follow_up_prescription_number={number}")
-        if not await _say(city, LEDGER, " ".join(parts)):
-            return
+    number = ""
+    procedure = _follow_up(chat)
+    if procedure and citizen:
+        number, chat = await _prescribe_follow_up(
+            city, message.need_id, chat, booking_id, citizen, procedure
+        )
+    parts = ["report", token, f"outcome_code={_OUTCOME}"]
+    if number:
+        parts.append(f"follow_up_prescription_number={number}")
+    return chat if await _say(city, LEDGER, " ".join(parts)) else None
+
+
+async def _await_report(
+    city: City, message: Message, chat: list[Message], booking_id: str
+) -> None:
+    token = f"booking_id={booking_id}"
     found = await _await_line(city, message.need_id, chat, "reported", token, op="report")
     if found is None:
         _LOG.info("care.report.missing", extra={"need_id": (message.need_id or "")[:48]})
