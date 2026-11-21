@@ -3209,6 +3209,126 @@ SCENARIOS.update({
 })
 
 
+
+# --- Centro prenotazioni, lingua che nessuno dei nostri medici parla (città 21/11, N-...0002770010, livello 4):
+# il gp passa il caso con lang=en, il centro offre h1; il need.request del cittadino con lang=sw incrocia le
+# offerte e arriva a un pod appena riavviato, poi i 3 cancel reason=lang. Il giro dai partner parte nel turno
+# del lang=sw, senza aspettare il Ledger (G2); le risposte a un giro vecchio contano (G5); le stesse offerte
+# non partono due volte (G6).
+
+
+def mother_tongue(b: Bus) -> None:
+    """Alle prime offerte del centro il cittadino scrive il suo need.request con lang=sw e rifiuta ogni
+    offerta con reason=lang, tutto insieme (i messaggi incrociano le offerte); poi si comporta come sempre."""
+    bc, react, done = b.ids["booking_centre"], b.citizen.react, []
+
+    def reacting(m: Message) -> None:
+        if m.sender == bc and act(m) == "offer" and not done:
+            done.append(m)
+            b.citizen.say(bc, f"need.request prescription_number={b.citizen.rx} lang=sw I need a doctor in my mother tongue.")
+            for o in parse_offers(m.text):
+                b.citizen.say(bc, f"cancel offer_id={o['offer_id']} reason=lang")
+            return
+        react(m)
+    b.citizen.react = reacting
+
+
+def restart_booking(before: str, slow_rx: float):
+    """Il pod del centro riparte (moduli ricaricati: CAL, _PAGES, _RULES, _CLOCK, _SENT vuoti) appena prima del
+    primo messaggio con il token ``before``; da lì la risposta a `prescription` tarda ``slow_rx`` s (città: minuti)."""
+    def setup(b: Bus) -> None:
+        deliver, bc, done = b.deliver, b.ids["booking_centre"], []
+
+        async def restarted(m: Message) -> None:
+            if not done and m.recipient == bc and before in m.text.split():
+                done.append(m)
+                b.agents[bc] = Agent("booking_centre")
+                b.agents[bc].main.__globals__["_RINGS"] = Rings(b.tasks)
+                late = b.ledger.late
+                b.ledger.late = lambda text: slow_rx if (text.split() or [""])[0] == "prescription" else late(text)
+            await deliver(m)
+
+        b.deliver = restarted
+    return setup
+
+
+def _partner_asks(b: Bus) -> list[Message]:
+    bc = b.ids["booking_centre"]
+    return [m for m in b.log if m.sender == bc and m.text.startswith("need.request") and m.recipient not in b.agents]
+
+
+def partners_in_lang_turn(b: Bus) -> str | None:
+    """Il need.request ai partner parte nel turno del lang=sw del cittadino, e la prima parola del centro al
+    cittadino dopo il lang=sw dice che cerca presso i partner (non «sto ancora controllando»)."""
+    bc = b.ids["booking_centre"]
+    sw = next((m for m in b.log if m.sender == CIT and m.recipient == bc and "lang=sw" in m.text.split()), None)
+    if sw is None:
+        return "il cittadino non ha scritto lang=sw: il centro non ha offerto nulla prima"
+    asks = _partner_asks(b)
+    if not asks:
+        return "nessun need.request ai partner"
+    opened = b.opened.get(b.turn_of[asks[0].msg_id])
+    if opened is not sw:
+        return f"need.request ai partner nel turno di «{(opened.text if opened else '')[:70]}», atteso quello del lang=sw"
+    first = next((m for m in b.log[b.log.index(sw):] if m.sender == bc and m.recipient == CIT), None)
+    if first is None or "partner facilities" not in first.text:
+        return f"dopo il lang=sw il centro dice «{first.text[:90] if first else ''}», atteso l'avviso dei partner"
+
+
+def offers_once(b: Bus) -> str | None:
+    """Mai lo stesso insieme di offerte due volte al cittadino."""
+    seen: list[frozenset[str]] = []
+    for _, m in _to_citizen(b):
+        if act(m) == "offer":
+            ids = frozenset(o.get("slot_id", "") for o in parse_offers(m.text))
+            if ids in seen:
+                return f"le stesse offerte due volte: {sorted(ids)}"
+            seen.append(ids)
+
+
+def first_round_late(b: Bus) -> None:
+    """Il primo partner pubblicato della fisiatria risponde al PRIMO giro solo quando parte il secondo,
+    con uno slot che va (città 21/11: risposte a 212-347 s, oltre un giro)."""
+    bc = b.ids["booking_centre"]
+    partner = next(iter(b.agents[bc].main.__globals__["_KNOWN_PARTNERS"]["hospital.physiatry"]))
+    b.partners, asked, add = [partner], [], b.add
+
+    def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+        m = add(sender, to, body, need, conv, kind)
+        if sender == bc and to == partner and m.text.startswith("need.request"):
+            asked.append(fields(m.text)["request_id"])
+            if len(asked) == 2:
+                b.queue.append(add(partner, bc, {"text": RING_OFFER.format(rid=asked[0], me=partner)}, need))
+        return m
+    b.add = adding
+
+
+def first_round_offered(b: Bus) -> str | None:
+    """Due giri, e lo slot che il partner ha dato per il primo arriva al cittadino."""
+    if len({fields(m.text)["request_id"] for m in _partner_asks(b)}) < 2:
+        return "un solo giro dai partner: il rifiuto dell'alternativa rilassata non ne ha aperto un secondo"
+    if not any(RING_SLOT in {o.get("slot_id") for o in parse_offers(m.text)} for _, m in _to_citizen(b) if act(m) == "offer"):
+        return f"lo slot del partner {RING_SLOT}, risposta al primo giro, non è arrivato al cittadino"
+
+
+SCENARIOS.update({
+    # Il pod del centro riparte prima del lang=sw e il Ledger tace (rules e prescription lente): il giro dai
+    # partner parte comunque nel turno del lang=sw, con i criteri del passaggio del gp.
+    "booking_lingua_rara_riavvio": dict(
+        start=("gp", PREF_EN), handoff=True,
+        setup=setups(slow_ledger("rules", 3.0), mother_tongue, restart_booking("lang=sw", 3.0)),
+        expect=[partners_in_lang_turn, offers_once]),
+    # Lo stesso senza riavvio.
+    "booking_lingua_rara": dict(
+        start=("gp", PREF_EN), handoff=True, setup=setups(slow_ledger("rules", 3.0), mother_tongue),
+        expect=[partners_in_lang_turn, offers_once]),
+    # Giro 1 muto, alternativa rilassata rifiutata (reason=deadline), giro 2; il partner risponde al giro 1 solo
+    # adesso: la sua offerta va al cittadino (G5).
+    "booking_partner_giro_vecchio": dict(
+        start=BACK, full_days=2, refuse_first="deadline", setup=setups(first_round_late, skips_ring_offers),
+        expect=[first_round_offered]),
+})
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"
