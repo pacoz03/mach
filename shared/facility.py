@@ -1798,6 +1798,15 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         and {"request_id", "procedure", "service_type"} & _fields(message).keys()
     ):
         await _cross_asst(city, message)
+    elif (
+        message.sender.startswith("agent:")
+        and not confirm
+        and ("need.request" in kind or message.type == "need.request")
+    ):
+        # A search without cross-ASST criteria (the conformance probe): nothing to book. End the
+        # turn now: custody.ack waits only ~5 s for the renew sent at turn end, and the booking
+        # branch's lock and second history read pushed it past that on a slow Relay (1.0.9 deploy).
+        return
     else:
         # One booking step at a time per case, on a fresh read of it: the held and committed
         # pushes open turns of their own while the confirm turn waits for the same lines, and
