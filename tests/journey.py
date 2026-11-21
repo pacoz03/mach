@@ -2068,6 +2068,76 @@ SCENARIOS.update({
 })
 
 
+
+# --- Il nostro centro prenotazioni chiede slot alle nostre strutture con un need.request come i
+# partner (stessa ASST, caso del cittadino): offerta subito, come agli altri centri. La sonda resta muta.
+
+
+def our_booking_asks(*asks: tuple[str, str]):
+    """Prima del primo turno il nostro centro manda a ogni struttura ``(cartella, testo)``."""
+    def setup(b: Bus) -> None:
+        for folder, text in asks:
+            b.queue.append(b.add(b.ids["booking_centre"], b.ids[folder], {"text": text}))
+    return setup
+
+
+def offered_to_booking(folder: str, rid: str, seconds: float):
+    """``folder`` risponde una volta al nostro centro per ``rid`` con 1-3 offerte sue, entro ``seconds`` s."""
+    def check(b: Bus) -> str | None:
+        me, bc, tok = b.ids[folder], b.ids["booking_centre"], f"request_id={rid}"
+        asked = next((m for m in b.log if m.sender == bc and m.recipient == me and tok in m.text.split()), None)
+        got = [m for m in b.log if m.sender == me and m.recipient == bc and tok in m.text.split()
+               and act(m) in ("offer", "cancel")]
+        if asked is None or len(got) != 1:
+            return f"{folder}: {len(got)} risposte al nostro centro per {rid} invece di una"
+        offers = parse_offers(got[0].text)
+        if act(got[0]) != "offer" or not 1 <= len(offers) <= 3:
+            return f"{folder}: al nostro centro «{got[0].text[:80]}», attese da 1 a 3 offerte"
+        if any(b.ledger.slots.get(o.get("slot_id", ""), {}).get("facility") != me for o in offers):
+            return f"{folder}: offerto al nostro centro uno slot non suo"
+        took = b.stamp[got[0].msg_id] - b.stamp[asked.msg_id]
+        if took >= seconds:
+            return f"{folder}: offerta al nostro centro dopo {took:.1f} s, attesa sotto {seconds} s"
+    return check
+
+
+SCENARIOS.update({
+    # Dopo la sonda (nessuna risposta), il nostro centro chiede la fisiatria all'ospedale.
+    "booking_nostro_ospedale": dict(
+        start=("hospital", "need.request service=lab summary=visit district=8"), foreign=True,
+        setup=our_booking_asks(("hospital", XFIS.format(rid="x-ours1", extra=""))),
+        expect=[offered_to_booking("hospital", "x-ours1", 4.0), never_from_hospital_to(FOREIGN)]),
+    "booking_nostro_specialista": dict(
+        start=("specialist_care", "need.request service=lab summary=visit district=8"), foreign=True,
+        setup=our_booking_asks(("specialist_care", XREQ.format(
+            svc="specialist_care.cardiology", proc="VIS-CARD", rid="x-ours2"))),
+        expect=[offered_to_booking("specialist_care", "x-ours2", 4.0),
+                never_from_hospital_to(FOREIGN, "specialist_care")]),
+    "booking_nostro_consultorio": dict(
+        start=("family_counseling", "need.request service=lab summary=visit district=8"), foreign=True,
+        setup=our_booking_asks(("family_counseling", XREQ.format(
+            svc="family_counseling.gynecology", proc="CONS-GIN", rid="x-ours3"))),
+        expect=[offered_to_booking("family_counseling", "x-ours3", 4.0),
+                never_from_hospital_to(FOREIGN, "family_counseling")]),
+})
+
+
+SCENARIOS.update({
+    # Consultorio, S vuoto (c1 è una dottoressa, il cittadino vuole un medico uomo): l'alternativa
+    # rilassata va come offer di uno slot fuori preferenza (R:232, R:678), mai come data.request
+    # purpose=alternative, uno scopo che il kit non ha e a cui il cittadino non risponde (R:124, R:188).
+    "consultorio_alternativa_offerta": dict(
+        start=("family_counseling", "Buongiorno, vorrei una visita ginecologica con un medico uomo. lang=it"),
+        expect=[never_told("family_counseling", "purpose=alternative", cite="R:124/188"),
+                told("family_counseling", "offer", "offer_id=", "slot_id=", cite="R:232"),
+                wrote("checkin", "R:232/234")]),
+    # Review, proattività (+1 solo per un passo in più, vero): il benvenuto nomina lo scambio con il
+    # centro prenotazioni e il lavoro già fatto sul Ledger; la conferma d'arrivo dice cosa fare dopo.
+    "ospedale_benvenuto_proattivo": dict(start=BACK, expect=[
+        told_text("hospital", "Il suo centro prenotazioni mi ha passato la sua richiesta", cite="review"),
+        told_text("hospital", "ho registrato il suo arrivo sul Ledger", cite="review"), *CHECKED_IN]),
+})
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"

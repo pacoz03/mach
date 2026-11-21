@@ -806,15 +806,16 @@ def _receipt_note(chat: list[Message], agent: str, slot_id: str, booking_id: str
     if _en(chat):
         head = f"Your appointment is booked for {when}." if when else "Your appointment is booked."
         return (
-            f" {head} On the day, when you arrive, check in with your booking code {booking_id}."
-            " I am here if you need anything."
+            f" {head} On the day, when you arrive, write to me here with your booking code "
+            f"{booking_id}: I will register your check-in myself. I am here if you need anything."
         )
     head = f"La sua prenotazione è confermata per {when}." if when else (
         "La sua prenotazione è confermata."
     )
     return (
-        f" {head} Il giorno della visita, al suo arrivo, faccia il check-in con il codice di "
-        f"prenotazione {booking_id}. Per qualsiasi cosa sono a sua disposizione."
+        f" {head} Il giorno della visita, al suo arrivo, mi scriva qui con il codice di "
+        f"prenotazione {booking_id}: registro io il check-in. Per qualsiasi cosa sono a sua "
+        "disposizione."
     )
 
 
@@ -1134,15 +1135,22 @@ async def _advance_alone(
             )
             await _say(city, citizen, "data.request purpose=booking fields=days " + note)
         elif fixed == "CONS-GIN" and family_alternative:
+            # S is empty: the relaxed alternative goes out as an offer outside the preferences
+            # (R:232, R:678). The kit has no purpose=alternative and the citizen answers only a
+            # purpose it accepts (R:124, R:188).
             spec = _DOCTORS[family_alternative["doctor_id"].rsplit("-", 1)[-1]]
-            lang = preferences.get("lang", "it")
-            lang = lang if lang in spec[0] else "it"
-            day = family_alternative.get("day", "")
-            note = (f"No slot meets all your requirements. An alternative is available: language {lang}, "
-                    f"doctor gender {spec[1]}, day {day}. May I search with these criteria? I have not booked anything."
-                    if en else f"Nessun posto rispetta tutti i vincoli. Posso cercare con lingua {lang}, "
-                    f"medico {'donna' if spec[1] == 'f' else 'uomo'}, giorno {day}? Non ho prenotato nulla.")
-            await _say(city, citizen, f"data.request purpose=alternative fields=accept lang={lang} gender={spec[1]} days={day} {note}")
+            langs = "/".join(sorted(spec[0]))
+            at = _when(family_alternative["at"])
+            when = _family_date(at, en) if at else family_alternative.get("day", "")
+            note = (f"No appointment meets all your preferences. The closest free one is {when}, with a "
+                    f"{'female' if spec[1] == 'f' else 'male'} doctor (languages: {langs}). I have not "
+                    "booked anything: if it suits you, reply with your consent reference and I will book it."
+                    if en else f"Nessun appuntamento rispetta tutte le sue preferenze. Il primo libero più "
+                    f"vicino è {when}, con {'una dottoressa' if spec[1] == 'f' else 'un medico uomo'} "
+                    f"(lingue: {langs}). Non ho prenotato nulla: se le va bene, mi risponda con il "
+                    "riferimento del consenso e lo prenoto.")
+            if await _say(city, citizen, f"{_offer_line(family_alternative, None, priority)}\n{note}"):
+                sent.offers.add(family_alternative["slot_id"])
         else:
             await _say(city, citizen, _NO_SLOTS_EN if en else _NO_SLOTS)
 
@@ -2912,12 +2920,20 @@ async def _welcome(
                     if at
                     else "in the half day of the visit (08:00-13:00 or 13:00-18:00)"
                 )
+                # Review (proactivity +1): the exchange with the booking centre and the work
+                # already done, then concrete next steps. Only facts of the case: the receipt
+                # went to the booking party after the Ledger's committed.
                 note = (
                     f"Hello, this is {place_en}: your "
-                    f"booking is confirmed and registered{when}. Your booking code is "
+                    f"booking is confirmed and registered{when}. Your booking centre passed me "
+                    "your request: I have already registered the booking on the Ledger and sent "
+                    f"it the receipt. Your booking code is "
                     f"{booking_id}. On the day, as soon as you arrive ({window}), write to me "
                     f"that you are here with the code {booking_id}: I will register your arrival "
-                    "and you need do nothing else. For any question, just write to me here."
+                    "and you need do nothing else. If the time no longer suits you, tell your "
+                    "booking centre and it can move the visit. If you feel worse in the meantime, "
+                    "contact your GP; in an emergency call 112. For any question, just write to "
+                    "me here."
                 )
             else:
                 when = f" per {_in_words(at, False)}" if at else ""
@@ -2928,10 +2944,15 @@ async def _welcome(
                 )
                 note = (
                     f"Buongiorno, sono {place_it}: la prenotazione "
-                    f"è confermata e registrata{when}. Il suo codice di prenotazione è "
+                    f"è confermata e registrata{when}. Il suo centro prenotazioni mi ha passato "
+                    "la sua richiesta: ho già registrato la prenotazione sul Ledger e gli ho "
+                    f"mandato la ricevuta. Il suo codice di prenotazione è "
                     f"{booking_id}. Il giorno della visita, appena arriva ({window}), mi scriva "
                     f"che è qui con il codice {booking_id}: registro io il suo arrivo e non deve "
-                    "fare altro. Per qualsiasi domanda mi scriva pure qui, sono a sua disposizione."
+                    "fare altro. Se l'orario non le va più bene, lo dica al centro prenotazioni: "
+                    "può spostare la visita. Se nel frattempo si sente peggio, si rivolga al suo "
+                    "medico di base; in emergenza chiami il 112. Per qualsiasi domanda mi scriva "
+                    "pure qui, sono a sua disposizione."
                 )
             await _say(city, citizen, " ".join(parts) + " " + note)
             await _tell_gp(city, chat, booking_id, entry["slot"], facts, at)
@@ -3386,12 +3407,17 @@ async def _on_checked_in(
         if reports:
             note = _specialist_arrival(chat, city.agent_id, booking_id, citizen, en)
         else:
+            # Review (proactivity +1): the Ledger's checked_in is the work already done; then
+            # where to turn after the visit, never a clinical indication.
             note = (
-                "Thank you, your arrival is registered: there is nothing else you need to do. "
-                "I wish you a good visit."
+                "Thank you, I have registered your arrival on the Ledger: there is nothing else "
+                "you need to do. If after the visit you have a question or need another "
+                "appointment, write to me here and I will tell you who to contact. I wish you a "
+                "good visit."
                 if en
-                else "Grazie, il suo arrivo è registrato: non deve fare altro. Le auguro una buona "
-                "visita."
+                else "Grazie, ho registrato il suo arrivo sul Ledger: non deve fare altro. Se dopo "
+                "la visita ha una domanda o le serve un altro appuntamento, mi scriva pure qui e "
+                "le dico io a chi rivolgersi. Le auguro una buona visita."
             )
         await _say(city, citizen, f"checkin booking_id={booking_id} {note}")
     if not reports:
