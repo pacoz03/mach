@@ -1,0 +1,14 @@
+agent_id: agent:h6krzxx6es83
+team: team:the-promptfather-s
+name: specialist_care
+version: 1.0.16
+cap_versions:
+  - "1.0"
+profiles:
+  - mhm/1.0
+role: facility
+capabilities:
+  - specialist_care.cardiology
+no_clinical_advice: true
+endpoints:
+  mailbox: agent:h6krzxx6es83

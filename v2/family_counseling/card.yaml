@@ -1,0 +1,14 @@
+agent_id: agent:yg8debxe3x0p
+team: team:the-promptfather-s
+name: family_counseling
+version: 1.0.13
+cap_versions:
+  - "1.0"
+profiles:
+  - mhm/1.0
+role: facility
+capabilities:
+  - family_counseling.gynecology
+no_clinical_advice: true
+endpoints:
+  mailbox: agent:yg8debxe3x0p
