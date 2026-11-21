@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Rete di sicurezza del refactoring (step 0 di docs/refactor/piano.md): tutti i controlli in parallelo,
 # una riga per controllo, uscita 0 solo se è tutto verde. Non lancia shared/sync.sh (riscrive i file).
-# Uso: bash tests/check.sh [-k <testo>]    (-k passa a tests/journey.py)
+# Uso: bash tests/check.sh [-k <testo>] [--chaos] [--arena]    (-k passa a tests/journey.py)
 set -u
 cd "$(dirname "$0")/.."
-K=() CHAOS=0
+K=() CHAOS=0 ARENA=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -k) K=(-k "$2"); shift 2 ;;
     --chaos) CHAOS=1; shift ;;   # anche tests/chaos.py (~4 min, ~6 GB RAM): all'integrazione di codice degli agenti
+    --arena) ARENA=1; shift ;;   # anche il cricchetto dell'arena, tests/arena_score.py (~4 min)
     *) shift ;;
   esac
 done
@@ -33,6 +34,7 @@ run pytest-family_counseling "${PYTEST[@]}" family_counseling/tests
 run pytest-unit              "${PYTEST[@]}" tests/unit
 for a in $AGENTS; do run "card-$a" city card validate "$a"; done
 [ "$CHAOS" = 1 ] && run chaos "$PY" -B tests/chaos.py
+[ "$ARENA" = 1 ] && run arena "$PY" -B tests/arena_score.py
 wait
 
 fails=()
@@ -56,6 +58,10 @@ done
 if [ "$CHAOS" = 1 ]; then
   tail -3 "$LOG/chaos.log" | sed 's/^/chaos: /'
   ok chaos || fails+=(chaos)
+fi
+if [ "$ARENA" = 1 ]; then
+  cat "$LOG/arena.log"
+  ok arena || fails+=(arena)
 fi
 files=0 diff=()
 for a in $AGENTS; do files=$((files+1)); cmp -s shared/tools.py "$a/agent/tools.py" || diff+=("$a/agent/tools.py"); done
