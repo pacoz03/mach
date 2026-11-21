@@ -12,12 +12,18 @@
 # 2026-11-21 scadenze feriali, slot condivisi dopo i partner, un confirm per slot: 194 (0 risolte; 6 nuove, tutte negli scenari aggiunti booking_slot_scarsi*, booking_confirm_doppio, solo con restart e two_pods: claim e _sent vivono nella memoria del pod, quindi un pod riavviato o un secondo pod non vede l'offerta o il confirm dell'altro caso; in città il booking ha un solo pod)
 # 2026-11-21 riofferta nello stesso turno, margine di 16 h come preferenza, scadenze in ore di calendario, partner Isola/EPICA: 208 (10 risolte lasciate finché una seconda corsa non le conferma; 12 nuove: 8 gemelle di righe già qui: redeliver booking_riofferta_dopo_annullo come ospedale_slot_rubato (l'ospedale ripete l'hold); say_tnv booking_margine_16h e booking_slot_scarsi_ring come booking_ricetta_muta (l'ospedale rimanda la ricevuta); say_tnv booking_riofferta_dopo_annullo e hostile booking_margine_u come booking_rifiuto_subito (offerta rimandata, uguale su master); ledger_lost gp_preferenze «hospital muto dopo checkin» come le 20 della finestra del richiedente (con days=mon e 16 h il booking legge 4 pagine e la risposta persa cade sul checkin); 3 say_tnv turns già rosse su master 6b98bb0 (ospedale_hold_scaduto, gp_rinnovo_a_parole_lento, ospedale_annullo_dal_centro: commit di Giuseppe dopo 7eaff04)
 # 2026-11-21 MACH-2.1 lato booking (token del need.request, ondate R3, R17/R18, taken): 213 (10 risolte lasciate; 5 nuove: ledger_late/ledger_reorder booking_mach21_richiesta: senza la risposta agenda il pod non ha orologio e non manda after/deadline invece di inventarli (voluto); ledger_lost booking_mach21_ondate «booking muto dopo confirm» come le altre ledger_lost «muto» qui; say_tnv plain booking_slot_scarsi_ring: offerta rimandata dopo TNV come booking_rifiuto_subito)
+# 2026-11-21 strutture W1+W2 (16 h, scadenze da calendar.deadline, guardia sui confirm, P2 nel consultorio, fuga di dati, referto prima del check-in): 247 (10 risolte lasciate, la famiglia instabile sotto carico come in 0ef1032; 34 nuove, tutte nei 13 scenari aggiunti delle strutture: restart/two_pods per lo stato nel pod, redeliver/ledger_late/ledger_reorder/clock_lost come le gemelle consultorio_* già qui, ledger_lost sui check-in rifiutati come «muto dopo checkin», say_tnv come cross_asst_*)
 clock_lost plain consultorio_alternativa_offerta
 clock_lost plain consultorio_annullata
+clock_lost plain consultorio_non_mi_va_bene
+clock_lost plain consultorio_non_vedo_lora
 clock_lost plain consultorio_senza_ricetta
 clock_lost turns consultorio_alternativa_offerta
 clock_lost turns consultorio_annullata
 clock_lost turns consultorio_checkin_lento
+clock_lost turns consultorio_checkin_rifiutato_push
+clock_lost turns consultorio_non_mi_va_bene
+clock_lost turns consultorio_non_vedo_lora
 clock_lost turns consultorio_senza_ricetta
 hostile plain booking_lingua_rara
 hostile plain booking_lingua_rara_riavvio
@@ -46,9 +52,17 @@ ledger_late turns booking_rifiuto_giorno
 ledger_late turns booking_world_in_cache
 ledger_late turns consultorio_alternativa_offerta
 ledger_late turns consultorio_annullata
+ledger_late turns consultorio_cancel_correlabile
 ledger_late turns consultorio_checkin_lento
+ledger_late turns consultorio_checkin_rifiutato_push
+ledger_late turns consultorio_consenso_p2
 ledger_late turns consultorio_hold_duplicate
+ledger_late turns consultorio_non_mi_va_bene
+ledger_late turns consultorio_non_vedo_lora
+ledger_late turns consultorio_partner_agenda_tardiva
+ledger_late turns consultorio_scritture_lente
 ledger_late turns consultorio_senza_ricetta
+ledger_late turns consultorio_solo_consenso_cross
 ledger_late turns gp_rinnovo_p1_lento
 ledger_late turns ospedale_confirm_doppio
 ledger_late turns ospedale_giu_poi_su
@@ -85,6 +99,7 @@ ledger_lost turns booking_rifiuto_giorno
 ledger_lost turns booking_rifiuto_subito
 ledger_lost turns booking_world_in_cache
 ledger_lost turns consultorio_alternativa_offerta
+ledger_lost turns consultorio_checkin_rifiutato_push
 ledger_lost turns cross_asst_push_reale
 ledger_lost turns cross_asst_riavvio
 ledger_lost turns cross_asst_riavvio_hold
@@ -102,6 +117,7 @@ ledger_lost turns gp_stesso_sintomo
 ledger_lost turns ospedale_benvenuto_proattivo
 ledger_lost turns ospedale_hold_scaduto
 ledger_lost turns p1_ricetta_scaduta
+ledger_lost turns specialista_checkin_rifiutato_push
 ledger_lost turns welcome_lang_en_partner
 ledger_reorder turns booking_lingua_rara
 ledger_reorder turns booking_lingua_rara_riavvio
@@ -113,7 +129,12 @@ ledger_reorder turns booking_passaggio_subito
 ledger_reorder turns booking_rifiuto_giorno
 ledger_reorder turns booking_world_in_cache
 ledger_reorder turns consultorio_alternativa_offerta
+ledger_reorder turns consultorio_cancel_correlabile
+ledger_reorder turns consultorio_consenso_p2
 ledger_reorder turns consultorio_hold_duplicate
+ledger_reorder turns consultorio_partner_agenda_tardiva
+ledger_reorder turns consultorio_scritture_lente
+ledger_reorder turns consultorio_solo_consenso_cross
 ledger_reorder turns gp_rinnovo_p1_lento
 ledger_reorder turns ospedale_confirm_doppio
 ledger_reorder turns ospedale_giu_poi_su
@@ -124,6 +145,8 @@ redeliver plain booking_lingua_rara_riavvio
 redeliver plain booking_partner_dopo_intoppo
 redeliver plain booking_riofferta_dopo_annullo
 redeliver plain checkin_rifiutato
+redeliver plain consultorio_cancel_correlabile
+redeliver plain consultorio_non_vedo_lora
 redeliver plain facility_cancel
 redeliver plain gp_rinnovo_p1_lento
 redeliver plain injection_facility
@@ -140,6 +163,9 @@ redeliver turns booking_lingua_rara_riavvio
 redeliver turns booking_partner_dopo_intoppo
 redeliver turns booking_riofferta_dopo_annullo
 redeliver turns checkin_rifiutato
+redeliver turns consultorio_cancel_correlabile
+redeliver turns consultorio_non_vedo_lora
+redeliver turns consultorio_scritture_lente
 redeliver turns facility_cancel
 redeliver turns gp_rinnovo_p1_lento
 redeliver turns injection_facility
@@ -151,14 +177,18 @@ redeliver turns ospedale_riavvio_alternative
 redeliver turns ospedale_slot_rubato
 redeliver turns p1_rinnovo_prenota
 redeliver turns p1_rinnovo_prenota_cittadino
+redeliver turns specialista_scritture_lente
 restart plain booking_letture_rare
 restart plain booking_slot_scarsi
 restart plain booking_slot_scarsi_ring
 restart plain cross_asst_rinfresco_raro
 restart plain ospedale_commit_unico
+restart plain specialista_slot_conteso
 restart turns booking_world_in_cache
 restart turns cross_asst_rinfresco_raro
+restart turns specialista_slot_conteso
 say_timeout plain booking_ricetta_riscritta
+say_timeout plain consultorio_non_mi_va_bene
 say_timeout turns booking_ricetta_riscritta
 say_tnv plain booking_redirect_pagina_due
 say_tnv plain booking_ricetta_muta
@@ -180,10 +210,12 @@ say_tnv turns cardiologia_referto
 say_tnv turns checkin_conferma_prosa
 say_tnv turns consultorio_alternativa_offerta
 say_tnv turns consultorio_annullata
+say_tnv turns consultorio_non_vedo_lora
 say_tnv turns consultorio_senza_ricetta
 say_tnv turns cross_asst_distribuite
 say_tnv turns cross_asst_finestra
 say_tnv turns cross_asst_orologio_nota
+say_tnv turns cross_asst_pagina2_tardiva
 say_tnv turns cross_asst_push_reale
 say_tnv turns cross_asst_riavvio
 say_tnv turns gp_rinnovo_a_parole_lento
@@ -203,6 +235,7 @@ say_tnv turns p1_rinnovo_prenota_cittadino
 say_tnv turns ricevuta_slot_specialista
 say_tnv turns specialista_annullata
 say_tnv turns specialista_finestra
+say_tnv turns specialista_richieste_incrociate
 two_pods plain booking_confirm_doppio
 two_pods plain booking_letture_rare
 two_pods plain booking_partner_dopo_intoppo
@@ -214,6 +247,7 @@ two_pods plain cross_asst_orologio_memoria
 two_pods plain cross_asst_rinfresco_raro
 two_pods plain ospedale_alternative
 two_pods plain ospedale_commit_unico
+two_pods plain specialista_slot_conteso
 two_pods turns booking_confirm_doppio
 two_pods turns booking_letture_rare
 two_pods turns booking_lingua_rara
@@ -225,3 +259,4 @@ two_pods turns cross_asst_orologio_memoria
 two_pods turns cross_asst_orologio_nota
 two_pods turns cross_asst_rinfresco_raro
 two_pods turns ospedale_commit_unico
+two_pods turns specialista_slot_conteso
