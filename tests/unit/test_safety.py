@@ -5,7 +5,6 @@ uv run --no-project --with city-sdk==0.9.202 --with pytest python -m pytest -q t
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -17,21 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "shared"))
 from mach import safety  # noqa: E402
 
-V1_FILES = ("gp/agent/agent.py", "booking_centre/agent/agent.py", "shared/facility.py")
-
-
-def _v1(path: str):
-    """``red_flag`` della copia v1 nel file, caricata come la carica il pod; None dopo l'adozione."""
-    name = "safety_v1_" + path.split("/")[0]
-    spec = importlib.util.spec_from_file_location(name, ROOT / path)
-    module = sys.modules[name] = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.red_flag if hasattr(module, "_RED_FLAG") else None
-
-
-V1 = [f for f in map(_v1, V1_FILES) if f is not None]
-
-# Frasi su cui scattano tutte e tre le copie v1 (almeno una per riga della tabella).
+# Frasi su cui scattavano tutte e tre le copie v1 (almeno una per riga della tabella), prima che
+# gp, booking e strutture adottassero safety: safety non deve perderne nessuna.
 V1_FIRES = [
     "Ho un forte dolore al petto da stamattina.",
     "forti dolori al petto da stamattina",
@@ -111,6 +97,12 @@ V1_FIRES = [
     "convulsions",
     "I'm paralysed",
     "Sorry, I can't breathe properly since this morning and I nearly fainted",
+    # «non solo» aggiunge, non nega; perdita del controllo con più parole o altre parole (21/11)
+    "ho un dolore non solo al petto ma anche al braccio sinistro",
+    "pain not only in my chest but also in my arm",
+    "non riesco più a controllare l'intestino",
+    "sono incapace di controllare la vescica",
+    "ho poco controllo della vescica",
 ]
 
 # v1 scatta, safety no: negazioni che v1 non vede e parole che contengono «petto».
@@ -228,6 +220,8 @@ INNOCENT = {
         "Il centro prenotazioni dice che la ricetta è scaduta, me la può rinnovare?",
         "Purtroppo martedì non riesco più a venire",
         "Ho avuto un controllo della vescica l'anno scorso, tutto bene",
+        "Non riesco a venire al controllo della vescica, poco dopo il lavoro è difficile",
+        "Ho dolore al ginocchio, non al petto",
     ],
     "en": [
         "I need a knee visit",
@@ -294,17 +288,13 @@ INNOCENT = {
 }
 
 
-@pytest.mark.skipif(not V1, reason="gli agenti usano già safety")
 @pytest.mark.parametrize("text", V1_FIRES)
 def test_parity_with_v1(text):
-    assert all(f(text) for f in V1), "il corpus deve far scattare v1"
     assert safety.red_flag(text)
 
 
-@pytest.mark.skipif(not V1, reason="gli agenti usano già safety")
 @pytest.mark.parametrize("text", V1_FALSE_POSITIVES)
 def test_v1_false_positives_are_fixed(text):
-    assert all(f(text) for f in V1)
     assert not safety.red_flag(text)
 
 

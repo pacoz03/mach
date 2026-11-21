@@ -52,7 +52,8 @@ _CHEST = r"(?:petto|th?ora[cx]\w*|chest|pecho|poitrine|brust\w*|gjoks\w*)"
 _LEFT_ARM = r"(?:braccio sinistro|left arm|brazo izquierdo|bras gauche|linke\w* arm|krah\w* (?:e |i )?majte)"
 _LEGS = r"(?:gamb\w*|legs?\b|piern\w*|jambes?\b|beine?n?\b|kemb\w*)"
 # Fino a quattro parole tra dolore e petto, nessuna una negazione: «knee pain, not chest pain».
-_NEAR = rf"\W+(?:(?!(?:{_NEG})\b)\w+\W+){{0,4}}?"
+# «non solo», «not only/just» aggiungono, non negano: «dolore non solo al petto» conta.
+_NEAR = rf"\W+(?:(?!(?:{_NEG})\b(?!\W+(?:solo|soltanto|only|just)\b))\w+\W+){{0,4}}?"
 _UPTO2 = r"\W+(?:\w+\W+){0,2}?"
 _UPTO3 = r"\W+(?:\w+\W+){0,3}?"
 _RED_FLAG = re.compile(r"\b(?:" + "|".join((
@@ -89,8 +90,9 @@ _RED_FLAG = re.compile(r"\b(?:" + "|".join((
     r"in[ck]ontinen\w*",
     r"(?:loss of|lost|can'?t control)" + _UPTO2 + r"(?:bladder|bowel)",
     # «perdo il controllo della vescica»; il solo «controllo della vescica» è una visita
-    r"(?:perd\w*|pers\w*|perte|lost|losing|loss|verlier\w*|verlor\w*|humb\w*|non|no|nuk|keine?|can'?t|cannot"
-    r"|problem\w*|dif+ic\w*|fatic\w*|trouble)" + _UPTO2 + r"(?:controll?\w*|kontroll\w*)" + _UPTO3
+    r"(?:perd\w*|pers\w*|perte|lost|losing|loss|verlier\w*|verlor\w*|humb\w*|non riesco|non|no|nuk|keine?|can'?t"
+    r"|cannot|problem\w*|dif+ic\w*|fatic\w*|incapac\w*|trouble|(?:poco|scars[oa]|mancat[oa])(?=\W+controll))"
+    + _UPTO2 + r"(?:controll?\w*|kontroll\w*)" + _UPTO3
     + r"(?:vescica|intestin\w*|sfinter\w*|bladder|bowel\w*|vejiga|esfinter\w*|vessie|blase|darm\w*|fshikez\w*|zorr\w*)",
     # sangue
     r"(?:sput\w*|tossisc\w*|tos\w*|vomi\w*|perd\w*|cough\w*|spit\w*|escup\w*|crach\w*|touss\w*|hust\w*"

@@ -39,6 +39,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 import tools  # noqa: E402  (shared/tools.py, copied by shared/sync.sh; best effort, never raises)
 from mach import calendar, case, protocol  # noqa: E402  (shared/mach/, copied by shared/sync.sh)
 from mach.protocol import fields_of, first_word, words  # noqa: E402
+from mach.safety import red_flag  # noqa: E402  (red flag in 6 lingue con la negazione, come il gp)
 
 # Module state (plan step 5: a = from history, b = declared cache with TTL and size, c = fact).
 # The case itself (prescription, offers, refusals, consents, preferences, hand-off) is read from
@@ -319,57 +320,6 @@ _PHRASES: dict[str, dict[str, str]] = {
         ),
     },
 }
-
-# Red flags in the citizen's own words (it/en, any tone), on text without accents. The city's
-# protocol lists red flags as codes (RF-...), which a citizen does not write: words it is.
-# Same table as gp/agent/agent.py: change both.
-_PAIN = r"(?:dolor\w*|mal(?:e|issimo)?\b|fitt\w*|strett\w*|oppress\w*|bruci\w*|pain\w*|hurt\w*|ach\w*|tight\w*|pressure|squeez\w*)"
-_CHEST = r"(?:petto|torace|chest)"
-_NEAR = r"\W+(?:\w+\W+){0,4}?"
-_RED_FLAG = re.compile(
-    "|".join(
-        (
-            _PAIN + _NEAR + _CHEST,
-            _CHEST + _NEAR + _PAIN,
-            r"peso (?:sul|al) petto|dolor\w* toracic\w*",
-            r"(?:dolor\w*|male|pain\w*|hurt\w*)" + _NEAR + r"(?:braccio sinistro|left arm)",
-            r"fiato corto|cort\w* di fiato|senza fiato|affann\w*|dispne\w*",
-            r"manc\w*\W+(?:\w+\W+){0,2}?(?:fiato|respiro|aria)\b",
-            r"(?:non riesco|fatic\w*|difficolt\w*)\W+(?:\w+\W+){0,2}?respir\w*",
-            r"short(?:ness)? of breath|out of breath|breathless\w*",
-            r"(?:can'?t|cannot|hard to|trouble|difficult\w*|struggl\w*)\W+(?:\w+\W+){0,2}?breath\w*",
-            r"svenu\w*|svenim\w*|sven(?:go|gono|ire)\b|(?:pers\w*|perdo)\W+(?:i sensi|conoscenza|coscienza)",
-            r"faint(?:ed|ing)\b|(?:feel\w*|felt) faint|pass(?:ed|ing)? out|lost consciousness|black(?:ed)? out",
-            r"(?:perdita di forza|perdo (?:la )?forza|debolezza|non sento)\W+(?:\w+\W+){0,3}?gamb\w*",
-            r"gamb\w*\W+(?:\w+\W+){0,2}?(?:cedono|non (?:mi )?(?:reggono|rispondono)|paralizzat\w*)",
-            r"(?:loss of strength|losing strength|weakness|can'?t feel)\W+(?:\w+\W+){0,3}?legs?\b",
-            r"legs?\W+(?:\w+\W+){0,2}?(?:giving (?:out|way)|gave (?:out|way)|won'?t hold)",
-            r"incontinen\w*|(?:controll\w*|controllo)\W+(?:\w+\W+){0,2}?(?:vescica|intestino|sfinter\w*)",
-            r"(?:loss of|lost|can'?t control)\W+(?:\w+\W+){0,2}?(?:bladder|bowel)",
-            r"(?:sput\w*|tossisc\w*|tosse con|vomit\w*|perd\w*)\W+(?:\w+\W+){0,2}?sangue",
-            r"sangue\W+(?:\w+\W+)?(?:nelle urine|nelle feci|nel vomito|dalla bocca)",
-            r"sanguin\w*\W+(?:\w+\W+)?(?:molto|tanto|abbondant\w*|non si ferma)|emorragi\w*",
-            r"(?:cough\w*|vomit\w*|spit\w*)\W+(?:\w+\W+)?blood|blood in (?:my |the )?(?:urine|stool|vomit)",
-            r"bleed\w*\W+(?:\w+\W+)?(?:heavily|a lot|won'?t stop)|heavy bleeding|h(?:a)?emorrhag\w*",
-            r"paralis\w*|paralizz\w*|paraly\w*|(?:faccia|bocca) storta|slurred speech|face droop\w*",
-            r"convulsion\w*|seizure\w*|crisi epilettic\w*",
-        )
-    )
-)
-# "non ho dolore al petto": a negation right before the words is not a red flag.
-_NEGATED = re.compile(
-    r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
-    r"\s+(?:\w+\s+)?$"
-)
-
-
-def red_flag(text: str) -> bool:
-    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
-    lowered = plain.decode().lower()
-    return any(
-        not _NEGATED.search(lowered[max(0, match.start() - 40) : match.start()])
-        for match in _RED_FLAG.finditer(lowered)
-    )
 
 
 async def main(need: Need, city: City) -> None:

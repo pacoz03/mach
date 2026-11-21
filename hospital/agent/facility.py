@@ -30,6 +30,7 @@ import tools
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope
 from mach import protocol
 from mach.protocol import fields_of, first_word, words
+from mach.safety import red_flag
 
 _MAX_PAGE = 8
 # Four agenda hours is about half a minute of real time at 480x, so a slot is still
@@ -97,59 +98,6 @@ _SENT_NEEDS = 4096
 _OUTCOME = "VISIT"
 # Catalogue code of the cardiology control visit (city-cli chat_play CODES: "cardiology follow-up").
 _CONTROL = "CTRL-CARD"
-# Red flags in the citizen's own words (it/en), on text without accents. Copied from the gp
-# (gp/agent/agent.py): the consultorio is a front door too and the first agent holding a
-# red-flag case must escalate (R:242). ponytail: two copies until the shared tool (plan T).
-_PAIN = (
-    r"(?:dolor\w*|mal(?:e|issimo)?\b|fitt\w*|strett\w*|oppress\w*|bruci\w*|pain\w*|hurt\w*"
-    r"|ach\w*|tight\w*|pressure|squeez\w*)"
-)
-_CHEST = r"(?:petto|torace|chest)"
-_NEAR = r"\W+(?:\w+\W+){0,4}?"
-_RED_FLAG = re.compile(
-    "|".join(
-        (
-            _PAIN + _NEAR + _CHEST,
-            _CHEST + _NEAR + _PAIN,
-            r"peso (?:sul|al) petto|dolor\w* toracic\w*",
-            r"(?:dolor\w*|male|pain\w*|hurt\w*)" + _NEAR + r"(?:braccio sinistro|left arm)",
-            r"fiato corto|cort\w* di fiato|senza fiato|affann\w*|dispne\w*",
-            r"manc\w*\W+(?:\w+\W+){0,2}?(?:fiato|respiro|aria)\b",
-            r"(?:non riesco|fatic\w*|difficolt\w*)\W+(?:\w+\W+){0,2}?respir\w*",
-            r"short(?:ness)? of breath|out of breath|breathless\w*",
-            r"(?:can'?t|cannot|hard to|trouble|difficult\w*|struggl\w*)"
-            r"\W+(?:\w+\W+){0,2}?breath\w*",
-            r"svenu\w*|svenim\w*|sven(?:go|gono|ire)\b"
-            r"|(?:pers\w*|perdo)\W+(?:i sensi|conoscenza|coscienza)",
-            r"faint(?:ed|ing)\b|(?:feel\w*|felt) faint|pass(?:ed|ing)? out|lost consciousness"
-            r"|black(?:ed)? out",
-            r"(?:perdita di forza|perdo (?:la )?forza|debolezza|non sento)"
-            r"\W+(?:\w+\W+){0,3}?gamb\w*",
-            r"gamb\w*\W+(?:\w+\W+){0,2}?"
-            r"(?:cedono|non (?:mi )?(?:reggono|rispondono)|paralizzat\w*)",
-            r"(?:loss of strength|losing strength|weakness|can'?t feel)\W+(?:\w+\W+){0,3}?legs?\b",
-            r"legs?\W+(?:\w+\W+){0,2}?(?:giving (?:out|way)|gave (?:out|way)|won'?t hold)",
-            r"incontinen\w*"
-            r"|(?:controll\w*|controllo)\W+(?:\w+\W+){0,2}?(?:vescica|intestino|sfinter\w*)",
-            r"(?:loss of|lost|can'?t control)\W+(?:\w+\W+){0,2}?(?:bladder|bowel)",
-            r"(?:sput\w*|tossisc\w*|tosse con|vomit\w*|perd\w*)\W+(?:\w+\W+){0,2}?sangue",
-            r"sangue\W+(?:\w+\W+)?(?:nelle urine|nelle feci|nel vomito|dalla bocca)",
-            r"sanguin\w*\W+(?:\w+\W+)?(?:molto|tanto|abbondant\w*|non si ferma)|emorragi\w*",
-            r"(?:cough\w*|vomit\w*|spit\w*)\W+(?:\w+\W+)?blood"
-            r"|blood in (?:my |the )?(?:urine|stool|vomit)",
-            r"bleed\w*\W+(?:\w+\W+)?(?:heavily|a lot|won'?t stop)"
-            r"|heavy bleeding|h(?:a)?emorrhag\w*",
-            r"paralis\w*|paralizz\w*|paraly\w*|(?:faccia|bocca) storta|slurred speech"
-            r"|face droop\w*",
-            r"convulsion\w*|seizure\w*|crisi epilettic\w*",
-        )
-    )
-)
-# "non ho dolore al petto": a negation right before the words is not a red flag.
-_NEGATED = re.compile(
-    r"\b(?:non|nessun\w*|senza|niente|mai|no|not|never|without|don'?t|doesn'?t|didn'?t|haven'?t)"
-    r"\s+(?:\w+\s+)?$"
-)
 # Citizen prose (it/en). Never an act word (offer, confirm, cancel, consent, checkin, report,
 # hold, prescription) or a key=value token: understood() reads the last act word as the act.
 ESCALATION = (
@@ -181,15 +129,6 @@ _NO_SLOTS_EN = (
     "to me again in a few days and I will check the agenda straight away; you can also ask the "
     "booking centre."
 )
-
-
-def red_flag(text: str) -> bool:
-    plain = unicodedata.normalize("NFKD", text.replace("’", "'")).encode("ascii", "ignore")
-    lowered = plain.decode().lower()
-    return any(
-        not _NEGATED.search(lowered[max(0, match.start() - 40) : match.start()])
-        for match in _RED_FLAG.finditer(lowered)
-    )
 
 
 async def emergency(need: Need, city: City) -> bool:
