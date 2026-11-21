@@ -3042,6 +3042,94 @@ async def _on_committed(
     await _say(city, target, text)
 
 
+# At most this many holds on one slot in a case: the first, and one after a STALE_FENCE.
+_REFENCE_HOLDS = 2
+
+
+def _held_count(chat: list[Message], agent: str, slot: str) -> int:
+    """How many ``hold`` on ``slot`` we have sent in this case."""
+
+    token = f"slot_id={slot}"
+    return sum(
+        1
+        for row in chat
+        if row.sender == agent
+        and row.recipient == LEDGER
+        and first_word(row.text) == "hold"
+        and token in row.text.split()
+    )
+
+
+def _reheld_after(chat: list[Message], agent: str, slot: str, refusal: Message) -> bool:
+    """A ``hold`` of ours on ``slot`` sent after ``refusal``: another turn already answered it."""
+
+    seen = False
+    for row in chat:
+        if row.msg_id and row.msg_id == refusal.msg_id:
+            seen = True
+        elif (
+            seen
+            and row.sender == agent
+            and row.recipient == LEDGER
+            and first_word(row.text) == "hold"
+            and f"slot_id={slot}" in row.text.split()
+        ):
+            return True
+    return False
+
+
+async def _refence(
+    city: City, message: Message, chat: list[Message], slot: str, *, hold_self: bool
+) -> bool:
+    """A commit the Ledger refused STALE_FENCE: hold the slot again and finish the booking.
+    True when the new hold left, so the caller sends no cancel.
+
+    The refusal is not a lost race. Live on 21/11 the hold's age when the Ledger reads the
+    commit separates the two outcomes with no overlap: ``committed`` p50 164,6 s and max
+    243,3 s, ``STALE_FENCE`` p10 227,7 s and p50 262,6 s, so the lease is worth ~240 s real
+    (4 agenda hours at rate 60). Our pod is not the slow part: from the ``held`` we read to
+    our ``commit`` 0,4-0,6 s pass, the same in both outcomes; the rest is relay and the
+    Ledger's own queue. The slot is still free: 21 of the 53 slots refused this way were
+    later committed by us. One re-hold only (_REFENCE_HOLDS), then the cancel as before.
+    """
+
+    agent = city.agent_id
+    if not slot:
+        return False
+    if first_word(message.text) != "refused" or not {"commit", "op=commit"} & words(message.text):
+        return False
+    # The confirm turn and the refusal's own push turn both get here for the same row: one
+    # re-holds, the other must stay quiet, or the citizen hears a cancel anyway.
+    async with _gated(f"refence:{slot}"):
+        try:
+            fresh = await city.history(need_id=message.need_id)
+        except CapError:
+            fresh = chat
+        if _booked(fresh, agent, slot):
+            return True
+        if _reheld_after(fresh, agent, slot, message):
+            return True  # the other turn already holds it again: the outcome is its own
+        if _held_count(fresh, agent, slot) >= _REFENCE_HOLDS:
+            return False  # the re-hold was refused too: the cancel, as before
+        sender, consent, number = _booking_of(fresh, agent, slot)
+        if not consent:
+            return False
+        parts = ["hold", f"slot_id={slot}"]
+        citizen = _holder(fresh, agent, slot) or (sender if sender.startswith("citizen:") else "")
+        if citizen:
+            parts.append(f"citizen={citizen}")
+        if number:
+            parts.append(f"prescription_number={number}")
+        parts.append(f"consent_ref={consent}")
+        if _HOSPITAL.get():
+            _HELD[slot] = time.monotonic()  # out of cross-ASST offers before the 1-5 s say
+        if not await _say(city, LEDGER, " ".join(parts)):
+            _HELD.pop(slot, None)
+            return False
+    await _finish_booking(city, message, fresh, slot, hold_self=hold_self, new=True)
+    return True
+
+
 async def _on_refused(
     city: City, message: Message, chat: list[Message], *, hold_self: bool, slot: str = "",
     code: str = "",
@@ -3064,6 +3152,8 @@ async def _on_refused(
     # renewal (P1), CONSENT_MISSING → consent (P2), NO_CAPACITY → another slot (P3).
     code = code or fields.get("code") or fields.get("reason") or "facility_cancelled"
     hospital = _HOSPITAL.get()
+    if code == "STALE_FENCE" and await _refence(city, message, chat, slot, hold_self=hold_self):
+        return
     if code == "DUPLICATE":
         # A second commit of a hold already committed (its committed line brings the receipt)
         # or a prescription already booked: nothing was lost, so no cancel to anyone (every

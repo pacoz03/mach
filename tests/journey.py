@@ -176,6 +176,9 @@ class Ledger:
         self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
         self.slow_prescribe = sc.get("slow_prescribe", 0)  # secondi, risposta a prescribe (21/11: minuti)
         self.push_expired = sc.get("push_expired", 0)  # commit che arrivano a hold già scaduto
+        # sc["stale_fence"]: commit rifiutati STALE_FENCE perché il lease del hold è scaduto
+        # mentre il commit era in coda (città 21/11: ogni commit elaborato oltre ~244 s reali).
+        self.stale_fence = sc.get("stale_fence", 0)
         self.steal = sc.get("steal")  # slot preso da un'altra ASST subito dopo la prima risposta a world
         self.flipped: set[str] = set()  # regole accese a metà scenario (sc["rule_at"]): i loro rifiuti sono iniettati
         self.pods = bool(sc.get("pods"))  # due pod senza lock comune: un commit doppio (DUPLICATE) è la corsa iniettata
@@ -257,6 +260,12 @@ class Ledger:
             self.push_expired -= 1  # l'hold scade prima del commit: push `expired` (R:682)
             h["state"] = "expired"
             return "EXPIRED", REPLY["expired"].format(**h), True
+        if op == "commit" and self.stale_fence and h is not None and h["state"] == "held":
+            # Il lease scade mentre il commit è in coda: la fence dell'hold non vale più, ma lo
+            # slot resta libero (città 21/11: 21 slot su 53 rifiutati così poi prenotati da noi).
+            self.stale_fence -= 1
+            h["state"] = "expired"
+            return "STALE_FENCE", "", True
         if op == "commit":
             if h is not None and h["state"] == "committed":  # come il Ledger vero (episodes)
                 return "DUPLICATE", "", self.pods
@@ -2905,6 +2914,38 @@ SCENARIOS.update({
         foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-41", "R-42", "R-43", "R-44")],
         expect=[*(cross_reply(r, "B") for r in ("R-41", "R-42", "R-43", "R-44")),
                 *(cross_fast(r, 1.0) for r in ("R-41", "R-42", "R-43", "R-44")), few_refreshes("R-41")]),
+})
+
+
+# --- Commit rifiutato STALE_FENCE: ri-tenere lo slot invece di annullare (città 21/11) ----------
+# Misura su `episodes`, 5 ore: 25 STALE_FENCE sull'ospedale e 13 sullo specialista, tutti su commit.
+# L'età del hold quando il Ledger lo elabora separa gli esiti senza sovrapposizione: `committed`
+# p50 164,6 s e max 243,3 s, `STALE_FENCE` p10 227,7 s e p50 262,6 s. Il lease vale ~240 s reali
+# (4 ore di agenda a rate 60). Il nostro pod non c'entra: dal `held` ricevuto al nostro `commit`
+# passano 0,4-0,6 s identici nei due esiti; il resto è relay e coda del Ledger. Non è una corsa
+# persa: 21 degli slot rifiutati su 53 sono stati poi committati da noi, quindi erano liberi.
+
+
+def refenced(b: Bus) -> str | None:
+    """Dopo un commit rifiutato STALE_FENCE: un hold nuovo sullo stesso slot e un commit riuscito."""
+    commits = [w for w in b.ledger.writes if w["op"] == "commit" and w["by"] == "hospital"]
+    if not commits or commits[0]["code"] != "STALE_FENCE":
+        return "il primo commit dell'ospedale non è stato rifiutato STALE_FENCE"
+    slot = b.ledger.holds.get(commits[0]["f"].get("hold_id", ""), {}).get("slot_id")
+    again = [w for w in b.ledger.writes if w["op"] == "hold" and w["by"] == "hospital"
+             and w["f"].get("slot_id") == slot and w["i"] > commits[0]["i"]]
+    if not again:
+        return f"dopo lo STALE_FENCE nessun hold nuovo su {slot}"
+    if not any(w["code"] is None for w in commits[1:]):
+        return f"dopo lo STALE_FENCE nessun commit riuscito su {slot}"
+
+
+SCENARIOS.update({
+    # Il Ledger rifiuta il primo commit STALE_FENCE: l'ospedale ri-tiene lo slot e prenota, e il
+    # centro non sente mai un cancel (in città quel cancel diventa facility_cancelled al cittadino
+    # e `citizen.booking_centre.wrong_outcome` -1: 17 journey failed su 129 il 21/11).
+    "ospedale_stale_fence": dict(start=BACK, stale_fence=1, expect=[
+        refenced, cancel_told("booking_centre", "STALE_FENCE", 0)]),
 })
 
 
