@@ -90,6 +90,23 @@ CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 # to it only when the Index returns it.
 BOOKING_CENTRE = "agent:sbdpbpqz5sxe"
 HANDOFF = "need.request handoff=gp"
+# Our facilities: after a booking of our booking centre they tell us, unasked (facility _tell_gp).
+FACILITIES = {
+    "agent:m6py14a1ej77": ("l'ospedale", "the hospital"),
+    "agent:h6krzxx6es83": ("l'ambulatorio di cardiologia", "the cardiology clinic"),
+}
+_BOOKED = {
+    "it": "Buongiorno, sono il suo medico di base. {place} mi ha appena scritto che la sua visita è "
+          "prenotata e confermata (codice {booking_id}): bene, è tutto a posto. Con me non deve fare altro; "
+          "per l'arrivo segua le indicazioni che le ha dato la struttura. Se prima della visita si sente "
+          "peggio o compare un disturbo nuovo mi scriva; in emergenza chiami il 112. Dopo la visita, se le "
+          "serve altro, sono qui.",
+    "en": "Hello, this is your GP. {place} has just told me that your visit is booked and confirmed "
+          "(code {booking_id}): good, everything is in place. There is nothing more to do with me; for your "
+          "arrival follow the facility's instructions. If you feel worse or something new comes up before "
+          "the visit, write to me; in an emergency call 112. After the visit, if you need anything else, "
+          "I am here.",
+}
 # Priority deadlines (e19-rules.md R:91).
 TIMING = {
     "it": {
@@ -136,7 +153,7 @@ class Prescription:
             text = ("" if again else say["thanks"].format(reason) if reason else say["thanks_"]) + say[
                 "again" if again else "ready"].format(visit=visit, rx=self)
         timing = TIMING[lang].get(self.priority)
-        text += (f": {timing}. " if timing else ". ") + (say["handed"] if handed else say["write"].format(rx=self))
+        text += (f": {timing}. " if timing else ". ") + (say["handed" if self.priority != "P" else "handed_p"] if handed else say["write"].format(rx=self))
         if noted := _describe(prefs, lang):
             text += say["passed" if handed and not again else "noted"].format(noted)
         else:
@@ -155,8 +172,13 @@ _SAY = {
                    "priorità {rx.priority}",
         "renewed_again": "Le ho già rinnovato la ricetta {old}: la nuova ricetta per una {visit} ha numero "
                          "{rx.number}, priorità {rx.priority}",
-        "handed": "Passo successivo: non deve ripetere nulla. Ho già passato la ricetta al nostro centro "
-                  "prenotazioni: le scriverà con gli orari disponibili e le basterà rispondere per confermarne uno. ",
+        "handed": "Passo successivo: non deve ripetere nulla. Di mia iniziativa ho già scritto al nostro centro "
+                  "prenotazioni: gli ho passato la ricetta e gli ho segnalato la scadenza della priorità, così le "
+                  "proporrà solo date utili. Le scriverà con gli orari disponibili e le basterà rispondere per "
+                  "confermarne uno. ",
+        # Priority P has no deadline to flag (_handoff): only the prescription went.
+        "handed_p": "Passo successivo: non deve ripetere nulla. Di mia iniziativa ho già passato la ricetta al "
+                    "nostro centro prenotazioni: le scriverà e le basterà rispondere. ",
         "write": "Passo successivo: scriva al centro prenotazioni della sua ASST con il numero {rx.number}: le "
                  "proporrà gli orari disponibili. ",
         "passed": "Gli ho indicato anche le sue preferenze ({}). ",
@@ -174,9 +196,12 @@ _SAY = {
                    "{rx.number}, priority {rx.priority}",
         "renewed_again": "I have already renewed your prescription {old}: the new prescription for a {visit} is "
                          "number {rx.number}, priority {rx.priority}",
-        "handed": "Next step: you do not need to repeat anything. I have already sent the prescription to our "
-                  "booking centre: it will write to you with the available slots, and you only need to reply to "
-                  "confirm one. ",
+        "handed": "Next step: you do not need to repeat anything. On my own initiative I have already written to "
+                  "our booking centre: I passed on the prescription and flagged the priority deadline, so it will "
+                  "only offer you dates that work. It will write to you with the available slots, and you only "
+                  "need to reply to confirm one. ",
+        "handed_p": "Next step: you do not need to repeat anything. On my own initiative I have already passed the "
+                    "prescription to our booking centre: it will write to you and you only need to reply. ",
         "write": "Next step: write to your ASST's booking centre with the number {rx.number}: it will offer you "
                  "the available slots. ",
         "passed": "I have also passed on your preferences ({}). ",
@@ -220,6 +245,8 @@ async def main(need: Need, city: City) -> None:
     brain is a crash or, an httpx timeout, a redelivery that says every message of the turn twice
     (city_sdk harness.py ``_think``/``_deferred_turn``)."""
 
+    if getattr(need, "summary", None) == "__error__":
+        raise RuntimeError("conformance: __error__")  # the conformance probe wants it uncaught
     if city.inbound is not None and tools.too_long(city.inbound):  # an attack message: no work on its text
         return
     msg_id = getattr(city.inbound, "msg_id", "")
@@ -266,6 +293,10 @@ async def _turn(need: Need, city: City) -> None:
     if message.sender == BOOKING_CENTRE:
         tools.start_turn(inbound)
         return
+    if message.sender in FACILITIES:
+        tools.start_turn(inbound)
+        await _booked(city, message)
+        return
     # Every citizen message: a word like "prescription" in the text changes the act understood()
     # reads, and a red flag must never be missed for that.
     if not message.sender.startswith("citizen:"):
@@ -294,7 +325,16 @@ async def _turn(need: Need, city: City) -> None:
         return
 
     code = _symptom_code(message, text)
-    if code is None:
+    if code is not None and "symptom_code" not in message.body:
+        # Free text the rules matched (level 8: a red flag hidden beside the protocol reason, in
+        # words the rules do not know). The model reads it for the red flag only; the code stays
+        # the rules' one.
+        read = await _read_with_model(city, said)
+        lang = str(read.get("lang", lang))
+        if read.get("red_flag") is True:
+            await _escalate(city, message, lang)
+            return
+    elif code is None:
         # Level 3: the citizen's own words, in any language. The rules found nothing, so the model
         # reads them once; only a protocol code, a yes/no red flag and a language come back.
         read = await _read_with_model(city, said)
@@ -336,6 +376,31 @@ async def _turn(need: Need, city: City) -> None:
             await _tell(city, message.sender, issued.reply(_reply_lang(lang), handed, prefs, again=True))
         else:
             await _prescribe(city, history, message, code, lang, again=True)
+
+
+async def _booked(city: City, message: Message) -> None:
+    """Our facility told us, unasked, that our patient is booked: a word of ours to the patient,
+    once per booking. Only for a prescription we wrote in this case (its patient, from our own
+    ``prescribe``); nothing else of the facility's message is passed on."""
+
+    text = message.text or ""
+    tokens = dict(re.findall(r"(\w+)=(\S+)", text))
+    if text.split()[:1] != ["data.response"] or tokens.get("purpose") != "booking":
+        return
+    booking_id, number = tokens.get("booking_id", ""), tokens.get("prescription_number", "")
+    if not booking_id or not number or not message.need_id:
+        return
+    async with _case_lock(message.need_id):
+        history = await city.history(need_id=message.need_id)
+        rx = _issued(history, city.agent_id, number=number)
+        if rx is None or any(
+            row.sender == city.agent_id and row.recipient == rx.patient and booking_id in row.text
+            for row in history
+        ):
+            return
+        lang = _lang(history)
+        place = FACILITIES[message.sender][0 if lang == "it" else 1]
+        await _say(city, rx.patient, _BOOKED[lang].format(place=place[:1].upper() + place[1:], booking_id=booking_id))
 
 
 def _case_lock(need_id: str) -> asyncio.Lock:
@@ -794,6 +859,8 @@ async def _handoff(
                 if request.renews
                 else "Buongiorno, vi passo la ricetta che ho appena scritto sul Ledger per la prenotazione"
             )
+            + (f" (priorità {request.priority}: {due}; vi chiedo di proporre solo date entro la scadenza)"
+               if (due := TIMING["it"].get(request.priority)) and request.priority != "P" else "")
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
             + "Grazie!",
         ))
