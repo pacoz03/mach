@@ -1708,7 +1708,8 @@ async def _cross_asst(
     page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days."""
 
     start = time.monotonic()
-    deadline = start + (_CROSS_COLD if procedures == (_PROCEDURE,) else _CROSS_WAIT)
+    # Hospital and specialist: the live Ledger answers world after ~12 s (21a6d28).
+    deadline = start + (_CROSS_COLD if procedures in ((_PROCEDURE,), _CARDIOLOGY) else _CROSS_WAIT)
     fields = _fields(message)
     rid = fields.get("request_id", "")
     tag = f"request_id={rid}" if rid else ""
@@ -1731,7 +1732,7 @@ async def _cross_asst(
         priority = priority if priority in {"U", "B", "D", "P"} else None
         chosen: list[dict[str, str]] = []
         relaxed = False
-        owed = 0  # hospital: the last world page answered without its reply (cache or late)
+        owed = 0  # hospital, specialist: the last world page answered without its reply
         # Only our own service: world lists every slot of the ASST, other facilities' too.
         if procedure in procedures:
             hospital = procedures == (_PROCEDURE,)
@@ -1758,7 +1759,7 @@ async def _cross_asst(
             every: list[dict[str, str]] = []
             while True:
                 await _say(city, LEDGER, f"world procedure={procedure} page={page}")
-                hit = _WORLD.get((procedure, page)) if hospital else None
+                hit = _WORLD.get((procedure, page)) if rich else None
                 if hit is not None and time.monotonic() - hit[0] <= _WORLD_FRESH:
                     # Answer now; this read's reply refreshes the cache after the answer.
                     rows, world, owed = chat, hit[1], page
@@ -1773,7 +1774,7 @@ async def _cross_asst(
                         deadline=deadline if rich else None,
                     )
                     world = page_of(rows, page)
-                    if hospital:
+                    if rich:
                         _keep_world(procedure, fresh(rows))
                         owed = owed if world else page
                 now = clock(rows) or (_day_after(world) if rich and world else None)
@@ -1864,7 +1865,8 @@ async def _cross_asst(
 
 
 def _keep_world(procedure: str, rows: list[Message]) -> None:
-    """Hospital: every ``world`` page in ``rows`` becomes the cached page of ``procedure``."""
+    """Hospital, specialist: every ``world`` page in ``rows`` becomes the cached page of
+    ``procedure`` (keyed by procedure, so VIS-FIS and VIS-CARD never mix)."""
 
     for row in rows:
         world = _latest_slots([row])

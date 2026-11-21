@@ -87,3 +87,22 @@ def test_empty_priority_window_offers_the_first_dates_after(brain):
 def test_gender_preference_field_is_read_too(brain):
     # Our teams' booking centres name it gender_preference (booking_centre, consultorio).
     assert _run(brain, [[S1_WED, S2_THU, S1_FRI]], "gender_preference=f")[0] == "S-s2-thu"
+
+
+def test_slow_world_answers_from_the_cached_page(brain):
+    # Live Ledger: world comes back after ~12 s, past our wait (21a6d28). The second partner
+    # request is answered from the page the first one read, not with no_availability.
+    slow = {"on": False}
+    base = _ledger([[S2_TUE, S1_WED]])
+
+    def ledger(to: str, text: str, fake: FakeCity) -> None:
+        if slow["on"] and to == LEDGER and text.startswith("world"):
+            return  # no reply in time
+        base(to, text, fake)
+
+    fake = FakeCity([], on_post=ledger)
+    run(brain, fake, msg(PARTNER, _ask("", rid="c-1")[0], need_id="N-X"))
+    slow["on"] = True
+    run(brain, fake, msg(PARTNER, _ask("", rid="c-2")[0], need_id="N-Y"))
+    second = [t for to, t in fake.sent if to == PARTNER][1]
+    assert second.startswith("offer ") and "request_id=c-2" in second.split()
