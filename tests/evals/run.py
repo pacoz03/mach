@@ -150,7 +150,7 @@ STOP = {
     "fr": "les des vous votre pour est et je nous merci avec du voici créneaux lequel préférez rendez bonjour "
           "au ce sur pas une",
     "es": "el los las para usted su y por cita gracias está puede sobre debe médico consultar ayudo "
-          "tratamientos es hola",
+          "tratamientos es hola siento puedo desea ayudarle preguntas consejos cabecera",
 }
 STOP = {lang: set(words.split()) for lang, words in STOP.items()}
 ARABIC = re.compile(r"[؀-ۿ]")
@@ -169,6 +169,7 @@ assert lang_of("Ecco i primi posti liberi per la visita: quale preferisce?") == 
 assert lang_of("Here are two Monday slots: which one suits you?") == "en"
 assert lang_of("Po, kemi një mjek që flet shqip: cilin orar preferoni?") == "sq"
 assert lang_of("مرحبا، هذه مواعيد يوم الثلاثاء") == "ar"
+assert lang_of("Lo siento, no puedo dar consejos clínicos; Si lo desea, puedo ayudarle") == "es"  # E3 GLM C04
 assert lang_of("ok") == "?"
 
 
