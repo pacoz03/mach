@@ -64,7 +64,7 @@ def fresh_pod(monkeypatch):
     for state in (facility._WORLD, facility._CLOCK, facility._SENT, facility._OFFERED, facility._HELD):
         state.clear()
     monkeypatch.setattr(facility, "_PULL_PAUSE", 0)
-    monkeypatch.setattr(facility, "_CROSS_COLD", 0.05)
+    monkeypatch.setattr(facility, "_LEDGER_WAIT", 0.05)
     monkeypatch.setattr(facility, "_RECALLED", True)  # no team-memory read in the background
 
 
@@ -72,11 +72,15 @@ def to_partner(case: Case) -> list[str]:
     return [text for to, text in case.said if to == PARTNER]
 
 
-def test_no_page_in_time_no_answer_never_no_availability():
+def test_no_page_in_time_facility_unavailable_never_no_availability():
     case = Case([])
     turn(case, row(PARTNER, ME, REQUEST))
     assert [text.split()[0] for to, text in case.said if to == LEDGER] == ["agenda", "world"]
-    assert to_partner(case) == []  # the old code said "cancel reason=no_availability request_id=R-1"
+    # W3 (21/11, Ledger replies in ~595 s): past _LEDGER_WAIT the request is closed with one
+    # facility_unavailable (the old code said "cancel reason=no_availability request_id=R-1", then nothing).
+    [answer] = to_partner(case)
+    assert answer.split()[:3] == ["cancel", "reason=facility_unavailable", "request_id=R-1"]
+    assert "offer_id=" not in answer and "no_availability" not in answer
 
 
 def test_the_late_page_answers_the_pending_request_whatever_we_asked_last():

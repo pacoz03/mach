@@ -59,22 +59,25 @@ _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
 # About 3 s: the visit's time and the city's clock are a courtesy, never worth a long wait.
 _SHORT_TRIES = 12
-# A cross-ASST answer goes out by this many seconds from the turn's start: the fast reply (+1,
-# R:246) needs < 10 s, and the real Ledger's agenda reply alone takes 3-5 s.
-_CROSS_WAIT = 5.5
-# Hospital: the live Ledger answers world after ~12 s (21/11 00:50), so a cross-ASST answer comes
-# from the last world page read (_WORLD) while it is _WORLD_FRESH seconds old; without one we wait
-# _CROSS_COLD (a history read can overrun it, still < 10 s). Hospital and specialist then end the
-# turn (the fast reply is scored on the ack) and cache the reply in its own push turn; the
-# consultorio, after its ack, waits up to _WORLD_WAIT for a page it has not read.
-_CROSS_COLD = 4.0  # live: says take 1-5 s and world answers in 25-96 s (21/11 02:00): a longer
-# cold wait only pushed the answer and its ack past 10 s
+# A partner's need.request and the consultorio citizen's offers wait at most this long per turn for
+# the Ledger (live 21/11: other teams' payloads clog the Relay, a Ledger reply takes ~595 s p50, p90
+# 615 s). The answer comes from the cached world pages (_WORLD) while they are _WORLD_FRESH seconds
+# old; past the wait with nothing useful, the request is closed (facility_unavailable, or "write again
+# later" to the citizen) and the late reply only refreshes the cache. The fast reply (+1, R:246)
+# needs the turn's ack < 10 s.
+_LEDGER_WAIT = 5.0
+_LEDGER_PAUSE = 1.0  # one read of the case's Ledger rows per second while waiting (was 24 full reads)
 _WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
-_WORLD_WAIT = 20.0
-# (procedure, page) -> (time.monotonic() of the read, world reply text).
+# A world read of one weekday: AgendaDay of the Ledger schema (city_sdk ledger.py:52), as slot rows
+# name it (day=tue). ponytail: the format is a guess from those two; a refused ``day=`` falls back to
+# page reads for the life of the process (_BY_DAY).
+_DAY_READ = "world procedure={procedure} day={day}"
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri")
+_BY_DAY = True
+# (procedure, page or weekday) -> (time.monotonic() of the read, world reply text).
 # ponytail: one process's memory, empty after a restart or rollout and not shared between pods;
 # a shared store if the hospital ever runs on more than one pod.
-_WORLD: dict[tuple[str, int], tuple[float, str]] = {}
+_WORLD: dict[tuple[str, int | str], tuple[float, str]] = {}
 # _cross_asst, cache hit: the refresh reads sent after the answer, at most one per read text every
 # _REFRESH_EVERY s (read text -> time.monotonic() it was last queued). Live hospital 1.0.17 (21/11,
 # 30 min): ~110 partner requests sent 91 world page=1, 87 page=2 and 87 agenda, 3 reads each with
@@ -128,6 +131,16 @@ _NO_SLOTS_EN = (
     "cancel reason=no_slots I'm sorry, there are no suitable free appointments right now. Write "
     "to me again in a few days and I will check the agenda straight away; you can also ask the "
     "booking centre."
+)
+# Consultorio: the Ledger did not answer within _LEDGER_WAIT. No date, no act word: the citizen's next
+# message asks again (a late reply sends nothing, _advance_alone).
+_BUSY = (
+    "Mi dispiace, in questo momento non riesco a verificare le disponibilità in agenda, quindi per "
+    "ora non posso prenotare la visita. Mi riscriva più tardi e ricontrollo subito."
+)
+_BUSY_EN = (
+    "I'm sorry, right now I can't check the agenda for free appointments, so I can't book your "
+    "visit yet. Please write to me again later and I will check straight away."
 )
 
 
@@ -233,10 +246,12 @@ async def _turn(role: str, need: Need, city: City) -> None:
         # turn ends well inside custody.ack's ~5 s wait for the renew (1.0.9 deploys failed there).
         # The consultorio too: 1.0.6 answered it live (21/11, TARGET_NOT_VISIBLE to t05/osp-x).
         return
-    global _RECALLED
+    global _RECALLED, _BY_DAY
     if not _CLOCK and not _RECALLED:
         _RECALLED = True
         _background(_recall_clock())  # never awaited: one memory read per process, off the turn
+    if message.sender == LEDGER and _day_refused([message]):
+        _BY_DAY = False  # the refusal came after the turn that asked: page reads from now on
     if role == "family_counseling" and message.sender.startswith("agent:"):
         try:
             chat = await asyncio.wait_for(city.history(need_id=message.need_id), timeout=1.0)
@@ -267,7 +282,7 @@ async def _turn(role: str, need: Need, city: City) -> None:
         if message.sender == LEDGER and first_word(message.text) == "agenda":
             _ledger([message], "agenda")  # refreshes the city clock (_CLOCK) for the cache
             await _answer_pending(city, chat, **cardiology)
-        if message.sender == LEDGER and _keep_world_reply(message):
+        if message.sender == LEDGER and _keep_world_reply(message, chat):
             await _answer_pending(city, chat, **cardiology)
             return
         kind = words(message.text)
@@ -305,7 +320,7 @@ async def _turn(role: str, need: Need, city: City) -> None:
         # city clock and the CONS-GIN cache that partner requests are answered from.
         if message.sender == LEDGER and first_word(message.text) == "agenda":
             _ledger([message], "agenda")
-        if message.sender == LEDGER and _keep_world_reply(message):
+        if message.sender == LEDGER and _keep_world_reply(message, chat):
             return
         await _family(city, message, chat)
 
@@ -775,28 +790,16 @@ async def _advance_alone(
     if citizen is None:
         return
     procedure = "CONS-GIN"
-    # Ask, then read the reply from history: the push of a ledger message does not open a turn.
-    for _pass in range(3):
-        agenda = _ledger(chat, "agenda")
-        now = protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
-        world = _latest_slots(chat)
-        if now is not None and world is not None:
-            break
-        if _pass == 2:
-            return
-        if now is None and not protocol.exact(chat, agent, "agenda"):
-            await _say(city, LEDGER, "agenda")
-        if world is None and not protocol.asked(chat, agent, procedure, 1):
-            await _say(city, LEDGER, f"world procedure={procedure} page=1")
-        chat = await _until(
-            city,
-            message.need_id,
-            chat,
-            lambda rows: _has_agenda(rows) and _latest_slots(rows) is not None,
-        )
-    else:
-        return
-    if now is None or world is None:
+    until = time.monotonic() + _LEDGER_WAIT
+    preferences = _family_preferences(chat, citizen)
+    en = preferences.get("lang", _lang(chat)) == "en"
+    told = [row.text.strip() for row in chat if row.sender == agent and row.recipient == citizen]
+    if message.sender != citizen and told and told[-1] in (_BUSY, _BUSY_EN):
+        return  # we said "write again later": a late Ledger reply offers nothing, their next message does
+    world, now, chat, complete = await _family_slots(city, message.need_id, chat, procedure,
+                                                     preferences.get("days", set()), until)
+    if world is None or now is None:
+        await _say(city, citizen, _BUSY_EN if en else _BUSY)
         return
     # A cancel drops every offer the citizen was holding, so the ones still free are sent again,
     # once per cancel: a second turn for the same cancel or refusal does not repeat them.
@@ -813,9 +816,7 @@ async def _advance_alone(
         taken = _offered(chat, agent) | sent.offers
     # ``world`` is this ASST's slots and ``procedure=`` narrows it to our service (SKILL.md),
     # so no filter on ``facility=``: the slot names the facility's seat, not always our id.
-    preferences = _family_preferences(chat, citizen)
     days = preferences.get("days", set())
-    en = preferences.get("lang", _lang(chat)) == "en"
     alternative_days: set[str] = set()
     family_alternative = None
     while True:
@@ -860,16 +861,20 @@ async def _advance_alone(
             break
         if not protocol.asked(chat, agent, procedure, page + 1):
             await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
-        # The next page's reply may never open a turn: read it back here.
-        chat = await _until(
-            city,
-            message.need_id,
-            chat,
-            lambda rows, seen=page: protocol.page(_latest_slots(rows) or "")[0] > seen,
+        # The next page's reply may never open a turn: read it back here (page reads only: a day
+        # read's slots come without a page header, so the loop ends above).
+        chat = await _wait_ledger(
+            city, message.need_id, chat,
+            lambda rows, seen=page: protocol.page(_latest_slots(rows) or "")[0] > seen, until,
         )
         world = _latest_slots(chat) or ""
         if protocol.page(world)[0] <= page:
-            return
+            complete = False
+            break
+    if not complete:
+        # A read the Ledger did not answer in time may hold the slot that fits: no "no slots".
+        await _say(city, citizen, _BUSY_EN if en else _BUSY)
+        return
     # No fitting slot on any page: say so, never silence (R:248). Once per case, unless the
     # citizen writes again.
     if message.sender.startswith("citizen:") or not protocol.we(
@@ -908,6 +913,56 @@ async def _advance_alone(
                 sent.offers.add(family_alternative["slot_id"])
         else:
             await _say(city, citizen, _NO_SLOTS_EN if en else _NO_SLOTS)
+
+
+async def _family_slots(
+    city: City, need_id: str | None, chat: list[Message], procedure: str, prefer: set[str], until: float
+) -> tuple[str | None, datetime | None, list[Message], bool]:
+    """Consultorio citizen: (slot rows, agenda now, case, complete). The rows of the cached world
+    answers when warm, else the day reads asked and waited for until ``until`` on the case's Ledger
+    rows. Without a clock, or after a refused day=, page 1 as before. Rows None: nothing to go on.
+    ``complete``: every read answered (a missing one may hold the slot that fits)."""
+
+    known = {row.msg_id for row in chat}
+
+    def replies(rows: list[Message]) -> list[Message]:
+        return [row for row in rows if row.msg_id not in known and row.sender == LEDGER]
+
+    def answered(rows: list[Message]) -> int:
+        return sum(_latest_slots([row]) is not None for row in replies(rows))
+
+    agenda = _ledger(chat, "agenda")  # a reply in the case moves the city clock (_CLOCK)
+    now = _city_now() or protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
+    reads = _day_reads(procedure, now, None, prefer=prefer)
+    if reads and _warm(procedure, reads):
+        return _cached_lines(procedure), now, chat, True
+    if reads:
+        missing = [read for read in reads if _fresh_world(procedure, _read_key(read)) is None]
+        await asyncio.gather(*(_say(city, LEDGER, read) for read in missing))
+        chat = await _wait_ledger(
+            city, need_id, chat,
+            lambda rows: answered(rows) >= len(missing) or _day_refused(replies(rows)), until,
+        )
+        _keep_world(procedure, replies(chat), _asks(chat, procedure))
+        if not _day_refused(replies(chat)):
+            world, complete = _cached_lines(procedure), answered(chat) >= len(missing)
+            return (world if world or complete else None), now, chat, complete
+        _stop_days()
+    # Page reads, as before day reads: no clock yet, or the Ledger refused day=.
+    agent = city.agent_id
+    if now is None and not protocol.exact(chat, agent, "agenda"):
+        await _say(city, LEDGER, "agenda")
+    if _latest_slots(chat) is None and not protocol.asked(chat, agent, procedure, 1):
+        await _say(city, LEDGER, f"world procedure={procedure} page=1")
+    if now is None or _latest_slots(chat) is None:
+        chat = await _wait_ledger(
+            city, need_id, chat,
+            lambda rows: (now is not None or _has_agenda(rows)) and _latest_slots(rows) is not None, until,
+        )
+    agenda = _ledger(chat, "agenda")
+    now = now or _city_now() or protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
+    world = _latest_slots(chat)
+    return world, now, chat, world is not None
 
 
 async def _on_confirm(
@@ -1040,7 +1095,7 @@ async def _held_elsewhere(city: City, slot: str, key: str) -> bool:
         if need == key or time.monotonic() - entry.holds.get(slot, float("-inf")) > _HOLD_SPAN:
             continue
         try:
-            rows = await city.history(need_id=need)
+            rows = await city.history(peer=LEDGER, need_id=need)  # our hold and the Ledger's rows only
         except CapError:
             continue
         since = _since_hold(rows, city.agent_id, slot)
@@ -1623,10 +1678,9 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         # without taken slots, names none). Then the requests of the case still waiting for it
         # get their answer.
         world = _latest_slots([message]) or ""
-        if (_page_procedure(world) == _PROCEDURE or "slot_id=" not in world) and protocol.asked(
-            chat, city.agent_id, _PROCEDURE, protocol.page(world)[0]
-        ):
-            _keep_world(_PROCEDURE, [message])
+        asks = _asks(chat, _PROCEDURE)  # the page or weekday it answers must be one we asked
+        if (_page_procedure(world) == _PROCEDURE or "slot_id=" not in world) and _world_key(world, asks) in asks:
+            _keep_world(_PROCEDURE, [message], asks)
             await _answer_pending(city, chat)
     elif (
         message.sender.startswith("agent:")
@@ -1697,24 +1751,26 @@ async def _cross_asst(
     pending: bool = False,
 ) -> None:
     """R:191-192: another ASST's booking centre asks for our slots, criteria only. One answer
-    per request, inside the fast reply (R:246): ``offer`` lines of our own slots from one
-    ``world`` page, else ``cancel reason=no_availability``. Never citizen data, never an
+    per request, inside the fast reply (R:246): ``offer`` lines of our own slots from the
+    ``world`` reads, else ``cancel reason=no_availability``. Never citizen data, never an
     attribute the Ledger did not write. The confirm that follows takes _on_confirm.
 
-    Hospital and specialist: the answer comes at once from a fresh _WORLD page, else by _CROSS_COLD.
-    The clock is _city_now (agenda is asked to refresh it, waited for only without it), else
-    world's first day (_day_after). A partner asks because its own set is empty: with nothing
-    in the priority window we offer the first free slots after it (relaxed alternative, R:232),
-    page 2 too, and one h3 slot unless it meets fewer of the named lang/gender/days.
+    The reads are one per weekday of the asker's window (_day_reads; page reads without a clock).
+    The answer comes at once from fresh cached answers (_WORLD), else the missing reads are asked
+    and the case's Ledger rows waited for up to _LEDGER_WAIT. The clock is _city_now (agenda is
+    asked only without it), else world's first day (_day_after). A partner asks because its own
+    set is empty: with nothing in the priority window we offer the first free slots after it
+    (relaxed alternative, R:232), and one h3 slot unless it meets fewer of the named
+    lang/gender/days.
 
-    Hospital and specialist: no page by then means we do not know, so no answer at all, never a
-    no_availability (a false attribute, -2): the turn ends (the fast reply is the ack) and _answer_pending answers
-    when page and clock are in. ``pending``: that late answer, from _WORLD and _city_now only,
-    without waiting (a page 2 it needs is asked, and its push turn answers)."""
+    No reply by then and nothing useful cached means we do not know: never a no_availability (a
+    false attribute, -2) but one ``cancel reason=facility_unavailable``, which closes the request:
+    the late reply only refreshes the cache. ``pending`` (_answer_pending, a request never
+    answered): from _WORLD and _city_now only, without waiting (a read it needs is asked, and its
+    push turn answers)."""
 
     start = time.monotonic()
-    # Hospital and specialist: the live Ledger answers world after ~12 s (21a6d28).
-    deadline = start + (_CROSS_COLD if procedures in ((_PROCEDURE,), _CARDIOLOGY) else _CROSS_WAIT)
+    deadline = start + _LEDGER_WAIT  # live 21/11: a Ledger reply takes ~595 s, the ack must go < 10 s
     fields = _fields(message)
     rid = fields.get("request_id", "")
     tag = f"request_id={rid}" if rid else ""
@@ -1753,6 +1809,7 @@ async def _cross_asst(
         free_after = ""
         chosen: list[dict[str, str]] = []
         relaxed = False
+        unavailable = False  # no Ledger reply in time and nothing useful cached
         owed = 0  # hospital, specialist: the last world page answered without its reply
         later: list[str] = []  # hospital, specialist, cache hit: Ledger reads after the answer
         # Only our own service: world lists every slot of the ASST, other facilities' too.
@@ -1777,23 +1834,32 @@ async def _cross_asst(
                 world = _latest_slots(fresh(rows))
                 return world if world is not None and protocol.page(world)[0] >= page else None
 
+            def answered(rows: list[Message]) -> int:
+                return sum(row.sender == LEDGER and _latest_slots([row]) is not None for row in fresh(rows))
+
+            # One read per weekday of the asker's window (_day_reads); page reads without a clock or
+            # after a refused day=. The asked days= go first.
+            days = _day_reads(procedure, _city_now() if use_cache else None, priority, after, until,
+                              {d for d in re.split(r"[\s,/;|]+", fields.get("days", "").lower()) if d})
+
             def warm(page: int) -> str | None:
-                # Hospital, specialist: a fresh cached page and a known city clock answer at once.
-                hit = _WORLD.get((procedure, page)) if use_cache else None
-                if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH or not _city_now():
+                # A fresh cached answer for every read and a known city clock answer at once: the day
+                # reads' slot rows (or page 1's), else the cached page.
+                reads = days or [f"world procedure={procedure} page={page}"]
+                if not use_cache or not _city_now() or not _warm(procedure, reads):
                     return None
-                return hit[1]
+                return _cached_lines(procedure) if days else _fresh_world(procedure, page)
 
             if warm(1) is not None:
                 if not pending:
                     later.append("agenda")  # a say to the Ledger takes 1-5 s live: after the answer
             elif pending:
                 return
-            else:
-                if family:
-                    await _say(city, sender, f"request_id={rid} Ricevuto: sto verificando le disponibilità sul registro. Non ho ancora un esito.")
+            elif not days:
                 await _say(city, LEDGER, "agenda")
             page = 1
+            now: datetime | None = None
+            complete = True  # every read answered: a no_availability is true
             found: list[dict[str, str]] = []
             every: list[dict[str, str]] = []
             while True:
@@ -1801,47 +1867,42 @@ async def _cross_asst(
                 # Past page 1, page 1 is read again with this one: both land fresh together (live 21/11
                 # 10:18: page 2 came 6 min after its page 1, _answer_pending found page 1 stale and the
                 # partner never had an answer).
-                reads = [f"world procedure={procedure} page={n}" for n in dict.fromkeys((1, page))]
+                reads = days or [f"world procedure={procedure} page={n}" for n in dict.fromkeys((1, page))]
                 if cached is not None:
                     # Answer now; the read goes out after the answer and refreshes the cache.
                     rows, world, owed = chat, cached, page
                     if not pending:
-                        later.append(f"world procedure={procedure} page={page}")
+                        later += reads if days else reads[-1:]
                 elif pending:
-                    # Page 2 not read yet: asked once, its own push turn answers.
-                    if not protocol.asked(chat, agent, procedure, page):
-                        await asyncio.gather(*(_say(city, LEDGER, read) for read in reads))
+                    # Not read yet: asked once, its own push turn answers.
+                    asked = _asks(chat, procedure)
+                    await asyncio.gather(*(_say(city, LEDGER, read) for read in reads if _read_key(read) not in asked))
                     world = None
                     break
                 else:
+                    asks = [read for read in reads if not days or _fresh_world(procedure, _read_key(read)) is None]
                     later = [read for read in later if read not in reads]
-                    await asyncio.gather(*(_say(city, LEDGER, read) for read in reads))
-                    rows = await _until(
-                        city,
-                        message.need_id,
-                        chat,
-                        lambda rows, page=page: page_of(rows, page) is not None
-                        and clock(rows) is not None,
-                        tries=_SHORT_TRIES,
-                        deadline=deadline if use_cache else None,
-                    )
-                    world = page_of(rows, page)
+                    await asyncio.gather(*(_say(city, LEDGER, read) for read in asks))
+
+                    def ready(rows: list[Message], page: int = page, n: int = len(asks)) -> bool:
+                        if days and _day_refused(fresh(rows)):
+                            return True
+                        got = answered(rows) >= n if days else page_of(rows, page) is not None
+                        return got and clock(rows) is not None
+
+                    rows = await _wait_ledger(city, message.need_id, chat, ready, deadline)
                     if use_cache:
-                        _keep_world(procedure, fresh(rows))
-                        owed = owed if world else page
-                if family and (world is None or clock(rows) is None):
-                    # A slow Ledger is not evidence of no availability. Acknowledge, then
-                    # keep ownership of the request and send the real result when it arrives.
-                    rows = await _until(city, message.need_id, chat,
-                                        lambda rs: page_of(rs, page) is not None and clock(rs) is not None,
-                                        deadline=start + _WORLD_WAIT)
-                    world = page_of(rows, page)
-                    _keep_world(procedure, fresh(rows))
-                    if world is None or clock(rows) is None:
-                        _LOG.info("care.family.availability_pending", extra={"request_id": rid})
-                        return
+                        _keep_world(procedure, fresh(rows), _asks(rows, procedure))
+                    if days and _day_refused(fresh(rows)):
+                        _stop_days()  # page reads, inside the same wait
+                        days = []
+                        continue
+                    complete = answered(rows) >= len(asks) if days else page_of(rows, page) is not None
+                    world = _cached_lines(procedure) if days else page_of(rows, page)
+                    world = world if world or complete else None
                 now = clock(rows) or (_day_after(world) if rich and world else None)
                 if world is None or now is None:
+                    complete = False
                     break
                 lines = [line for line in world.splitlines() if "slot_id=" in line]
                 seen += lines
@@ -1868,9 +1929,12 @@ async def _cross_asst(
                 if every or page >= min(protocol.page(world)[1], 2) or time.monotonic() >= deadline:
                     break
                 page += 1
-            if rich and world is None:
-                _LOG.info("care.cross.pending", extra={"request_id": rid})
-                return
+            if pending and world is None:
+                return  # stays for its push turn
+            # A read not answered within _LEDGER_WAIT: without an offer from what we have, we do not know,
+            # so never a no_availability (a false attribute, -2) but facility_unavailable, which closes
+            # the request; the late reply only refreshes the cache.
+            unavailable = world is None or not complete
             if hospital:
                 # Without slots we hold, least offered first: partners no longer race for one 3.
                 found, every = _spread(found), _spread(every)
@@ -1925,6 +1989,12 @@ async def _cross_asst(
                     else ""
                 ),
             ])
+        elif unavailable:
+            # MACH-2.1: "struttura chiusa o non raggiungibile"; the asker offers the rest, no retry.
+            text = (
+                f"cancel reason=facility_unavailable {tag}".rstrip()
+                + " Mi dispiace, in questo momento non riusciamo a consultare la nostra agenda sul registro."
+            )
         else:
             text = (
                 f"cancel reason=no_availability {tag}".rstrip()
@@ -1939,7 +2009,7 @@ async def _cross_asst(
             _LOG.info("care.family.cross_reply", extra={"request_id": rid,
                       "elapsed_seconds": round(time.monotonic() - start, 3),
                       "delivered": delivered, "cached": bool(later),
-                      "result": "offer" if chosen else "no_availability"})
+                      "result": "offer" if chosen else "facility_unavailable" if unavailable else "no_availability"})
         if owed:  # the refresh reads below go out only with owed: drop those sent lately
             tick = time.monotonic()
             later = [read for read in later
@@ -1964,10 +2034,10 @@ async def _answer_pending(city: City, chat: list[Message], *, skip: str = "", **
     """Hospital and specialist: the partner searches of this case we have not answered (the
     Ledger's world came after their turn, or before a restart), answered now from the cached page
     (_cross_asst ``pending``, with ``cross``: the specialist's procedures and wording). One we
-    answered, in this process or in the history, is skipped."""
+    answered, in this process or in the history (our facility_unavailable too), is skipped."""
 
-    hits = [_WORLD.get((procedure, 1)) for procedure in cross.get("procedures", (_PROCEDURE,))]
-    if not any(hit and time.monotonic() - hit[0] <= _WORLD_FRESH for hit in hits):
+    procedures = cross.get("procedures", (_PROCEDURE,))
+    if not any(proc in procedures and time.monotonic() - at <= _WORLD_FRESH for (proc, _), (at, _) in list(_WORLD.items())):
         return  # nothing to answer from: no history read in this turn
     agent = city.agent_id
     for row in chat:
@@ -2014,16 +2084,17 @@ async def _say_later(city: City, reads: list[str]) -> None:
             return
 
 
-def _keep_world_reply(message: Message) -> bool:
+def _keep_world_reply(message: Message, chat: list[Message]) -> bool:
     """A Ledger ``world`` answer arriving as its own turn refreshes the cache of its procedure
-    (every slot line names it). True if it was a world answer."""
+    (every slot line names it; ``chat``, the case, names the reads we asked). True if it was a
+    world answer."""
 
     world = _latest_slots([message])
     if world is None:
         return False
     procedure = _page_procedure(world)
     if procedure:
-        _keep_world(procedure, [message])
+        _keep_world(procedure, [message], _asks(chat, procedure))
     return True
 
 
@@ -2052,15 +2123,16 @@ def _recover(chat: list[Message], agent: str) -> None:
         _CLOCK.update(agenda or {})
         if _city_now() is None:
             _CLOCK.clear()
-    found: dict[tuple[str, int], tuple[float, str]] = {}
+    found: dict[tuple[str, int | str], tuple[float, str]] = {}
     real = datetime.now().astimezone()
+    asks = _asks(chat, _PROCEDURE)
     for row in chat:
         world = _latest_slots([row])
         sent = protocol.when(row.sent_at or "")
         if world is None or sent is None or _page_procedure(world) != _PROCEDURE:
             continue
         at = time.monotonic() - max(0.0, (real - sent).total_seconds())
-        key = (_PROCEDURE, protocol.page(world)[0])
+        key = (_PROCEDURE, _world_key(world, asks))
         if time.monotonic() - at < _WORLD_FRESH and at >= found.get(key, (at, ""))[0]:
             found[key] = (at, world)
     held = {f"slot_id={fields_of(row.text).get('slot_id', '')}" for row in chat
@@ -2072,14 +2144,153 @@ def _recover(chat: list[Message], agent: str) -> None:
             _WORLD[key] = (at, "\n".join(line for line in world.splitlines() if not held & set(line.split())))
 
 
-def _keep_world(procedure: str, rows: list[Message]) -> None:
-    """Hospital, specialist: every ``world`` page in ``rows`` becomes the cached page of
-    ``procedure`` (keyed by procedure, so VIS-FIS and VIS-CARD never mix)."""
+def _keep_world(procedure: str, rows: list[Message], asks: set[int | str] = frozenset()) -> None:
+    """Every ``world`` answer in ``rows`` becomes a cached answer of ``procedure`` (keyed by
+    procedure, so VIS-FIS and VIS-CARD never mix, then by _world_key: ``asks``, our reads)."""
 
     for row in rows:
         world = _latest_slots([row])
-        if world is not None:
-            _WORLD[(procedure, protocol.page(world)[0])] = (time.monotonic(), world)
+        if world is not None and (key := _world_key(world, asks)) is not None:
+            _WORLD[(procedure, key)] = (time.monotonic(), world)
+
+
+def _day_reads(
+    procedure: str,
+    now: datetime | None,
+    priority: str | None,
+    after: datetime | None = None,
+    until: datetime | None = None,
+    prefer: set[str] = frozenset(),
+) -> list[str]:
+    """``world`` reads of one weekday each, the nearest ones of the window, at most 3, the
+    ``prefer`` days (asked by the citizen or the partner) first. The window: from now + _LEAD (U:
+    _HOLD_LEAD, as fitting) or ``after``, to ``until`` (the asker's deadline=), else the priority's
+    horizon (calendar.deadline). A window without a weekday still reads its first one. [] without
+    a clock, or once the Ledger refused day= (_BY_DAY): page reads then."""
+
+    if now is None or not _BY_DAY:
+        return []
+    day = max(now + (_HOLD_LEAD if priority == "U" else _LEAD), after or now)
+    horizon = until or calendar.deadline(priority, now)
+    names: list[str] = []
+    while len(names) < len(_WEEKDAYS):
+        if day.weekday() < len(_WEEKDAYS):
+            if names and horizon is not None and day.date() > horizon.date():
+                break
+            names.append(_WEEKDAYS[day.weekday()])
+        day += timedelta(days=1)
+    names.sort(key=lambda name: name not in prefer)  # stable: nearest first within each group
+    return [_DAY_READ.format(procedure=procedure, day=name) for name in names[:3]]
+
+
+def _read_key(read: str) -> int | str:
+    """The key of a world read (ours, sent or to send): its weekday, else its page (1 by default)."""
+
+    found = fields_of(read)
+    page = found.get("page", "1")
+    return found["day"] if found.get("day") else int(page) if page.isdigit() else 1
+
+
+def _asks(chat: list[Message], procedure: str) -> set[int | str]:
+    """The keys (_read_key) of every world read of ``procedure`` we sent in ``chat``."""
+
+    return {
+        _read_key(row.text) for row in chat
+        if row.recipient == LEDGER and first_word(row.text) == "world"
+        and fields_of(row.text).get("procedure") == procedure
+    }
+
+
+def _page_day(world: str) -> str:
+    """The one weekday every slot line of a world answer names, else ""."""
+
+    days = {_slot(line).get("day") for line in world.splitlines() if "slot_id=" in line} - {None, ""}
+    return days.pop() if len(days) == 1 else ""
+
+
+def _world_key(world: str, asks: set[int | str]) -> int | str | None:
+    """A world answer's key in _WORLD: the weekday of its slots when we asked that day, else its
+    page. None for an empty answer while we asked days: which day it answers, the text does not say.
+    ponytail: replies are matched to reads by content, not by id (the Ledger answers out of order)."""
+
+    day = _page_day(world)
+    if day and day in asks:
+        return day
+    if "slot_id=" not in world and any(isinstance(ask, str) for ask in asks):
+        return None
+    return protocol.page(world)[0]
+
+
+def _fresh_world(procedure: str, key: int | str) -> str | None:
+    hit = _WORLD.get((procedure, key))
+    return None if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH else hit[1]
+
+
+def _warm(procedure: str, reads: list[str]) -> bool:
+    """Every read has a fresh cached answer; for day reads a fresh page 1 will do (the earliest slots
+    of every day: a cache filled by page reads, _recover, _ask_slots or a Ledger ignoring day=)."""
+
+    keys = [_read_key(read) for read in reads]
+    return all(_fresh_world(procedure, key) is not None for key in keys) or (
+        isinstance(keys[0], str) and _fresh_world(procedure, 1) is not None
+    )
+
+
+def _cached_lines(procedure: str) -> str:
+    """The slot rows of every fresh cached answer of ``procedure``, one per slot: the latest read.
+    ponytail: a slot missing from a newer answer keeps its older row; the real world lists a taken
+    slot with free=0 (tests/journey.py REAL_SLOT), so the latest row wins. The SDK format, which drops
+    taken slots, would need the newer answer to clear the time range it covers."""
+
+    rows: dict[str, str] = {}
+    for (proc, _), (at, world) in sorted(_WORLD.items(), key=lambda item: item[1][0]):
+        if proc == procedure and time.monotonic() - at <= _WORLD_FRESH:
+            for line in world.splitlines():
+                if slot := _slot(line).get("slot_id"):
+                    rows[slot] = line
+    return "\n".join(rows.values())
+
+
+def _day_refused(rows: list[Message]) -> bool:
+    """A Ledger refusal of a world read naming the day (``refused world code=SCHEMA_INVALID
+    detail=day``, or the like)."""
+
+    return any(
+        row.sender == LEDGER and first_word(row.text) == "refused"
+        and bool({"world", "op=world"} & words(row.text)) and re.search(r"\bday\b", row.text) is not None
+        for row in rows
+    )
+
+
+def _stop_days() -> None:
+    global _BY_DAY
+    _BY_DAY = False
+
+
+async def _wait_ledger(
+    city: City,
+    need_id: str | None,
+    chat: list[Message],
+    ready: Callable[[list[Message]], bool],
+    until: float,
+) -> list[Message]:
+    """``chat`` plus the case's new Ledger rows, re-read every _LEDGER_PAUSE s until ``ready`` or
+    ``until`` (time.monotonic()). Only the Ledger's rows: the whole case, 24 times a turn through
+    the clogged Relay, was the cost (21/11)."""
+
+    rows = chat
+    while True:
+        try:  # a slow read stops at ``until`` too: the cap holds, the ack still goes < 10 s
+            ledger = await asyncio.wait_for(
+                city.history(peer=LEDGER, need_id=need_id), timeout=max(0.05, until - time.monotonic())
+            )
+        except (CapError, TimeoutError):
+            ledger = []
+        seen = {row.msg_id for row in rows}
+        rows = rows + [row for row in ledger if row.msg_id not in seen]
+        if ready(rows) or time.monotonic() >= until:
+            return rows
+        await asyncio.sleep(max(0.0, min(_LEDGER_PAUSE, until - time.monotonic())))
 
 
 def _spread(slots: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -3217,18 +3428,14 @@ async def _alternatives(city: City, chat: list[Message], partner: str, slot: str
     priority = mine.get("priority", "").upper()
     priority = priority if priority in {"U", "B", "D", "P"} else None
     skip = {slot} | {offer.get("slot_id", "") for offer in offers}
-    chosen: list[dict[str, str]] = []
-    for key in sorted(key for key in _WORLD if key[0] == procedure):
-        at, world = _WORLD[key]
-        now = _city_now() or _day_after(world)
-        if time.monotonic() - at > _WORLD_FRESH or now is None:
-            continue
-        lines = [line for line in world.splitlines() if "slot_id=" in line]
-        chosen += [
-            found
-            for found in fitting(lines, now=now, priority=priority, lang="it", procedure=procedure)
-            if found["slot_id"] not in skip
-        ]
+    # Every fresh cached answer, pages and weekdays, one row per slot (_cached_lines).
+    world = _cached_lines(procedure)
+    now = _city_now() or _day_after(world)
+    chosen = [] if now is None else [
+        found
+        for found in fitting(world.splitlines(), now=now, priority=priority, lang="it", procedure=procedure)
+        if found["slot_id"] not in skip
+    ]
     if not chosen:
         return
     await _say(city, partner, "\n".join([

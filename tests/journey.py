@@ -184,6 +184,7 @@ class Ledger:
         self.no_day = sc.get("no_day", False)  # world day=... rifiutato SCHEMA_INVALID detail=day
         self.page_refused = sc.get("page_refused", False)  # pagina oltre l'ultima: SCHEMA_INVALID detail=page
         self.pages_extra = sc.get("pages_extra", 0)
+        self.refuse_day = sc.get("refuse_day", False)  # world day=... rifiutato SCHEMA_INVALID detail=day
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -313,7 +314,7 @@ class Ledger:
             # day=: il giorno della settimana delle righe (mon..fri) o la data ISO; sc["no_day"] lo rifiuta
             # come uno schema che non lo conosce (R:78 lo nomina, il formato non è documentato).
             day = f.get("day", "")
-            if day and (self.no_day or not (day in DAYS[:5] or re.fullmatch(r"\d{4}-\d{2}-\d{2}", day))):
+            if day and (self.no_day or self.refuse_day or not (day in DAYS[:5] or re.fullmatch(r"\d{4}-\d{2}-\d{2}", day))):
                 return f"{REPLY['refused'].format(op=op, code='SCHEMA_INVALID')} detail=day"
             rows = sorted((s for s in self.slots.values()
                            if f.get("procedure", s["procedure"]) == s["procedure"]
@@ -1373,7 +1374,7 @@ SCENARIOS: dict[str, dict] = {
     # senza, dal turno di R-12, che arriva 6 s dopo e trova la pagina nella history del caso.
     "cross_asst_world_lento": dict(
         start=("hospital", XFIS.format(rid="R-11", extra="")), foreign_after=[XFIS.format(rid="R-12", extra="")],
-        foreign=True, slow_world=12.0, gap=6.0,
+        foreign=True, slow_world=3.0, gap=6.0,  # W3: era 12 s; oltre i 5 s di attesa ora è facility_unavailable (w3_*)
         expect=[cross_reply("R-11", "B"), cross_reply("R-12", "B"), cross_fast("R-12", 1.0)]),
     "cross_asst_tutto_pieno": dict(
         start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
@@ -2859,7 +2860,7 @@ SCENARIOS.update({
     # richiesta. La risposta parte quando ci sono pagina e orologio (turno di agenda), mai un cancel.
     "cross_asst_world_prima_di_agenda": dict(
         start=("hospital", XFIS.format(rid="R-1", extra="")), foreign=True, ledger_turns=True,
-        slow_world=5.0, slow_agenda=8.0, setup=first_agenda_slow,
+        slow_world=2.0, slow_agenda=3.0, setup=first_agenda_slow,  # W3: erano 5 e 8 s, oltre i 5 s di attesa
         expect=[cross_reply("R-1", "B"), wrote("commit", "R:194")]),
     # Il centro annulla e il `cancelled` del Ledger arriva dopo il turno del cancel (3 s): il
     # `cancelled` al centro parte dal turno della risposta.
@@ -2868,8 +2869,9 @@ SCENARIOS.update({
     # Guardie della risposta in sospeso. Pagina 1 tutta piena e world lento: la pagina 2 si chiede
     # dal turno della pagina 1, e il cancel parte solo quando le due pagine dicono che non c'è posto.
     "cross_asst_tutto_pieno_lento": dict(
-        start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15, slow_world=5.0,
-        ledger_turns=True, expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
+        start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15, slow_world=1.5,
+        ledger_turns=True,  # W3: slow_world era 5 s; le due pagine devono arrivare entro i 5 s di attesa
+        expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
     # Riavvio dopo l'hold di R-20: la pagina della history non offre più lo slot trattenuto.
     "cross_asst_riavvio_hold": dict(
         start=("hospital", XFIS_D.format(rid="R-20", extra="")), foreign=True,
@@ -2945,7 +2947,7 @@ SCENARIOS.update({
     # pagina, le offerte partono dal turno della risposta di world (come cross_asst_world_prima_di_agenda).
     "specialista_world_lento": dict(
         start=("specialist_care", "need.request service=lab summary=visit district=8"), foreign=True,
-        ledger_turns=True, slow_world=5.0,
+        ledger_turns=True, slow_world=3.0,  # W3: era 5 s, oltre i 5 s di attesa
         setup=our_booking_asks(("specialist_care", XREQ.format(
             svc="specialist_care.cardiology", proc="VIS-CARD", rid="x-ours4"))),
         expect=[offered_to_booking("specialist_care", "x-ours4", 10.0)]),
@@ -4050,6 +4052,188 @@ SCENARIOS.update({
     # (detail=page), il centro va avanti con l'alternativa invece di aspettarla.
     "booking_pagina_oltre": dict(start=BACK, handoff=True, full_days=9, no_day=True, page_refused=True, pages_extra=1,
                                  expect=[page_refused_no_loop, wrote("checkin", "R:234")]),
+})
+
+
+# --- W3, Relay intasato (21/11: una risposta del Ledger arriva dopo ~595 s): le strutture leggono world
+# per giorno della finestra (day=, al massimo 3), aspettano il Ledger al più 5 s rileggendo solo le sue righe del
+# caso, poi chiudono la richiesta (facility_unavailable al partner, "riscriva più tardi" al cittadino): la
+# risposta tardiva rinfresca solo la cache.
+
+
+def clock_first(*folders: str):
+    """Prima del primo turno ogni struttura in ``folders`` riceve, come turno suo, una risposta di agenda di un
+    caso vecchio: ha l'orologio della città (in città: city:clock o un'agenda già letta), quindi legge per giorno."""
+    def setup(b: Bus) -> None:
+        for folder in folders:
+            b.queue.append(b.add(LEDGER, b.ids[folder], {"text": b.ledger.read("agenda", {})}, "N-2026-11-23-0009"))
+    return setup
+
+
+def late_push(op: str, seconds: float, answered: str = ""):
+    """Le risposte del Ledger a ``op`` arrivano ``seconds`` s dopo e aprono sempre un turno loro (anche senza
+    --ledger-turns, come in città): ben oltre i 5 s di attesa del turno che le ha chieste. ``answered``: solo dopo
+    la prima risposta a quel request_id (prima il Ledger risponde subito)."""
+    def setup(b: Bus) -> None:
+        late = b.ledger.late
+
+        def slow(text: str) -> float:
+            muted = not answered or any(m.recipient == FOREIGN and f"request_id={answered}" in m.text.split() for m in b.log)
+            return seconds if muted and (text.split() or [""])[0] == op else late(text)
+        b.ledger.late = slow
+
+        async def pushed(delay: float, to: str, text: str, need: str | None, conv: str | None) -> None:
+            await asyncio.sleep(delay)
+            r = b.reply(to, text, need, conv)
+            if not b.ledger_turns:
+                b.queue.append(r)
+        b.later = pushed
+    return setup
+
+
+def both(*setups):
+    def setup(b: Bus) -> None:
+        for s in setups:
+            s(b)
+    return setup
+
+
+def late_reply_seen(b: Bus, fac: str, after: Message) -> str | None:
+    """La risposta tardiva di world è arrivata alla struttura dopo ``after`` (lo scenario ha davvero provato il push)."""
+    i = b.log.index(after)
+    if not any(m.sender == LEDGER and m.recipient == fac and m.text.split()[:1] in (["slots"], ["world"])
+               for m in b.log[i + 1:]):
+        return "la risposta tardiva di world non è mai arrivata: scenario senza push"
+
+
+def unavailable_then_silent(rid: str, role: str):
+    """Ledger muto, cache fredda: una sola risposta a ``rid``, cancel reason=facility_unavailable request_id=,
+    senza offer_id, dentro il turno; la risposta tardiva di world non porta offerte a quel partner."""
+    def check(b: Bus) -> str | None:
+        got = _cross_answer(b, rid, role)
+        if len(got) != 1:
+            return f"{role} ha risposto {len(got)} volte a {rid}: {[m.text[:60] for m in got]}, atteso un solo facility_unavailable"
+        m = got[0]
+        if act(m) != "cancel" or not has(m.text, ("reason=facility_unavailable", f"request_id={rid}")) or "offer_id=" in m.text:
+            return f"{role} a {rid}: «{m.text[:90]}», atteso cancel reason=facility_unavailable request_id={rid} senza offer_id"
+        req = next(r for r in b.log if r.sender == FOREIGN and f"request_id={rid}" in r.text.split())
+        if b.opened.get(b.turn_of[m.msg_id]) is not req:
+            return f"{role}: il facility_unavailable a {rid} non è partito nel turno della richiesta"
+        if any(x.sender == b.ids[role] and x.recipient == FOREIGN and act(x) == "offer" for x in b.log):
+            return f"{role} ha mandato offerte al partner dopo il facility_unavailable"
+        return late_reply_seen(b, b.ids[role], m)
+    return check
+
+
+def only_day_reads(folder: str, allowed: set[str]):
+    """Ogni world della struttura: day=<giorno feriale> dentro la finestra (``allowed``), mai page=, al più 3 per turno."""
+    def check(b: Bus) -> str | None:
+        reads = [m for m in b.log if m.sender == b.ids[folder] and m.recipient == LEDGER and m.text.startswith("world")]
+        if not reads:
+            return f"{folder} non ha letto world"
+        bad = [m.text for m in reads if "page" in fields(m.text) or fields(m.text).get("day") not in allowed]
+        if bad:
+            return f"{folder}: world fuori formato o fuori finestra {sorted(allowed)}: {bad[:3]}"
+        per_turn = Counter(b.turn_of[m.msg_id] for m in reads)
+        if max(per_turn.values()) > 3:
+            return f"{folder}: {max(per_turn.values())} letture di world nello stesso turno, al più 3"
+    return check
+
+
+def cross_offered(rid: str, role: str):
+    """Una sola risposta a ``rid``, con da 1 a 3 offerte di slot di ``role``."""
+    def check(b: Bus) -> str | None:
+        got = _cross_answer(b, rid, role)
+        if len(got) != 1 or act(got[0]) != "offer" or not 1 <= len(parse_offers(got[0].text)) <= 3:
+            return f"{role} a {rid}: {[m.text[:70] for m in got]}, attese da 1 a 3 offerte"
+        if any(b.ledger.slots.get(o.get("slot_id", ""), {}).get("facility") != b.ids[role] for o in parse_offers(got[0].text)):
+            return f"{role} a {rid}: offerto uno slot non suo"
+    return check
+
+
+def busy_then_silent(folder: str):
+    """Consultorio, Ledger muto: al cittadino un messaggio "riscriva più tardi" (né date né parole d'atto), nessuna
+    offerta, neanche quando la risposta tardiva arriva."""
+    def check(b: Bus) -> str | None:
+        fac = b.ids[folder]
+        told = [m for m in b.log if m.sender == fac and m.recipient == CIT]
+        if len(told) != 1 or "riscriva più tardi" not in told[0].text:
+            return f"{folder} al cittadino: {[m.text[:70] for m in told]}, atteso un solo «riscriva più tardi»"
+        if any(w in ACTS for w in told[0].text.replace(",", " ").split()) or re.search(r"\d|=", told[0].text):
+            return f"{folder}: il messaggio d'attesa ha una parola d'atto, una data o un token: «{told[0].text[:90]}»"
+        return late_reply_seen(b, fac, told[0])
+    return check
+
+
+def day_refused_then_pages(folder: str, rid: str):
+    """Il Ledger rifiuta day= (SCHEMA_INVALID detail=day): la prima lettura era per giorno, poi solo page=, e la
+    richiesta ha le sue offerte nello stesso turno; le richieste dopo leggono subito per pagina."""
+    def check(b: Bus) -> str | None:
+        reads = [m.text for m in b.log if m.sender == b.ids[folder] and m.recipient == LEDGER and m.text.startswith("world")]
+        if not reads or "day" not in fields(reads[0]):
+            return f"{folder}: la prima lettura non era per giorno: {reads[:2]}"
+        back = next((i for i, t in enumerate(reads) if "day" not in fields(t)), None)
+        if back is None or any("day" in fields(t) or "page" not in fields(t) for t in reads[back:]):
+            return f"{folder}: dopo il rifiuto di day= non è tornato a page=: {reads}"
+        return cross_offered(rid, folder)(b)
+    return check
+
+
+TUE_WED = {"tue", "wed"}  # B nato lunedì 08:00: da martedì 00:00 (16 h) a mercoledì 08:00
+
+SCENARIOS.update({
+    # Cache fredda, orologio noto, world muto (risposte dopo 7 s, come turno loro): un solo facility_unavailable nel
+    # turno della richiesta, e le pagine tardive non mandano offerte a quel partner. Prima: nessuna risposta, poi
+    # offerte dal turno della pagina tardiva (10 minuti dopo in città).
+    "w3_partner_ledger_muto": dict(
+        start=("hospital", XFIS.format(rid="R-80", extra="")), foreign=True,
+        setup=both(clock_first("hospital"), late_push("world", 7.0)),
+        expect=[unavailable_then_silent("R-80", "hospital")]),
+    "w3_specialista_ledger_muto": dict(
+        start=("specialist_care", XCARD.format(rid="R-81", extra="")), foreign=True,
+        setup=both(clock_first("specialist_care"), late_push("world", 7.0)),
+        expect=[unavailable_then_silent("R-81", "specialist_care")]),
+    # Senza orologio (pod appena partito): agenda e world muti, lettura per pagina, stesso esito.
+    "w3_partner_ledger_muto_senza_orologio": dict(
+        start=("hospital", XFIS.format(rid="R-82", extra="")), foreign=True,
+        setup=both(late_push("world", 7.0), late_push("agenda", 7.0)),
+        expect=[unavailable_then_silent("R-82", "hospital")]),
+    # Cache calda (R-83 letto per giorno), poi world muto: R-84 (D, un giorno in più non in cache) ha le offerte
+    # dalla cache dopo l'attesa, mai un facility_unavailable; nessuna lettura per pagina.
+    "w3_partner_cache_calda": dict(
+        start=("hospital", XFIS.format(rid="R-83", extra="")), foreign=True,
+        foreign_after=[XFIS_D.format(rid="R-84", extra="")],
+        setup=both(clock_first("hospital"), late_push("world", 7.0, answered="R-83")),
+        expect=[cross_offered("R-83", "hospital"), cross_offered("R-84", "hospital"),
+                only_day_reads("hospital", {"tue", "wed", "thu"})]),
+    # Consultorio, cittadino, world muto: "riscriva più tardi", e la risposta tardiva (agenda e world, turni loro)
+    # non manda offerte. Con l'orologio (lettura per giorno) e senza (pod appena partito, per pagina).
+    "w3_consultorio_ledger_muto": dict(
+        start=("family_counseling", "Buongiorno, vorrei una visita ginecologica. lang=it"),
+        setup=both(clock_first("family_counseling"), late_push("world", 7.0)),
+        expect=[busy_then_silent("family_counseling")]),
+    "w3_consultorio_ledger_muto_senza_orologio": dict(
+        start=("family_counseling", "Buongiorno, vorrei una visita ginecologica. lang=it"),
+        setup=both(late_push("world", 7.0), late_push("agenda", 7.0)),
+        expect=[busy_then_silent("family_counseling")]),
+    # Formato delle letture: day=<giorno> della finestra, al più 3, mai page=. Partner B a ospedale e specialista
+    # (martedì e mercoledì), cittadino del consultorio (i 3 giorni feriali più vicini da martedì).
+    "w3_letture_per_giorno_ospedale": dict(
+        start=("hospital", XFIS.format(rid="R-85", extra="")), foreign=True, setup=clock_first("hospital"),
+        expect=[cross_offered("R-85", "hospital"), only_day_reads("hospital", TUE_WED)]),
+    "w3_letture_per_giorno_specialista": dict(
+        start=("specialist_care", XCARD.format(rid="R-86", extra="")), foreign=True,
+        setup=clock_first("specialist_care"),
+        expect=[cross_offered("R-86", "specialist_care"), only_day_reads("specialist_care", TUE_WED)]),
+    "w3_letture_per_giorno_consultorio": dict(
+        start=("family_counseling", "Buongiorno, vorrei una visita ginecologica. lang=it"),
+        setup=clock_first("family_counseling"),
+        expect=[wrote("checkin", "R:234/238"), only_day_reads("family_counseling", {"tue", "wed", "thu"})]),
+    # Il Ledger rifiuta day=: si torna a page= nello stesso turno (offerte a R-87), e R-88 legge subito per pagina.
+    "w3_day_rifiutato": dict(
+        start=("hospital", XFIS.format(rid="R-87", extra="")), foreign=True, refuse_day=True,
+        foreign_after=[XFIS.format(rid="R-88", extra="")], setup=clock_first("hospital"),
+        expect=[day_refused_then_pages("hospital", "R-87"), cross_offered("R-88", "hospital")]),
 })
 
 
