@@ -1266,7 +1266,8 @@ SCENARIOS: dict[str, dict] = {
                                expect=[writes("prescribe", 2, "motivo nuovo"),
                                        wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D")]),
     "gp_rinnovo_a_parole": dict(start=BACK, handoff=True, after=[RINNOVO], llm={RINNOVO: NONE_IT}, expect=[
-        writes("prescribe", 2, "P1 a parole"), asked_ledger("gp", "prescription", "prescription_number=")]),
+        # La ricetta del caso è confermata (prescribed): nessuna lettura del Ledger (gp_rinnovo_*).
+        writes("prescribe", 2, "P1 a parole")]),
     "gp_lingua_es": dict(start=("gp", RODILLA), llm={RODILLA: '{"code": "SYM-KNEE", "red_flag": false, "lang": "es"}'},
                          expect=[wrote("prescribe", "R:228", procedure="VIS-FIS", priority="D"),
                                  gp_prescription(), requested_translation("es")]),
@@ -2137,6 +2138,183 @@ SCENARIOS.update({
         told_text("hospital", "Il suo centro prenotazioni mi ha passato la sua richiesta", cite="review"),
         told_text("hospital", "ho registrato il suo arrivo sul Ledger", cite="review"), *CHECKED_IN]),
 })
+
+# --- P1, rinnovo dal gp (livello 8, R:716/720) con il Ledger lento (città 21/11: 4-5 minuti)
+
+
+def setups(*steps):
+    """sc["setup"] con più passi, in ordine."""
+    def setup(b: Bus) -> None:
+        for step in steps:
+            step(b)
+    return setup
+
+
+def gp_slow_reads(seconds: float):
+    """Le letture `prescription` del gp tornano dopo ``seconds`` s (in città minuti)."""
+    def setup(b: Bus) -> None:
+        late, gp = b.ledger.late, b.ids["gp"]
+        # Port.post chiede late() subito dopo aver messo la richiesta in coda al log.
+        b.ledger.late = lambda text: (
+            seconds if text.split()[:1] == ["prescription"] and b.log[-1].sender == gp else late(text))
+    return setup
+
+
+def seeded_rx(number: str, patient: str, procedure: str, priority: str):
+    """Una ricetta già sul Ledger, emessa 3 giorni di agenda fa (P1: scaduta), non da questo caso."""
+    def setup(b: Bus) -> None:
+        b.ledger.rx[number] = dict(prescription_number=number, patient=patient, procedure=procedure,
+                                   priority=priority, issued=b.ledger.now - timedelta(days=3))
+    return setup
+
+
+def typed_renewal(b: Bus) -> None:
+    """Al data.request purpose=prescription_renewal il cittadino scrive al gp un need.request con
+    solo il prescription_number, senza testo (R:720)."""
+    c, react = b.citizen, b.citizen.react
+
+    def wrapped(m: Message) -> None:
+        if act(m) == "data.request" and fields(m.text).get("purpose") == "prescription_renewal":
+            c.say(b.ids["gp"], "", kind="need.request", prescription_number=c.rx)
+            return
+        react(m)
+
+    c.react = wrapped
+
+
+def expired_commit_expected(b: Bus) -> None:
+    """Il commit rifiutato PRESCRIPTION_EXPIRED è il modo in cui P1 arriva a questo percorso: il
+    centro ha verificato la ricetta al passaggio del gp, il cittadino conferma 3 giorni dopo. È
+    una riga del centro (R:244), non del gp: qui non conta."""
+    write = b.ledger.write
+
+    def wrapped(op: str, by: str, need: str | None, f: dict) -> tuple[str | None, str, bool]:
+        code, reply, injected = write(op, by, need, f)
+        return code, reply, injected or code == "PRESCRIPTION_EXPIRED"
+
+    b.ledger.write = wrapped
+
+
+def renewal_to_booking(b: Bus) -> None:
+    """Ricevuto il numero rinnovato dal gp, il cittadino lo porta anche lui al centro, come il
+    centro gli chiede («Appena mi manda il numero nuovo, prenotiamo insieme»)."""
+    c, react = b.citizen, b.citizen.react
+
+    def wrapped(m: Message) -> None:
+        old = c.rx
+        react(m)
+        if m.sender == b.ids["gp"] and act(m) == "prescription" and old and c.rx != old:
+            c.say(b.ids["booking_centre"], f"data.response purpose=prescription_renewal prescription_number={c.rx}")
+
+    c.react = wrapped
+
+
+def renew_at_once(b: Bus) -> None:
+    """Appena riceve la ricetta, il cittadino chiede al gp il rinnovo (need.request con il solo
+    numero): il percorso P1 senza passare dal centro."""
+    c, react = b.citizen, b.citizen.react
+
+    def wrapped(m: Message) -> None:
+        react(m)
+        if m.sender == b.ids["gp"] and act(m) == "prescription" and not getattr(c, "renewing", False):
+            c.renewing = True
+            c.say(b.ids["gp"], "", kind="need.request", prescription_number=c.rx)
+
+    c.react = wrapped
+
+
+def gp_renewed(old: str | None, procedure: str, priority: str, *, at_once: bool, tokens: tuple[str, ...] = ()):
+    """Il gp rinnova ``old`` (None: la prima ricetta del caso): un prescribe accettato con numero
+    nuovo, stessa procedura e priorità; il numero nuovo al cittadino (``at_once``: nel turno della
+    richiesta) e nel passaggio al centro, con renewal_of=."""
+    def check(b: Bus) -> str | None:
+        gp = b.ids["gp"]
+        first = old or next((w["f"]["prescription_number"] for w in b.ledger.writes if w["op"] == "prescribe"), "")
+        new = [w["f"] for w in b.ledger.writes if w["op"] == "prescribe" and not w["code"]
+               and w["f"]["prescription_number"] != first and w["f"]["patient"] == CIT]
+        if len(new) != 1 or (new[0]["procedure"], new[0]["priority"]) != (procedure, priority):
+            return f"rinnovo di {first}: prescribe {[(f['procedure'], f['priority']) for f in new]} invece di uno {procedure}/{priority}"
+        number = new[0]["prescription_number"]
+        at = next((i for i, m in enumerate(b.log) if m.sender == gp and m.recipient == CIT and act(m) == "prescription"
+                   and fields(m.text).get("prescription_number") == number), None)
+        if at is None:
+            return f"il gp non ha detto al cittadino il numero rinnovato {number}"
+        said = b.log[at]
+        # La richiesta: l'ultimo messaggio del cittadino al gp prima del numero nuovo.
+        asked = next((m for m in reversed(b.log[:at]) if m.sender == CIT and m.recipient == gp), None)
+        if at_once and (asked is None or b.opened.get(b.turn_of[said.msg_id]) is not asked):
+            return "il numero rinnovato non è partito nel turno della richiesta del cittadino"
+        if not any(m.sender == gp and m.recipient == b.ids["booking_centre"]
+                   and has(m.text, ("handoff=gp", f"prescription_number={number}", f"renewal_of={first}", *tokens))
+                   for m in b.log):
+            return f"il gp non ha passato al centro il numero rinnovato {number} con renewal_of={first} {' '.join(tokens)}"
+    return check
+
+
+def no_rx_read(b: Bus) -> str | None:
+    """Ricetta del caso confermata: il gp non chiede `prescription` al Ledger (in città 4-5 minuti)."""
+    if any(m.sender == b.ids["gp"] and m.recipient == LEDGER and m.text.startswith("prescription ") for m in b.log):
+        return "il gp ha letto sul Ledger una ricetta che il caso già conferma"
+
+
+NO_CHECK = never_told("gp", "Non riesco a verificare", cite="la risposta del Ledger è in viaggio, non mancante")
+P1_BOOKING = ("booking_centre: dopo commit PRESCRIPTION_EXPIRED e rinnovo non rioffre (nel trascritto "
+              "rilegge solo world page=1) e risponde «Su questo non posso…»; il gp passa il numero nuovo")
+GRAZIE_RINNOVO = "Grazie mille per il rinnovo!"
+SPEC_RX = "RX-SPEC-1"  # ricetta di controllo dello specialista (prescribe ... follow_up_of=)
+OTHER_RX = "RX-ALTRUI-1"
+
+
+SCENARIOS.update({
+    # (a)+(d) Ricetta del caso scaduta (P1), il cittadino manda al gp solo need.request con il
+    # numero; la lettura del Ledger torna dopo 3 s. Il gp ha già la ricetta confermata nel caso:
+    # rinnova nel turno, e il numero nuovo arriva al centro con il passaggio (il cittadino, con
+    # handoff, aspetta il centro e non glielo riscrive).
+    "gp_rinnovo_p1_lento": dict(start=BACK, handoff=True, rules={"P1": "on"}, wait_days=3,
+                                setup=setups(typed_renewal, gp_slow_reads(3.0), expired_commit_expected), expect=[
+        told("booking_centre", "data.request", "purpose=prescription_renewal", cite="R:716/720"),
+        gp_renewed(None, "VIS-FIS", "B", at_once=True), NO_CHECK]),
+    # Fine del percorso P1: dopo il rinnovo il centro rioffre e la visita si fa. Il numero nuovo
+    # arriva al centro dal passaggio del gp, oppure anche dal cittadino.
+    "p1_rinnovo_prenota": dict(start=BACK, handoff=True, rules={"P1": "on"}, wait_days=3,
+                               setup=setups(typed_renewal, expired_commit_expected), xfail=P1_BOOKING, expect=[
+        gp_renewed(None, "VIS-FIS", "B", at_once=True), wrote("checkin", "R:716")]),
+    "p1_rinnovo_prenota_cittadino": dict(start=BACK, handoff=True, rules={"P1": "on"}, wait_days=3,
+                                         setup=setups(typed_renewal, renewal_to_booking, expired_commit_expected),
+                                         xfail=P1_BOOKING, expect=[
+        gp_renewed(None, "VIS-FIS", "B", at_once=True), wrote("checkin", "R:716")]),
+    # Rinnovo chiesto a parole, Ledger a 3 s: dal caso, nel turno, senza leggere il Ledger.
+    "gp_rinnovo_a_parole_lento": dict(start=BACK, handoff=True, after=[RINNOVO], llm={RINNOVO: NONE_IT},
+                                      setup=gp_slow_reads(3.0), expect=[
+        gp_renewed(None, "VIS-FIS", "B", at_once=True), NO_CHECK, no_rx_read]),
+    # Dopo il rinnovo il cittadino ringrazia con «rinnovo» nel testo: un promemoria, non una terza ricetta.
+    "gp_rinnovo_grazie": dict(start=BACK, handoff=True, after=[RINNOVO, GRAZIE_RINNOVO],
+                              llm={RINNOVO: NONE_IT, GRAZIE_RINNOVO: NONE_IT}, expect=[
+        writes("prescribe", 2, "un solo rinnovo"), gp_prescription(after_followup=True)]),
+    # Cittadino inglese, rinnovo con il solo numero: risposta in inglese, lang=en nel passaggio.
+    "gp_rinnovo_en": dict(start=("gp", PREF_EN), handoff=True, setup=setups(renew_at_once, gp_slow_reads(3.0)), expect=[
+        gp_renewed(None, "VIS-FIS", "B", at_once=True, tokens=("lang=en", "doctor_lang=en")),
+        told_text("gp", "I have renewed your prescription", cite="lingua del cittadino"), NO_CHECK]),
+    # (b) Ricetta non di questo caso (follow-up dello specialista), Ledger a 3 s: il gp avvisa
+    # che verifica, poi rinnova nel turno della risposta del Ledger. Solo con i turni del Ledger.
+    "gp_rinnovo_ledger_lento": dict(start=("gp", f"need.request prescription_number={SPEC_RX}"), ledger_turns=True,
+                                    setup=setups(seeded_rx(SPEC_RX, CIT, "VIS-CARD", "B"), gp_slow_reads(3.0)), expect=[
+        gp_renewed(SPEC_RX, "VIS-CARD", "B", at_once=False), NO_CHECK, writes("prescribe", 1, "un solo rinnovo")]),
+    # (b) Lo stesso, e il cittadino riscrive dopo la risposta del Ledger: un solo rinnovo, mai muto.
+    "gp_rinnovo_riscritto": dict(start=("gp", f"need.request prescription_number={SPEC_RX}"),
+                                 after=[f"Ho scritto prima: mi serve il rinnovo. prescription_number={SPEC_RX}"],
+                                 setup=setups(seeded_rx(SPEC_RX, CIT, "VIS-CARD", "B"), gp_slow_reads(3.0)), expect=[
+        gp_renewed(SPEC_RX, "VIS-CARD", "B", at_once=False), NO_CHECK, writes("prescribe", 1, "un solo rinnovo")]),
+    # (c) Ricetta di un altro cittadino: niente ricetta, niente dati dell'altro, risposta onesta.
+    "gp_rinnovo_altrui": dict(start=("gp", f"need.request prescription_number={OTHER_RX}"),
+                              setup=seeded_rx(OTHER_RX, "citizen:T-9", "VIS-FIS", "D"), expect=[
+        no_write("prescribe", "AGENT.md 9"), told_text("gp", "non risulta a suo nome", cite="AGENT.md 9"),
+        never_told("gp", "fisiatric", "VIS-FIS", "priority", "T-9", cite="over-disclosure R:243")]),
+    # (c) Numero che il Ledger non conosce (refused prescription code=NOT_FOUND).
+    "gp_rinnovo_inesistente": dict(start=("gp", "need.request prescription_number=RX-NONE"), expect=[
+        no_write("prescribe", "AGENT.md 9"), told_text("gp", "non risulta a suo nome", cite="AGENT.md 9")]),
+})
+
 
 def transcript(b: Bus) -> None:
     for m in b.log:

@@ -106,12 +106,34 @@ ASK_REASON = {
     ),
 }
 LEDGER_REFUSAL = "Non sono riuscito a registrare la ricetta. Può riprovare con una nuova richiesta."
-RENEWAL_UNKNOWN = (
-    "Non riesco a verificare questa ricetta sul Ledger. Può indicarmi il motivo della richiesta "
-    "in poche parole? Così applico il protocollo."
-)
-LEDGER_WAIT_ATTEMPTS = 24
-LEDGER_WAIT_SECONDS = 0.25
+# P1 renewal of a number this case does not show as ours: the Ledger is asked, and answers in its
+# own turn (live 21/11: 4-5 minutes). Meanwhile the citizen hears what happens, never silence.
+RENEWAL_CHECKING = {
+    "it": (
+        "Sto verificando sul Ledger la ricetta {number}: appena ho la conferma gliela rinnovo, con "
+        "la stessa visita e la stessa priorità, e le scrivo subito il numero nuovo. Non deve fare "
+        "altro."
+    ),
+    "en": (
+        "I am checking prescription {number} on the Ledger: as soon as it is confirmed I will renew "
+        "it, with the same visit and priority, and write to you with the new number straight away. "
+        "You don't need to do anything else."
+    ),
+}
+# Not found, or not the citizen's: nothing is renewed and nothing about it is told (no disclosure).
+RENEWAL_NOT_FOUND = "data.response purpose=prescription_renewal outcome=not_found"
+RENEWAL_UNKNOWN = {
+    "it": (
+        "Ho verificato sul Ledger: la ricetta {number} non risulta a suo nome, quindi non posso "
+        "rinnovarla. Se mi descrive in poche parole il disturbo per cui vuole farsi visitare, le "
+        "preparo una ricetta nuova secondo il protocollo."
+    ),
+    "en": (
+        "I checked the Ledger: prescription {number} is not registered in your name, so I cannot "
+        "renew it. If you tell me in a few words what you would like to be seen for, I will "
+        "prepare a new prescription according to the protocol."
+    ),
+}
 CASE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 # Our ASST's booking centre (booking_centre/card.yaml). The Index Peer carries neither team nor
 # district, and find() leaves this agent out: the id is the only way to pick ours. We still write
@@ -154,6 +176,7 @@ class Prescription:
     number: str
     procedure: str
     priority: str
+    renews: str = ""  # P1: the number this prescription renews
 
     @property
     def head(self) -> str:
@@ -168,6 +191,16 @@ class Prescription:
         reason = _REASON[lang].get(_code_of(self))
         visit = _VISIT[lang].get(self.procedure, self.procedure)
         number = self.number
+        if self.renews:
+            if lang == "en":
+                return (
+                    f"I have renewed your prescription {self.renews}: the new prescription for a "
+                    f"{visit} is number {number}, priority {self.priority}"
+                )
+            return (
+                f"Le ho rinnovato la ricetta {self.renews}: la nuova ricetta per una {visit} ha "
+                f"numero {number}, priorità {self.priority}"
+            )
         if lang == "en":
             return (
                 (f"Thank you for telling me about {reason}. " if reason else "Thank you for writing. ")
@@ -273,11 +306,15 @@ async def main(need: Need, city: City) -> None:
     _HEARD.set("")  # never the words or language of a previous turn
     _LANG.set(None)
     if message.sender == LEDGER:
-        if message.need_id and message.text.split()[:1] in (["prescribed"], ["refused"]):
+        first = message.text.split()[:1]
+        if message.need_id and first in (["prescribed"], ["refused"], ["prescription"]):
             async with _case_lock(message.need_id):
                 history = await city.history(need_id=message.need_id)
-                request = _previous_prescription(history, city.agent_id)
-                if request is not None:
+                old = understood(message).body.get("prescription_number")
+                patient = _renewal_asker(history, city.agent_id, old) if first != ["prescribed"] else None
+                if patient is not None:  # P1: the Ledger's answer about a number to renew
+                    await _renew(city, history, patient, message.need_id, old, None, reply=False)
+                elif first != ["prescription"] and (request := _previous_prescription(history, city.agent_id)):
                     await _notify(city, history, request)
         return
     if message.sender == BOOKING_CENTRE:
@@ -304,7 +341,9 @@ async def main(need: Need, city: City) -> None:
             await city.say(message.sender, "Non riesco ad associare la richiesta a un percorso.")
             return
         async with _case_lock(message.need_id):
-            await _renew(city, message.sender, message.need_id, old, _guess_lang(text))
+            history = await city.history(need_id=message.need_id)
+            # Often only the number (R:720): the case's language, not a guess on the tokens.
+            await _renew(city, history, message.sender, message.need_id, old, None)
         return
 
     code = _symptom_code(message, text)
@@ -335,7 +374,14 @@ async def main(need: Need, city: City) -> None:
                 # A renewal asked in words renews that prescription (P1). Only a different protocol
                 # reason gets a prescription of its own.
                 if _RENEWAL.search(text) and code is None:
-                    await _renew(city, message.sender, message.need_id, issued.number, lang)
+                    # "Grazie per il rinnovo" after one: the prescription it renewed, so _renew
+                    # finds the renewal already told and reminds it, never a third one.
+                    ours = (understood(row).body.get("prescription_number") for row in history
+                            if row.sender == city.agent_id and row.recipient == LEDGER
+                            and row.text.startswith("prescribe "))
+                    old = next((n for n in ours if isinstance(n, str)
+                                and _renewal_number(message.need_id, message.sender, n) == issued.number), issued.number)
+                    await _renew(city, history, message.sender, message.need_id, old, lang)
                     return
                 if code is None or PROTOCOL[code] == (issued.procedure, issued.priority):
                     prefs = {**_case_preferences(history, message.sender), **_preferences(said)}
@@ -625,9 +671,13 @@ _RENEWAL = re.compile(
 )
 
 
-def _issued(history: list[Message], agent_id: str, patient: str) -> Prescription | None:
-    """The latest prescription of this case the Ledger confirmed for ``patient``; None = none yet."""
+def _issued(
+    history: list[Message], agent_id: str, patient: str, number: str | None = None
+) -> Prescription | None:
+    """The latest prescription of this case the Ledger confirmed for ``patient`` (``number``: that
+    one only); None = none yet."""
 
+    wanted = number
     confirmed = {
         understood(row).body.get("prescription_number")
         for row in history
@@ -644,6 +694,7 @@ def _issued(history: list[Message], agent_id: str, patient: str) -> Prescription
             fields.get("patient") == patient
             and number in confirmed
             and isinstance(number, str)
+            and wanted in (None, number)
             and isinstance(procedure, str)
             and isinstance(priority, str)
         ):
@@ -706,51 +757,93 @@ def _reminder(
     return f"{issued.head} {text}"
 
 
-async def _renew(city: City, patient: str, need_id: str, old: str, lang: str) -> None:
-    """P1: a new prescription with the procedure and priority of ``old``, read from the Ledger."""
+async def _renew(
+    city: City, history: list[Message], patient: str, need_id: str, old: str, lang: str | None,
+    *, reply: bool = True,
+) -> None:
+    """P1: a new prescription with the procedure and priority of ``old``, as the Ledger has it.
 
-    history = await city.history(need_id=need_id)
-    ask = f"prescription prescription_number={old}"
-    if not _sent(history, city.agent_id, LEDGER, ask):
-        try:
-            await city.say(LEDGER, ask)
-        except CapError:
-            await city.say(patient, LEDGER_REFUSAL)
+    Ours in this case and confirmed (``prescribed``): renewed in this turn, no Ledger read. Else
+    the Ledger is asked once; live 21/11 it answers in 4-5 minutes, in a turn of its own (main),
+    or a later message of the citizen finds the answer here. ``reply``: a citizen's turn, which
+    always gets an answer. ``lang`` None: the case's language."""
+
+    tongue = _lang(history) if lang is None else _reply_lang(lang)
+    mine = _issued(history, city.agent_id, patient, number=old)
+    found = _ledger_rx(history, old) if mine is None else {
+        "procedure": mine.procedure, "priority": mine.priority, "symptom_code": _code_of(mine)
+    }
+    if found is None:
+        ask = f"prescription prescription_number={old}"
+        if not _sent(history, city.agent_id, LEDGER, ask):
+            try:
+                await city.say(LEDGER, ask)
+            except CapError:
+                await city.say(patient, LEDGER_REFUSAL)
+                return
+            history = await city.history(need_id=need_id)  # a quick Ledger has already answered
+            found = _ledger_rx(history, old)
+        if found is None:
+            if reply:
+                await _tell(city, patient, RENEWAL_CHECKING[tongue].format(number=old), history)
             return
-    found = _ledger_rx(history, old)
-    for _ in range(LEDGER_WAIT_ATTEMPTS):
-        if found is not None:
-            break
-        await asyncio.sleep(LEDGER_WAIT_SECONDS)
-        history = await city.history(need_id=need_id)
-        found = _ledger_rx(history, old)
-    procedure = None if found is None else found.get("procedure")
-    priority = None if found is None else found.get("priority")
+    procedure, priority = found.get("procedure"), found.get("priority")
     # Someone else's prescription, or one the Ledger does not know: nothing is renewed.
     if (
         not isinstance(procedure, str)
         or not isinstance(priority, str)
         or found.get("patient", patient) != patient
     ):
-        if not _sent(history, city.agent_id, patient, RENEWAL_UNKNOWN):
-            await city.say(patient, RENEWAL_UNKNOWN)
+        head = f"{RENEWAL_NOT_FOUND} prescription_number={old}"
+        # The Ledger's own turn says it once; a citizen's turn always gets its answer.
+        if reply or not any(
+            row.sender == city.agent_id and row.recipient == patient and row.text.startswith(head + " ")
+            for row in history
+        ):
+            await _tell(city, patient, f"{head} {RENEWAL_UNKNOWN[tongue].format(number=old)}", history)
         return
-    digest = sha256(f"{need_id}/{patient}/{old}".encode()).hexdigest()[:24].upper()
-    request = Prescription(patient, f"prescription_number-{digest}", procedure, priority)
+    request = Prescription(patient, _renewal_number(need_id, patient, old), procedure, priority, renews=old)
+    if reply and any(
+        row.sender == city.agent_id and row.recipient == patient and row.text.startswith(request.head + " ")
+        for row in history
+    ):  # asked again once renewed: what is ready, never silence
+        await _tell(city, patient, _reminder(history, city.agent_id, request, tongue, {}), history)
+        return
     code = found.get("symptom_code")
-    await _issue(city, need_id, request, f"symptom_code={code} " if isinstance(code, str) else "", lang)
+    await _issue(city, need_id, request, f"symptom_code={code} " if isinstance(code, str) else "", tongue)
+
+
+def _renewal_number(need_id: str, patient: str, old: str) -> str:
+    """Derived from the case and ``old``: a retry never renews twice."""
+
+    return "prescription_number-" + sha256(f"{need_id}/{patient}/{old}".encode()).hexdigest()[:24].upper()
 
 
 def _ledger_rx(history: list[Message], number: str) -> dict | None:
-    """The Ledger's latest answer about prescription ``number``."""
+    """The Ledger's latest answer about prescription ``number``: its fields, {} for a refusal;
+    None = no answer yet."""
 
     found = None
     for row in history:
-        if row.sender == LEDGER and row.text.split()[:1] == ["prescription"]:
-            fields = understood(row).body
-            if fields.get("prescription_number") == number:
-                found = dict(fields)
+        if row.sender != LEDGER or understood(row).body.get("prescription_number") != number:
+            continue
+        words = row.text.split()
+        if words[:1] == ["prescription"]:
+            found = dict(understood(row).body)
+        elif words[:1] == ["refused"] and "prescription" in words:
+            found = {}
     return found
+
+
+def _renewal_asker(history: list[Message], agent_id: str, number: object) -> str | None:
+    """The citizen whose renewal of ``number`` we asked the Ledger about in this case."""
+
+    if not isinstance(number, str) or not _sent(history, agent_id, LEDGER, f"prescription prescription_number={number}"):
+        return None
+    return next((
+        row.sender for row in history
+        if row.sender.startswith("citizen:") and understood(row).body.get("prescription_number") == number
+    ), None)
 
 
 async def _issue(
@@ -921,8 +1014,10 @@ async def _handoff(
     """Best effort, once per need: the prescription to our booking centre. Never raises."""
 
     done = [row.text for row in history if row.sender == city.agent_id and row.text.startswith(HANDOFF + " ")]
-    if done:  # once per need; a renewal's new number was not passed on, so we do not claim it
-        return any(f" prescription_number={request.number} " in text for text in done)
+    if any(f" prescription_number={request.number} " in text for text in done):
+        return True
+    if done and not request.renews:  # once per need; only a renewal's new number (P1) goes too
+        return False
     try:
         peers = [peer for peer in await city.find("booking_centre") if peer.agent_id == BOOKING_CENTRE]
         if len(peers) != 1:
@@ -931,8 +1026,14 @@ async def _handoff(
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
             f"procedure={request.procedure} priority={request.priority} lang={lang} notify_if=no_slots "
+            + (f"renewal_of={request.renews} " if request.renews else "")
             + (f"{tokens} " if (tokens := _preference_tokens(prefs)) else "")
-            + "Buongiorno, vi passo la ricetta che ho appena scritto sul Ledger per la prenotazione"
+            + (
+                f"Buongiorno, vi passo il rinnovo della ricetta {request.renews}, con la stessa visita e "
+                "la stessa priorità, che ho appena scritto sul Ledger per la prenotazione"
+                if request.renews
+                else "Buongiorno, vi passo la ricetta che ho appena scritto sul Ledger per la prenotazione"
+            )
             + (f", con le preferenze che il paziente mi ha indicato ({_describe(prefs, 'it')}). " if tokens else ". ")
             + "Se non trovate un posto, avvisatemi così posso aiutare la persona a proseguire. Grazie!",
         )
