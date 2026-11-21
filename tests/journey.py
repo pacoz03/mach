@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, Peer, understood  # noqa: E402
+from httpx import ReadTimeout  # noqa: E402  (quello che solleva city.say quando il Relay supera 10 s)
 
 # --- IPOTESI: sostituire con risposte reali ---------------------------------------------------
 # I testi del Ledger reale non sono documentati. Queste forme vengono da come li leggono i brain
@@ -47,6 +48,9 @@ REPLY = {
     "committed": "committed booking_id={hold_id} ledger_ref={ledger_ref} slot_id={slot_id} "
     "receipt=sig-{ledger_ref}",
     "cancelled": "cancelled hold_id={hold_id} slot_id={slot_id}",
+    # Nessun `expired` nel kit (LocalLedger non lo ha) né in episodes al 21/11: forma ipotetica,
+    # la stessa di cancelled.
+    "expired": "expired hold_id={hold_id} slot_id={slot_id}",
     "checked_in": "checked_in booking_id={booking_id} citizen={citizen} slot_id={slot_id}",
     "reported": "reported booking_id={booking_id} outcome_code={outcome_code} shared={shared}",
     "refused": "refused {op} code={code}",  # + i token identificativi della richiesta
@@ -156,10 +160,16 @@ class Ledger:
         self.consents: set[tuple[str, str]] = set()  # (purpose, consent_ref) dati dal cittadino
         self.writes: list[dict] = []
         self.refuse_holds = sc.get("refuse_holds", 0)
+        self.refuse_code = sc.get("refuse_code", "SLOT_TAKEN")  # codice dell'hold rifiutato
         self.refuse_checkin = sc.get("refuse_checkin")
         self.full = self.now + timedelta(days=sc.get("full_days", 0))  # slot prima di qui: pieni
         self.slow_agenda, self.agendas = sc.get("slow_agenda", 0), 0  # secondi, dalla 2a agenda
         self.slow_world = sc.get("slow_world", 0)  # secondi, ogni world (città 21/11: ~12 s)
+        self.slow_writes = sc.get("slow_writes", 0)  # secondi, risposta a hold e commit (21/11: ~30 s)
+        self.push_expired = sc.get("push_expired", 0)  # commit che arrivano a hold già scaduto
+        self.steal = sc.get("steal")  # slot preso da un'altra ASST subito dopo la prima risposta a world
+        self.flipped: set[str] = set()  # regole accese a metà scenario (sc["rule_at"]): i loro rifiuti sono iniettati
+        self.pods = bool(sc.get("pods"))  # due pod senza lock comune: un commit doppio (DUPLICATE) è la corsa iniettata
         self.n = 0
 
     def advance(self, days: int) -> None:
@@ -170,6 +180,8 @@ class Ledger:
         return bool(r) and self.rules["P1"] == "on" and self.now - r["issued"] > timedelta(days=2)
 
     def late(self, text: str) -> float:
+        if (text.split() or [""])[0] in ("hold", "commit"):
+            return self.slow_writes
         if (text.split() or [""])[0] == "world":
             return self.slow_world
         if (text.split() or [""])[0] != "agenda":
@@ -180,7 +192,7 @@ class Ledger:
     def taken(self, slot_id: str) -> bool:
         if datetime.fromisoformat(self.slots[slot_id]["at"]) < self.full:
             return True
-        return any(h["slot_id"] == slot_id and h["state"] != "cancelled" for h in self.holds.values())
+        return any(h["slot_id"] == slot_id and h["state"] not in ("cancelled", "expired") for h in self.holds.values())
 
     def answer(self, by: str, need: str | None, text: str, i: int) -> str:
         op = (text.split() or [""])[0]
@@ -189,7 +201,7 @@ class Ledger:
             return self.read(op, f)
         code, reply, injected = self.write(op, by, need, f)
         self.writes.append(dict(i=i, by=self.folder.get(by, by), op=op, f=f, code=code, injected=injected))
-        if code is None:
+        if code is None or reply:  # reply con un codice: il Ledger risponde altro (push_expired)
             return reply
         ids = [f"{k}={f[k]}" for k in ("prescription_number", "slot_id", "hold_id", "booking_id") if k in f]
         return " ".join([REPLY["refused"].format(op=op, code=code), *ids])
@@ -212,9 +224,13 @@ class Ledger:
                 return "NOT_FOUND", "", False
             if self.refuse_holds:  # guasto facility_cancel iniettato dallo scenario
                 self.refuse_holds -= 1
-                return "SLOT_TAKEN", "", True
+                return self.refuse_code, "", True
             if self.taken(s["slot_id"]):
-                return "SLOT_TAKEN", "", False
+                return "SLOT_TAKEN", "", s["slot_id"] == self.steal
+            # Il Ledger vero rifiuta la riserva U sull'hold (episodes: refused op=hold code=NO_CAPACITY).
+            if (self.rules["P3"] == "on" and s["reserve"]
+                    and self.rx.get(f.get("prescription_number", ""), {}).get("priority") != "U"):
+                return "NO_CAPACITY", "", "P3" in self.flipped
             # ponytail: il mondo finto non ha ASST partner, quindi P2 non scatta finché non si
             # aggiungono slot di un'altra ASST (ondata 3B).
             if (self.rules["P2"] == "on" and s["facility"] not in self.folder
@@ -224,9 +240,15 @@ class Ledger:
             self.holds[hid] = dict(f, hold_id=hid, need_id=need, state="held")
             return None, REPLY["held"].format(**self.holds[hid]), False
         h = self.holds.get(f.get("hold_id") or f.get("booking_id", ""))
+        if op == "commit" and self.push_expired and h is not None and h["state"] == "held":
+            self.push_expired -= 1  # l'hold scade prima del commit: push `expired` (R:682)
+            h["state"] = "expired"
+            return "EXPIRED", REPLY["expired"].format(**h), True
         if op == "commit":
             if h is not None and h["state"] == "committed":  # come il Ledger vero (episodes)
-                return "DUPLICATE", "", False
+                return "DUPLICATE", "", self.pods
+            if h is not None and h["state"] == "expired":  # sc["expire_holds"]: il commit arriva tardi
+                return "EXPIRED", "", True
             if h is None or h["state"] != "held":
                 return "UNKNOWN_HOLD", "", False
             if not f.get("consent_ref"):
@@ -282,6 +304,8 @@ class Ledger:
             for s in rows[(page - 1) * PAGE: page * PAGE]:
                 line = REPLY["slot"].format(**s, free=0 if self.taken(s["slot_id"]) else 1)
                 lines.append(line + (" urgent_reserve=true" if self.rules["P3"] == "on" and s["reserve"] else ""))
+            if self.steal in self.slots:  # sc["steal"]: un'altra ASST lo conferma appena dopo questa risposta
+                self.holds.setdefault("H-ALTRA", dict(hold_id="H-ALTRA", slot_id=self.steal, need_id=None, state="committed"))
             return "\n".join(lines)
         return REPLY["refused"].format(op=op or "?", code="UNKNOWN_OP")
 
@@ -343,18 +367,38 @@ class Port:
         b = self.bus
         if b.race:  # sc["race"]: la rete cede il loop, gli altri turni vanno avanti intanto
             await asyncio.sleep(0)
+        if b.bounce and self.me == b.ids["hospital"]:  # sc["bounce"]: ospedale giù per i suoi primi N invii
+            b.bounce -= 1
+            b.bounced.append((self.me, to, body.get("text", "")))
+            raise CapError("TARGET_NOT_VISIBLE", to)
+        if b.timeouts and self.me == b.ids["hospital"]:  # sc["say_timeout"]: il Relay non risponde (httpx)
+            b.timeouts -= 1
+            raise TimeoutError(to)
+        op = (str(body.get("text", "")).split() or [""])[0]
+        # sc["say_delay"]: secondi per ogni city.say (o {op: secondi}); il Relay vero ci mette 1-5 s.
+        delay = b.say_delay if isinstance(b.say_delay, (int, float)) else b.say_delay.get(op, 0)
+        if delay:
+            await asyncio.sleep(delay)
+        if op and op == b.timeout_on:  # sc["say_timeout_on"]: la prima say con questa parola d'atto va oltre 10 s
+            b.timeout_on = None
+            raise ReadTimeout("relay send")
         if to in b.down or self.me in b.down or (self.me, to) in b.hidden:
             b.bounced.append((self.me, to, body.get("text", "")))
             raise CapError("TARGET_NOT_VISIBLE", to)
         m = b.add(self.me, to, body, need_id, conversation_id)
         if to == LEDGER:  # la risposta è subito nel log: il polling nel turno la vede
             text = b.ledger.answer(self.me, need_id, m.text, len(b.log) - 1)
-            if delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città
-                asyncio.get_running_loop().call_later(delay, b.reply, self.me, text, need_id, conversation_id)
+            if text.startswith("expired "):  # un push: apre sempre un turno suo, mai una risposta
+                b.queue.append(b.add(LEDGER, self.me, {"text": text}, need_id, conversation_id))
+            elif delay := b.ledger.late(m.text):  # sc["slow_agenda"]: arriva dopo, come in città; il bus la aspetta
+                b.tasks.append(asyncio.create_task(b.later(delay, self.me, text, need_id, conversation_id)))
             else:
                 r = b.reply(self.me, text, need_id, conversation_id)
                 if b.race and text.startswith("held "):  # il push di held apre subito un turno suo
                     b.tasks.append(asyncio.create_task(b.deliver(r)))
+                if b.expire_holds and text.startswith("held "):  # solo il primo hold, se no si riprenota all'infinito
+                    ttl, b.expire_holds = b.expire_holds, 0
+                    b.tasks.append(asyncio.create_task(b.expire(fields(text)["hold_id"], ttl, self.me, need_id, conversation_id)))
         else:
             b.queue.append(m)
         return m.msg_id
@@ -402,7 +446,7 @@ class Citizen:
 
     def checkin(self, fac: str, booking_id: str, ledger_ref: str) -> None:
         """Livello 3: sc["checkin"] sceglie come il cittadino si presenta in struttura."""
-        if self.sc.get("ledger_cancel"):  # la città annulla prima della visita (Bus.run)
+        if self.sc.get("ledger_cancel") or self.sc.get("booking_cancel"):  # annullata prima della visita (Bus.run)
             return
         text = f"checkin booking_id={booking_id} ledger_ref={ledger_ref}"
         mode = self.sc.get("checkin", "testo")
@@ -494,13 +538,31 @@ class Bus:
         self.dup = sc.get("dup_confirm", 0)
         # sc["hidden"]: il cittadino non è visibile all'ospedale (altra ASST, TARGET_NOT_VISIBLE)
         self.hidden = {(self.ids["hospital"], CIT)} if sc.get("hidden") else set()
+        self.bounce = sc.get("bounce", 0)
+        self.timeouts = sc.get("say_timeout", 0)
+        self.late_refusal = sc.get("late_refusal", False)
+        self.took: dict[str, float] = {}  # msg_id -> secondi del turno che ha aperto (l'ack parte alla fine)
+        self.opened: dict[int, Message] = {}  # turno -> messaggio che lo ha aperto
+        if "pull_pause" in sc:  # in città ogni lettura della history costa: 0,25 s di pausa + la lettura
+            self.agents[self.ids["hospital"]].mods["facility"]._PULL_PAUSE = sc["pull_pause"]
+        # --- G: guasti dei livelli 6-8 (default spenti) ---
+        self.hosp = self.ids["hospital"]
+        self.say_delay, self.timeout_on = sc.get("say_delay", 0), sc.get("say_timeout_on")
+        self.expire_holds = sc.get("expire_holds", 0)  # secondi di vita del primo hold non confermato
+        # passo = messaggio consegnato che non viene dal Ledger: down_turns e rule_at cadono nello
+        # stesso punto con e senza --ledger-turns
+        self.step, self.down_turns, self.inflight, self.back_at = 0, sc.get("down_turns"), set(), 0
+        self.rule_at = dict(sc.get("rule_at", {}))
+        # sc["pods"]=2: un secondo ospedale con i suoi globali (_GATES, _BOUNCED, _WORLD...), i turni si alternano
+        self.pods = [self.agents[self.hosp], Agent("hospital")] if sc.get("pods") == 2 else []
+        self.pod_turns = 0
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
 
     def add(self, sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
         lang = self.citizen.sc.get("confirm_lang")  # il centro manda lang= nel confirm all'ospedale
-        if (lang and sender == self.ids["booking_centre"] and to == self.ids["hospital"]
+        if (lang and sender in (self.ids["booking_centre"], FOREIGN) and to == self.ids["hospital"]
                 and str(body.get("text", "")).startswith("confirm")):
             body = {**body, "text": f"{re.sub(r' ?lang=\S+', '', body['text'])} lang={lang}"}
         m = Message(type=kind, sender=sender, recipient=to, msg_id=f"m-{len(self.log)}",
@@ -514,15 +576,28 @@ class Bus:
         r = self.add(LEDGER, to, {"text": text}, need, conv)
         if self.ledger_turns:
             self.queue.append(r)
+        if self.late_refusal and text.startswith("held "):  # sc["late_refusal"]: hold doppio rifiutato dopo il held
+            self.late_refusal = False
+            late = f"refused hold code=NO_CAPACITY slot_id={fields(text).get('slot_id', '')}"
+            self.queue.append(self.add(LEDGER, to, {"text": late}, need, conv))
         return r
+
+    async def later(self, delay: float, *reply) -> None:
+        await asyncio.sleep(delay)
+        self.reply(*reply)
 
     async def deliver(self, m: Message) -> None:
         a = self.agents[m.recipient]
+        if self.pods and a.folder == "hospital":
+            a, self.pod_turns = self.pods[self.pod_turns % 2], self.pod_turns + 1
         if a.main is None:
             self.crashes.append(f"{a.folder}: import fallito: {a.error}")
             return
         port = Port(self, a.id)
-        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm)
+        # sc["address"]: la via dell'ospedale (city.address, CITY_ADDRESS in città)
+        street = self.citizen.sc.get("address", "") if a.folder == "hospital" else ""
+        city = City(index=port, messages=port, history=port, agent_id=a.id, inbound=m, llm=self.llm, address=street)
+        started = time.monotonic()
         with a.active():
             try:
                 await a.main(Need(summary=m.text, message=m), city)
@@ -530,6 +605,7 @@ class Bus:
                 self.oos.add(m.msg_id)
             except Exception:
                 self.crashes.append(f"crash {a.folder}: {traceback.format_exc().strip().splitlines()[-1]}")
+        self.took[m.msg_id] = time.monotonic() - started
         if self.dup and m.sender == self.ids["booking_centre"] and a.folder == "hospital" and m.text.startswith("confirm"):
             self.dup -= 1  # sc["dup_confirm"]: lo stesso confirm arriva di nuovo dopo il turno, msg_id nuovo
             self.queue.append(self.add(m.sender, m.recipient, m.body, m.need_id, m.conversation_id))
@@ -539,30 +615,87 @@ class Bus:
         # domande, un secondo disturbo, un rinnovo chiesto a parole).
         # sc["foreign_after"]: altre richieste del centro dell'altra ASST all'ospedale.
         # sc["ledger_cancel"]: a prenotazione fatta il Ledger la annulla, poi il cittadino chiede l'orario.
-        cancel = (("ledger", self.citizen.sc["ledger_cancel"]), ("hospital", ORARIO)) if "ledger_cancel" in self.citizen.sc else ()
+        # sc["after_cancel"]: cosa il cittadino scrive all'ospedale dopo l'annullo (default ORARIO);
+        # {hold_id}/{ledger_ref} sono quelli della prenotazione annullata.
+        # sc["booking_cancel"]: a prenotazione fatta il centro annulla la visita per il cittadino.
+        sc = self.citizen.sc
+        cancel = (("ledger", sc["ledger_cancel"]), ("hospital", sc.get("after_cancel", ORARIO))) if "ledger_cancel" in sc else ()
+        cancel += (("booking", sc["booking_cancel"]),) if "booking_cancel" in sc else ()
         for to, text in (start, *(("gp", t) for t in self.citizen.sc.get("after", ())),
                          *(("hospital", t) for t in self.citizen.sc.get("foreign_after", ())), *cancel):
             if to == "ledger":
-                h = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
+                h = self.dropped = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
                 h["state"] = "cancelled"
                 self.queue.append(self.add(LEDGER, self.ids["hospital"], {"text": REPLY["cancelled"].format(**h)
                                            + f" booking_id={h['hold_id']} reason={text}"}))
+            elif to == "booking":  # l'offer_id del confirm del centro, come lo nomina un centro vero
+                bc, hosp = self.ids["booking_centre"], self.ids["hospital"]
+                h = next(h for h in self.ledger.holds.values() if h["state"] == "committed")
+                offer = next(fields(m.text)["offer_id"] for m in self.log if m.sender == bc and m.recipient == hosp
+                             and m.text.startswith("confirm") and f"slot_id={h['slot_id']}" in m.text.split())
+                self.queue.append(self.add(bc, hosp, {"text": f"cancel offer_id={offer} reason={text}"}))
+            elif to == "hospital" and "{hold_id}" in text:
+                self.citizen.say(self.ids[to], text.format(**self.dropped))
             elif self.citizen.sc.get("foreign"):  # cross-ASST: apre il centro di un'altra ASST
-                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}))
+                text, need = text if isinstance(text, tuple) else (text, NEED)  # (testo, need_id): altro caso
+                if self.citizen.sc.get("gap") and (to, text) != start:  # sc["gap"]: secondi tra le richieste
+                    await asyncio.sleep(self.citizen.sc["gap"])
+                self.queue.append(self.add(FOREIGN, self.ids[to], {"text": text}, need))
             else:
                 self.citizen.say(self.ids[to], text)
-            while (self.queue or self.tasks) and self.turn < MAX_TURNS:
+            while (self.queue or self.tasks or self.back()) and self.turn < MAX_TURNS:
                 if not self.queue:  # sc["race"]: aspetta i turni concorrenti ancora aperti
                     await self.tasks.pop()
                     continue
                 m = self.queue.popleft()
                 self.turn += 1
+                self.opened[self.turn] = m
+                if m.sender != LEDGER:
+                    self.step += 1
+                    self.window(m)
                 if m.recipient == CIT:
                     self.citizen.react(m)
                 elif m.recipient == FOREIGN:
                     self.foreign(m)
-                elif m.recipient in self.agents and m.recipient not in self.down:
+                elif m.recipient in self.agents and (m.recipient not in self.down or m.msg_id in self.inflight):
                     await self.deliver(m)
+
+    def window(self, m: Message) -> None:
+        """sc["rule_at"]={"P3": passo}: la regola si accende a quel passo (R:708-718).
+        sc["down_turns"]=(a, b): l'ospedale è giù dal passo a al passo b, TARGET_NOT_VISIBLE nei due
+        sensi come sc["down"] (R:694-701). I messaggi già accettati dal Relay prima (in coda, ``m``
+        compreso) arrivano lo stesso: il turno in corso resta vivo, le sue say rimbalzano."""
+        for rule, at in self.rule_at.items():
+            if self.step >= at and self.ledger.rules[rule] != "on":
+                self.ledger.rules[rule] = "on"
+                self.ledger.flipped.add(rule)
+        a, b = self.down_turns or (0, 0)
+        if a <= self.step < b and self.hosp not in self.down:
+            self.down.add(self.hosp)
+            self.inflight = {m.msg_id, *(q.msg_id for q in self.queue)}
+        elif self.step >= b:
+            self.back()
+
+    def back(self) -> bool:
+        """Fine di sc["down_turns"] (o il bus è fermo): l'ospedale torna e chi gli aveva mandato
+        l'ultimo confirm lo rimanda, con un msg_id nuovo ("quando l'ospedale torna, prenotate")."""
+        if not self.down_turns or self.hosp not in self.down:
+            return False
+        self.down.discard(self.hosp)
+        self.down_turns, self.back_at = None, len(self.log)
+        last = next((m for m in reversed(self.log) if m.recipient == self.hosp and m.text.startswith("confirm")), None)
+        if last is not None:
+            self.queue.append(self.add(last.sender, self.hosp, last.body, last.need_id, last.conversation_id))
+        return last is not None
+
+    async def expire(self, hold_id: str, ttl: float, holder: str, need: str | None, conv: str | None) -> None:
+        """sc["expire_holds"]: dopo ``ttl`` secondi un hold non ancora confermato scade e il Ledger
+        lo dice con un push; un commit arrivato dopo è rifiutato EXPIRED."""
+        await asyncio.sleep(ttl)
+        h = self.ledger.holds[hold_id]
+        if h["state"] == "held":
+            h["state"] = "expired"
+            self.queue.append(self.add(LEDGER, holder, {"text": REPLY["expired"].format(**h)}, need, conv))
 
     def foreign(self, m: Message) -> None:
         """Il centro di un'altra ASST (R:191-195): alla prima offerta rimanda la stessa richiesta
@@ -594,6 +727,12 @@ def general(b: Bus) -> list[str]:
 
     def before(op: str, key: str, val: str | None, i: int) -> bool:
         return any(w["op"] == op and not w["code"] and w["f"].get(key) == val and w["i"] < i for w in L.writes)
+
+    # Fast reply (+1, R:246) is scored on the ack, sent when the turn ends: every hospital turn
+    # opened by another agent ends within 9.5 s.
+    for m in b.log:
+        if m.recipient == b.ids["hospital"] and m.sender not in (LEDGER, CIT) and b.took.get(m.msg_id, 0) >= 9.5:
+            errs.append(f"hospital: turno aperto da {b.name(m.sender)} «{m.text[:40]}» durato {b.took[m.msg_id]:.1f} s (ack > 10 s, R:246)")
 
     offered: set[str | None] = set()
     for i, m in enumerate(b.log):
@@ -632,7 +771,7 @@ def general(b: Bus) -> list[str]:
             errs.append(f"{by}: checkin booking_id={bid} mai confermato sul Ledger (inventato)")
         if n > 1:
             errs.append(f"{by}: {n} checkin sul Ledger per booking_id={bid}, ne serve uno (retry)")
-    for (s, t), n in Counter((s, t) for s, t, _ in b.bounced).items():
+    for (s, t, _), n in Counter(b.bounced).items():  # lo stesso messaggio: due letture diverse non sono un retry
         if n > 1:
             errs.append(f"{b.name(s)} ha ritentato {n} volte verso {b.name(t)} dopo TARGET_NOT_VISIBLE (R:701)")
     for i, m in enumerate(b.log):
@@ -966,6 +1105,13 @@ def no_world_of(proc: str):
     return check
 
 
+def by_turns(with_turns, without):
+    """Con --ledger-turns (come in città) la risposta del Ledger apre un turno suo, senza resta solo nella history."""
+    def check(b: Bus) -> str | None:
+        return (with_turns if b.ledger_turns else without)(b)
+    return check
+
+
 XREQ = "need.request service_type={svc} procedure={proc} priority=B request_id={rid} Buongiorno, cerchiamo disponibilità."
 XFIS = "need.request service_type=hospital.physiatry procedure=VIS-FIS priority=B request_id={rid}{extra} Buongiorno."
 BACK = ("gp", "Ho mal di schiena da una settimana, vorrei farmi vedere.")
@@ -1109,12 +1255,15 @@ SCENARIOS: dict[str, dict] = {
     "cross_asst_vincoli": dict(
         start=("hospital", XFIS.format(rid="R-13", extra=" lang=en gender=f")), foreign=True,
         expect=[cross_reply("R-13", "B"), cross_only("R-13", "h1")]),
-    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e il turno
-    # aspetta la risposta di world; R-12 trova la pagina in memoria e offre in meno di 1 s.
+    # Ledger lento (world dopo 12 s, città 21/11): R-11 a freddo risponde entro 9,5 s e chiude il
+    # turno; R-12 arriva 6 s dopo. Con la risposta di world come turno suo (--ledger-turns, come in
+    # città) R-12 trova la pagina in memoria e offre in meno di 1 s; senza, R-12 è di nuovo a freddo.
     "cross_asst_world_lento": dict(
         start=("hospital", XFIS.format(rid="R-11", extra="")), foreign_after=[XFIS.format(rid="R-12", extra="")],
-        foreign=True, slow_world=12.0,
-        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5), cross_reply("R-12", "B"), cross_fast("R-12", 1.0)]),
+        foreign=True, slow_world=12.0, gap=6.0,
+        expect=[cross_reply("R-11", None), cross_fast("R-11", 9.5),
+                by_turns(cross_reply("R-12", "B"), cross_reply("R-12", None)),
+                by_turns(cross_fast("R-12", 1.0), cross_fast("R-12", 9.5))]),
     "cross_asst_tutto_pieno": dict(
         start=("hospital", XFIS.format(rid="R-9", extra="")), foreign=True, full_days=15,
         expect=[cross_reply("R-9", None), no_write("hold", "R:192")]),
@@ -1159,13 +1308,14 @@ def rehold(b: Bus) -> str | None:
         return f"dopo il rifiuto {len(again)} hold su {slot} invece di uno accettato (re-hold)"
 
 
-def cancel_told(peer: str, reason: str, n: int):
+def cancel_told(peer: str, reason: str | None, n: int):
+    """``reason=None``: un cancel con un motivo qualsiasi. ``peer``: cartella, "citizen" o FOREIGN."""
     def check(b: Bus) -> str | None:
-        to = CIT if peer == "citizen" else b.ids[peer]
+        to = CIT if peer == "citizen" else b.ids.get(peer, peer)
         got = [m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == to and act(m) == "cancel"
-               and f"reason={reason}" in m.text.split()]
+               and (f"reason={reason}" in m.text.split() if reason else "reason=" in m.text)]
         if len(got) != n:
-            return f"hospital ha mandato {len(got)} cancel reason={reason} a {peer} invece di {n}"
+            return f"hospital ha mandato {len(got)} cancel reason={reason or '…'} a {b.name(to)} invece di {n}"
     return check
 
 
@@ -1200,6 +1350,343 @@ SCENARIOS.update({
 })
 
 
+# --- D: ospedale, alternative a uno slot perso, via nel benvenuto, lingua del partner, rimbalzi
+# (_BOUNCED) per caso e a tempo, rifiuto tardivo di un hold doppio -----------------------------
+
+
+def lost_slot_alternatives(rid: str):
+    """Hold rifiutato NO_CAPACITY su un'offerta cross-ASST: cancel col motivo al centro dell'altra
+    ASST, poi da 1 a 3 offerte nuove con request_id e soli campi del Ledger; mai lo slot perso
+    (tolto anche dalla pagina in memoria) né uno già offerto."""
+    def check(b: Bus) -> str | None:
+        hosp = b.ids["hospital"]
+        sent = [m for m in b.log if m.sender == hosp and m.recipient == FOREIGN]
+        lost = next((w["f"].get("slot_id") for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+        i = next((i for i, m in enumerate(sent) if act(m) == "cancel" and "reason=NO_CAPACITY" in m.text.split()), None)
+        if lost is None or i is None:
+            return "nessun hold rifiutato o nessun cancel reason=NO_CAPACITY al centro dell'altra ASST"
+        before = {o.get("slot_id") for m in sent[:i] for o in parse_offers(m.text)}
+        after = [o for m in sent[i + 1:] if act(m) == "offer" and f"request_id={rid}" in m.text.split()
+                 for o in parse_offers(m.text)]
+        if not 1 <= len(after) <= 3:
+            return f"{len(after)} offerte alternative dopo il cancel invece di 1-3"
+        for o in after:
+            s = b.ledger.slots.get(o.get("slot_id", ""))
+            if o.get("slot_id") == lost or o.get("slot_id") in before:
+                return f"alternativa {o.get('slot_id')} già persa o già offerta"
+            if s is None or s["facility"] != hosp or o.get("request_id") != rid:
+                return f"alternativa non dell'ospedale o senza request_id={rid}: {o}"
+            for k, v in o.items():
+                if k not in ("offer_id", "request_id", "priority") and (k not in SLOT_KEYS or str(s[SLOT_KEYS[k]]) != v):
+                    return f"attributo {k}={v} non dal Ledger (R:243)"
+    return check
+
+
+def lost_not_offered(rid: str):
+    """Dopo un NO_CAPACITY la pagina in memoria non offre più lo slot perso a un'altra richiesta."""
+    def check(b: Bus) -> str | None:
+        lost = next((w["f"].get("slot_id") for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+        got = [o.get("slot_id") for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+               and f"request_id={rid}" in m.text.split() for o in parse_offers(m.text)]
+        if not got:
+            return f"nessuna offerta per {rid}"
+        if lost in got:
+            return f"{rid}: offerto di nuovo lo slot perso {lost} dalla pagina in memoria"
+    return check
+
+
+def silent_after_refused_hold(b: Bus) -> str | None:
+    hold = next((w for w in b.ledger.writes if w["op"] == "hold" and w["code"]), None)
+    if hold is None:
+        return "nessun hold rifiutato"
+    got = [m for m in b.log[hold["i"]:] if m.sender == b.ids["hospital"] and m.recipient == FOREIGN]
+    if got:
+        return f"hospital ha scritto al centro dopo un hold rifiutato DUPLICATE: «{got[0].text[:80]}»"
+
+
+def late_refusal_no_cancel(b: Bus) -> str | None:
+    """Il Ledger rifiuta un secondo hold sullo stesso slot dopo il held del primo (secondo pod,
+    Ledger lento): la prenotazione resta, nessun cancel a nessuno."""
+    hosp = b.ids["hospital"]
+    refused = next((i for i, m in enumerate(b.log) if m.sender == LEDGER and m.recipient == hosp
+                    and m.text.startswith("refused hold")), None)
+    if refused is None:
+        return "nessun refused hold arrivato all'ospedale"
+    got = [m for m in b.log[refused:] if m.sender == hosp and act(m) == "cancel"]
+    if got:
+        return f"cancel falso dopo il rifiuto tardivo: «{got[0].text[:80]}»"
+
+
+SCENARIOS.update({
+    # Slot perso (NO_CAPACITY) su un'offerta cross-ASST: cancel, poi altre date dalla pagina in memoria.
+    "ospedale_alternative": dict(
+        start=("hospital", XFIS.format(rid="R-20", extra="")), foreign=True, refuse_holds=1,
+        refuse_code="NO_CAPACITY", foreign_after=[(XFIS.format(rid="R-25", extra=""), WALKIN)],
+        expect=[lost_slot_alternatives("R-20"), lost_not_offered("R-25")]),
+    # DUPLICATE: niente perso, niente cancel né alternative.
+    "ospedale_alternative_duplicate": dict(
+        start=("hospital", XFIS.format(rid="R-21", extra="")), foreign=True, refuse_holds=1,
+        refuse_code="DUPLICATE", expect=[silent_after_refused_hold]),
+    # Proattività: il benvenuto dice la via dell'ospedale (city.address).
+    "welcome_indirizzo": dict(start=BACK, address="Via Esempio 1", expect=[
+        told_text("hospital", "in Via Esempio 1", cite="proattività: indirizzo"), *CHECKED_IN]),
+    # Il centro di un'altra ASST conferma con lang=en: benvenuto in inglese.
+    "welcome_lang_en_partner": dict(
+        start=("hospital", XFIS.format(rid="R-22", extra="")), foreign=True, confirm_lang="en",
+        expect=[told_text("hospital", "Hello, this is the hospital", cite="lang=en dal partner")]),
+    # Ospedale giù per il primo invio (agenda di R-23): un caso dopo (R-24) l'agenda riparte e
+    # l'offerta arriva subito, non dopo l'attesa a freddo.
+    "ospedale_giu_poi_su": dict(
+        start=("hospital", XFIS.format(rid="R-23", extra="")), foreign=True, bounce=1,
+        foreign_after=[(XFIS.format(rid="R-24", extra=""), WALKIN)],
+        expect=[cross_reply("R-23", "B"), cross_reply("R-24", "B"), cross_fast("R-24", 4.0),
+                asked_ledger("hospital", "agenda")]),
+    # Ledger lento o secondo pod: un refused hold arriva dopo il held dello stesso slot.
+    "ospedale_rifiuto_tardivo": dict(start=BACK, late_refusal=True, expect=[
+        late_refusal_no_cancel, wrote("commit", "R:241"), *CHECKED_IN]),
+    # Una say dell'ospedale va in timeout (Relay oltre 10 s): il turno non si interrompe a metà.
+    "ospedale_say_timeout": dict(start=BACK, say_timeout=1, expect=[wrote("commit", "R:241"), *CHECKED_IN]),
+})
+
+
+# --- Cross-ASST: offerte distribuite e ack subito (ospedale 1.0.8 in città: 80 offerte in 11 minuti
+# sugli stessi 3 slot, 3 confirm su 5 rifiutati NO_CAPACITY; ogni risposta dalla cache con ack a 12-20 s)
+
+
+def _hospital_hold(b: Bus) -> str | None:
+    return next((w["f"].get("slot_id") for w in b.ledger.writes
+                 if w["op"] == "hold" and w["by"] == "hospital" and not w["code"]), None)
+
+
+def cross_spread(*rids: str):
+    """Dopo l'hold dell'ospedale quello slot non viene più offerto, e le richieste ``rids``
+    ricevono più di 3 slot diversi (non sempre gli stessi 3)."""
+    def check(b: Bus) -> str | None:
+        hold = _hospital_hold(b)
+        if hold is None:
+            return "nessun hold accettato dell'ospedale"
+        got = {}
+        for rid in rids:
+            m = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                      and f"request_id={rid}" in m.text.split()), None)
+            got[rid] = [o.get("slot_id") for o in parse_offers(m.text)] if m else []
+        again = [rid for rid, slots in got.items() if hold in slots]
+        if again:
+            return f"{hold}, già in hold, offerto di nuovo a {again}"
+        if len(set().union(*got.values()) - {hold}) <= 3:
+            return f"offerte {got}: sempre gli stessi slot"
+    return check
+
+
+def cache_after_hold(b: Bus) -> str | None:
+    """--ledger-turns: la risposta di world letta dopo l'hold arriva in _WORLD nel suo turno."""
+    if not b.ledger_turns:
+        return None
+    hold = _hospital_hold(b)
+    page = b.agents[b.ids["hospital"]].mods["facility"]._WORLD.get(("VIS-FIS", 1))
+    line = next((l.split() for l in page[1].splitlines() if f"slot_id={hold}" in l.split()), []) if page else None
+    if line is None or {"free=1", "capacity=1"} & set(line):
+        return f"pagina di world in memoria vecchia: {hold} ancora libero dopo l'hold"
+
+
+def cross_turn_ends(rid: str, nxt: str):
+    """Il +1 della risposta veloce si misura sull'ack, che parte a fine turno (R:246): dopo la
+    risposta a ``rid`` il turno dell'ospedale finisce subito e la richiesta ``nxt`` parte entro 1 s."""
+    def check(b: Bus) -> str | None:
+        got = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+                    and f"request_id={rid}" in m.text.split()), None)
+        req = next((m for m in b.log if m.sender == FOREIGN and f"request_id={rid}" in m.text.split()), None)
+        asked = next((m for m in b.log if m.sender == FOREIGN and f"request_id={nxt}" in m.text.split()), None)
+        if got is None or asked is None or req is None:
+            return f"risposta a {rid} o richiesta {nxt} mancante"
+        # The turn's own duration (b.took): the bus also waits for slow Ledger replies before nxt.
+        took = b.took[req.msg_id] - (b.stamp[got.msg_id] - b.stamp[req.msg_id]) if req.msg_id in b.took else (
+            b.stamp[asked.msg_id] - b.stamp[got.msg_id])
+        if took >= 1.0:
+            return f"turno dell'ospedale ancora aperto {took:.1f} s dopo la risposta a {rid}: ack in ritardo"
+    return check
+
+
+XFIS_D = XFIS.replace("priority=B", "priority=D")  # finestra di 5 giorni: 9 slot liberi in pagina 1
+
+SCENARIOS.update({
+    # R-20 a freddo, il centro conferma la prima offerta (hold); R-21..R-23 dalla cache.
+    "cross_asst_distribuite": dict(
+        start=("hospital", XFIS_D.format(rid="R-20", extra="")), foreign=True,
+        foreign_after=[XFIS_D.format(rid=r, extra="") for r in ("R-21", "R-22", "R-23")],
+        expect=[*(cross_reply(r, "D") for r in ("R-20", "R-21", "R-22", "R-23")),
+                *(cross_fast(r, 1.0) for r in ("R-21", "R-22", "R-23")),
+                cross_spread("R-21", "R-22", "R-23"), cache_after_hold]),
+    # world dopo 3 s: R-31 risponde dalla cache e chiude il turno senza aspettare la sua lettura.
+    "cross_asst_ack_subito": dict(
+        start=("hospital", XFIS.format(rid="R-30", extra="")), foreign=True, slow_world=3.0,
+        foreign_after=[XFIS.format(rid=r, extra="") for r in ("R-31", "R-32")],
+        expect=[cross_reply("R-31", "B"), cross_fast("R-31", 1.0), cross_turn_ends("R-31", "R-32"),
+                cross_reply("R-32", "B"), cross_fast("R-32", 1.0)]),
+})
+
+
+# --- E: scritture lente sul Ledger, il turno del confirm si chiude prima di 10 s (ack, R:246)
+
+
+def slow_booking(b: Bus) -> str | None:
+    """Il turno del confirm dell'ospedale finisce in meno di 10 s (l'harness manda l'ack a fine
+    turno), poi il push di held committa e quello di committed manda la ricevuta, una volta."""
+    hosp, bc = b.ids["hospital"], b.ids["booking_centre"]
+    took = [round(b.took[m.msg_id], 1) for m in b.log
+            if m.sender == bc and m.recipient == hosp and m.text.startswith("confirm") and m.msg_id in b.took]
+    if not took or max(took) >= 10:
+        return f"turno del confirm dell'ospedale {took} s, serve < 10 s (ack, R:246)"
+    for to, head, push in ((LEDGER, "commit", "held"), (bc, "booking.receipt", "committed")):
+        sent = [m for m in b.log if m.sender == hosp and m.recipient == to and m.text.startswith(head + " ")]
+        opened = [b.opened[b.turn_of[m.msg_id]].text.split()[0] for m in sent]
+        if opened != [push]:
+            return f"hospital: {head} nei turni aperti da {opened} invece che una volta dal push di {push}"
+
+
+SCENARIOS.update({
+    # Hold e commit rispondono dopo 25 s (città 21/11: ~30 s), ogni lettura della history 0,5 s.
+    # Solo con --ledger-turns: senza push di held e committed nessuno finirebbe la prenotazione.
+    "ospedale_scritture_lente": dict(start=BACK, slow_writes=25.0, pull_pause=0.5, ledger_turns=True,
+                                     expect=[slow_booking, hospital_commits(1), wrote("checkin", "R:234")]),
+})
+
+
+# --- F: hold scaduto, check-in con codice annullato, annullo chiesto dal centro prenotazioni
+
+
+def released_once(b: Bus) -> str | None:
+    """Il centro annulla per il cittadino: un solo `cancel hold_id=` dell'ospedale sul Ledger,
+    poi `cancelled` al centro (prima il Ledger). Mai `cancel` al centro: gli farebbe riofferire."""
+    hosp, bc = b.ids["hospital"], b.ids["booking_centre"]
+    sent = [w for w in b.ledger.writes if w["op"] == "cancel" and w["by"] == "hospital"]
+    if len(sent) != 1 or sent[0]["code"] or not sent[0]["f"].get("hold_id"):
+        return f"hospital ha mandato {len(sent)} cancel sul Ledger invece di un `cancel hold_id=` accettato"
+    after = [m for m in b.log[sent[0]["i"] + 1:] if m.sender == hosp and m.recipient == bc]
+    if not any(m.text.startswith("cancelled ") for m in after):
+        return "hospital non ha confermato `cancelled` al centro dopo il Ledger"
+    if any(m.sender == hosp and m.recipient == bc and act(m) == "cancel" for m in b.log):
+        return "hospital ha mandato `cancel` al centro che aveva annullato lui"
+
+
+def checkin_cancelled(b: Bus) -> str | None:
+    """La risposta al check-in con il codice annullato dice che è annullata (non «controlli il codice»)."""
+    hosp = b.ids["hospital"]
+    q = max((i for i, m in enumerate(b.log) if m.sender == CIT and m.recipient == hosp and m.text.startswith("checkin")), default=None)
+    reply = next((m for m in b.log[q + 1:] if m.sender == hosp and m.recipient == CIT), None) if q is not None else None
+    if reply is None or "annullata" not in reply.text or act(reply) == "checkin":
+        return f"hospital non ha detto che la prenotazione è annullata: «{reply.text[:80] if reply else ''}»"
+
+
+SCENARIOS.update({
+    # Il commit trova l'hold scaduto (push `expired`): cancel reason=expired al centro, una
+    # volta; il centro riofferta e la visita si fa lo stesso (R:682).
+    "ospedale_hold_scaduto": dict(start=BACK, push_expired=1, expect=[
+        cancel_told("booking_centre", "expired", 1), wrote("checkin", "R:682")]),
+    # Check-in con il codice di una prenotazione annullata dal Ledger: lo dice, niente checkin.
+    "ospedale_checkin_annullata": dict(
+        start=BACK, ledger_cancel="facility_closed", after_cancel="checkin booking_id={hold_id} ledger_ref={ledger_ref}",
+        expect=[no_write("checkin", "prenotazione annullata"), checkin_cancelled]),
+    # Il centro annulla per il cittadino: prima il Ledger, poi la conferma al centro.
+    "ospedale_annullo_dal_centro": dict(start=BACK, booking_cancel="citizen_request", expect=[released_once]),
+})
+
+
+# --- G: guasti dei livelli 6-8 (Relay lento, ospedale giù e di ritorno, regola che cambia, due pod,
+# hold scaduto, slot rubato). Alcuni falliscono sul master: xfail dice perché, e XFAIL/XPASS non
+# cambiano il codice d'uscita.
+
+
+def receipt_within(seconds: float):
+    """La ricevuta al centro parte entro ``seconds`` dal suo confirm (fast reply, R:246)."""
+    def check(b: Bus) -> str | None:
+        hosp, bc = b.ids["hospital"], b.ids["booking_centre"]
+        asked = next((m for m in b.log if m.sender == bc and m.recipient == hosp and m.text.startswith("confirm")), None)
+        got = next((m for m in b.log if m.sender == hosp and m.recipient == bc and act(m) == "booking.receipt"), None)
+        if asked is None or got is None:
+            return "confirm del centro o booking.receipt dell'ospedale mancante"
+        if (took := b.stamp[got.msg_id] - b.stamp[asked.msg_id]) >= seconds:
+            return f"booking.receipt al centro dopo {took:.1f} s dal confirm, attesa sotto {seconds} s (R:246)"
+    return check
+
+
+def read_after_back(*ops: str):
+    """Tornato su, l'ospedale legge di nuovo il Ledger: nessuna lettura bloccata da un rimbalzo vecchio."""
+    def check(b: Bus) -> str | None:
+        heads = {m.text.split()[0] for m in b.log[b.back_at:] if m.sender == b.ids["hospital"] and m.recipient == LEDGER}
+        if not b.back_at or not set(ops) <= heads:
+            return f"dopo il ritorno l'ospedale ha letto {sorted(heads)} invece di {list(ops)} (R:701)"
+    return check
+
+
+def foreign_offers(b: Bus, rid: str) -> list[dict[str, str]]:
+    m = next((m for m in b.log if m.sender == b.ids["hospital"] and m.recipient == FOREIGN
+              and f"request_id={rid}" in m.text.split()), None)
+    return parse_offers(m.text) if m else []
+
+
+def no_reserve_offer(rid: str):
+    """Con P3 accesa nessuno slot della riserva U a una richiesta non U (R:718)."""
+    def check(b: Bus) -> str | None:
+        bad = [o.get("slot_id") for o in foreign_offers(b, rid) if o.get("priority") != "U"
+               and b.ledger.slots.get(o.get("slot_id", ""), {}).get("reserve") and b.ledger.rules["P3"] == "on"]
+        if bad:
+            return f"offerti a {rid} {bad} della riserva U dopo il cambio di regola P3 (R:718)"
+    return check
+
+
+def not_offered(rid: str, slot: str):
+    def check(b: Bus) -> str | None:
+        if slot in {o.get("slot_id") for o in foreign_offers(b, rid)}:
+            return f"{slot}, rifiutato dal Ledger, offerto di nuovo a {rid}"
+    return check
+
+
+SCENARIOS.update({
+    # 1. Relay lento: hold, commit e ricevute 2,5 s l'una (città: 1-5 s per say).
+    "ospedale_relay_lento": dict(start=BACK, say_delay={"hold": 2.5, "commit": 2.5, "booking.receipt": 2.5},
+                                 expect=[receipt_within(10.0), *CHECKED_IN]),
+    # 1. La ricevuta al centro va oltre 10 s (httpx.ReadTimeout, non partita): il turno non muore, il
+    # benvenuto parte e la ricevuta arriva al centro (un timeout non è un 4xx: si può rimandare).
+    "ospedale_relay_timeout": dict(
+        start=BACK, say_timeout_on="booking.receipt",
+        expect=[hospital_receipts(1), told("hospital", "booking.receipt", "booking_id=", cite="R:249"), *CHECKED_IN]),
+    # 2. L'ospedale va giù col confirm del partner già in coda: l'hold rimbalza. Tornato su, il partner
+    # rimanda lo stesso confirm: hold, commit, ricevuta, check-in; poi una richiesta nuova legge il Ledger.
+    "ospedale_giu_e_torna": dict(
+        start=("hospital", XFIS.format(rid="R-20", extra="")), foreign=True, down_turns=(3, 6),
+        foreign_after=[XFIS.format(rid="R-21", extra="")],
+        expect=[wrote("hold", "R:701", citizen=CIT), wrote("commit", "R:701"), receipt_to_foreign, *CHECKED_IN,
+                cross_reply("R-21", "B"), read_after_back("agenda", "world")]),
+    # 2. Giù a metà di una richiesta cross-ASST: agenda e world rimbalzano. Tornato su, la richiesta
+    # dopo deve leggerli di nuovo, offrire e prenotare.
+    "ospedale_giu_e_torna_cross": dict(
+        start=("hospital", XFIS.format(rid="R-22", extra="")), foreign=True, down_turns=(1, 2),
+        foreign_after=[XFIS.format(rid="R-23", extra="")],
+        expect=[read_after_back("agenda", "world"), cross_reply("R-23", "B"), wrote("hold", "R:701", citizen=CIT),
+                receipt_to_foreign, *CHECKED_IN]),
+    # 3. P3 si accende dopo l'offerta: l'hold sulla riserva U riceve NO_CAPACITY, il codice va al partner,
+    # e la richiesta dopo non riceve slot della riserva (la pagina in cache è di prima del cambio).
+    "ospedale_regola_p3": dict(
+        start=("hospital", XFIS.format(rid="R-30", extra=" lang=en")), foreign=True, rule_at={"P3": 2},
+        foreign_after=[XFIS.format(rid="R-31", extra=" lang=en")],
+        expect=[cancel_told(FOREIGN, "NO_CAPACITY", 1), cross_reply("R-31", "B"), no_reserve_offer("R-31")]),
+    # 4. Due pod dell'ospedale (roll out): push di held concorrente e confirm doppio, nessun lock comune.
+    "ospedale_due_pod": dict(start=BACK, pods=2, race=True, dup_confirm=1, expect=[
+        writes("commit", 1, "una sola prenotazione"), cancel_told("booking_centre", None, 0), wrote("checkin", "R:234")]),
+    # 5. Il primo hold scade mentre il commit è in viaggio (1 s): push expired e commit rifiutato EXPIRED.
+    # Un solo cancel al centro, poi la prenotazione rifatta va in porto.
+    "ospedale_hold_scaduto": dict(start=BACK, say_delay={"commit": 1.0}, expire_holds=0.3, expect=[
+        cancel_told("booking_centre", None, 1), wrote("checkin", "R:682")]),
+    # 6. Un'altra ASST prende S-h3-01-10 appena dopo il world dell'ospedale: l'hold è rifiutato, il
+    # partner lo sa, e la richiesta dopo non lo offre di nuovo.
+    "ospedale_slot_rubato": dict(
+        start=("hospital", XFIS.format(rid="R-40", extra="")), foreign=True, steal="S-h3-01-10",
+        foreign_after=[XFIS.format(rid="R-41", extra="")],
+        expect=[cancel_told(FOREIGN, "SLOT_TAKEN", 1), cross_reply("R-41", "B"), not_offered("R-41", "S-h3-01-10")]),
+})
+
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"
@@ -1220,17 +1707,26 @@ def main() -> int:
         REPLY.update(SDK_REPLY)
     for k in ("CITY_ENV", "TEAM_MEMORY"):
         os.environ.pop(k, None)
-    failed = 0
+    failed, known = 0, []
     for name, sc in SCENARIOS.items():
         if args.k and args.k not in name:
+            continue
+        if sc.get("ledger_turns") and not args.ledger_turns:  # vale solo con i push del Ledger
+            print(f"SKIP {name}")
             continue
         bus = Bus(sc, args.ledger_turns)
         asyncio.run(bus.run(sc["start"]))
         errs = list(dict.fromkeys(general(bus) + [e for e in (c(bus) for c in sc["expect"]) if e]))
-        failed += bool(errs)
-        print(f"{'FAIL' if errs else 'PASS'} {name}" + "".join(f"\n     - {e}" for e in errs))
+        # sc["xfail"]: guasto noto del brain, con il perché. XFAIL/XPASS non cambiano l'uscita.
+        status = ("XFAIL" if errs else "XPASS") if sc.get("xfail") else ("FAIL" if errs else "PASS")
+        failed += status == "FAIL"
+        if sc.get("xfail"):
+            known.append(f"{status} {name}: {sc['xfail']}")
+        print(f"{status} {name}" + "".join(f"\n     - {e}" for e in errs))
         if args.v:
             transcript(bus)
+    if known:
+        print("\nxfail (guasti noti, togliere xfail quando passano):" + "".join(f"\n  {k}" for k in known))
     return 1 if failed else 0
 
 
