@@ -56,6 +56,7 @@ from mach.protocol import fields_of, first_word, words  # noqa: E402
 #   _SENT     b  per-need sends history may not show yet (read-your-writes), LRU 4096
 #   _HEARD    b  msg_id -> the model's reading of a citizen message, LRU 4096
 #   _TASKS       per-need background re-ask of a read the Ledger left unanswered (R2), dropped when done
+#   _RINGS       per-need timer of a pending round to the partners (_ring), dropped when it fires
 
 _MAX_PAGE = 8
 _MAX_OFFERS = 3
@@ -611,10 +612,10 @@ async def _advance(
                 await _partner_answer(city, message, chat, key)
             else:
                 await _advance_alone(city, message, chat, key, replacing=replacing)
-                sent = _sent(key)
-                reads, sent.reread = sent.reread, []
-                for read in reads:
-                    await _say(city, LEDGER, read)
+            sent = _sent(key)
+            reads, sent.reread = sent.reread, []
+            for read in reads:
+                await _say(city, LEDGER, read)
             while gate.wake is not None:
                 wake, gate.wake = gate.wake, None
                 chat = await _until(city, wake.need_id, chat, lambda rows: True)
@@ -829,7 +830,7 @@ async def _advance_alone(
 
     async def partners() -> bool:
         return await _try_partners(
-            city, message, chat, citizen, number, priority, procedure, prefs.lang, now, born, no, skip, replacing)
+            city, message, chat, citizen, number, priority, procedure, prefs.lang, now, born, no, skip, replacing, again)
 
     # A language none of our doctors speaks: only a partner ASST can have that doctor.
     if prefs.lang != "it" and not ours and await partners():
@@ -884,10 +885,12 @@ async def _advance_alone(
     if slots:
         await _offer(city, key, citizen, _spread(best or slots, key), number, priority, replacing, chat, opening)
         return
-    # S is empty on every page: a relaxed alternative (past the priority deadline), else the
-    # waiting list. Never silence. The partners are asked for a language none of our doctors
-    # speaks (above), or once the citizen turned our alternative down for its date: for a full
-    # agenda they gave no usable slot (0 of 15 answers, 85 s median wait) before that.
+    # S is empty on every page, also after a hold hiccup: the partners first (R:676, the answer may
+    # be only in a ring partner; since 07:56, 14 of 21 verdicts were no_booking with S not empty).
+    # While their round runs, no relaxed alternative and no waiting list. Then a relaxed
+    # alternative (past the priority deadline), else the waiting list. Never silence.
+    if await partners():
+        return
     late = bool(no.reasons & {"deadline", "priority", "late", "time"})
     alternatives, why = search(relaxed=True)
     phrase = "relaxed"
@@ -911,8 +914,6 @@ async def _advance_alone(
             await _say(city, citizen, _phrase(chat, "unreachable"))
         sent.pending = True
         return
-    if late and await partners():
-        return
     offer_id = f"wl-{key}"
     if offer_id in sent.offers or protocol.we(chat, agent, f"offer_id={offer_id}", to=citizen, word="offer"):
         return
@@ -929,6 +930,18 @@ async def _advance_alone(
 _RETRY = (20.0, 60.0, 180.0)
 _RTT_UNMEASURED = 270.0
 _TASKS: dict[str, asyncio.Task] = {}
+# The timer of a pending round to the partners (_ring), one per need, kept referenced until it fires.
+_RINGS: dict[str, asyncio.Task] = {}
+
+
+def _closed(chat: list[Message], agent: str, need_id: str | None) -> bool:
+    """An emergency ends the case (R:442): escalated, or a red flag whose own turn answers it."""
+
+    return need_id in _ESCALATED or any(
+        (row.sender == agent and first_word(row.text) == "escalate.emergency")
+        or (row.sender.startswith("citizen:") and red_flag(row.text))
+        for row in chat
+    )
 
 
 async def _waiting(
@@ -969,11 +982,7 @@ async def _retry(city: City, message: Message, key: str) -> None:
             await asyncio.sleep(wait)
             chat = await city.history(need_id=message.need_id)
             _learn(chat, agent)
-            if message.need_id in _ESCALATED or any(
-                (row.sender == agent and first_word(row.text) == "escalate.emergency")
-                or (row.sender.startswith("citizen:") and red_flag(row.text))
-                for row in chat
-            ):
+            if _closed(chat, agent, message.need_id):
                 return  # the red flag's own turn answers it; nothing else on this need (R:442)
             real = datetime.now(timezone.utc)
             for read in reads:
@@ -1370,11 +1379,21 @@ _KNOWN_PARTNERS = {
     },
 }
 _MAX_PARTNERS = 3
-# The partners promise 10 seconds, but their own Ledger read takes about 12 and none answered
-# within our old 12 tries (39 rings, one offer). 240 tries of a history read each (~0.22 s live)
-# took ~113 s (live: "asking the partners" -> offer, median 98 s) for one partner offer in 39 rings.
-# A partner answering later still reaches the citizen through _partner_answer.
-_PARTNER_WAIT = 30.0
+# A round to the partners, in real seconds. It ends at the first fitting partner slot, when every
+# partner asked has answered, or at this cap; until then no relaxed alternative and no waiting list.
+# It never holds the turn: the answers' turns or the timer (_ring) decide. Our old 30 s in the turn
+# missed most answers (since 07:56: partner offers for 47 cases, 17 reached the citizen, 19 got the
+# waiting list after an offer had come). The cap is bounded by the citizen, not by the partners:
+# a journey whose reply has no offer closes ~5 minutes after the citizen's last message (21/11,
+# 109 journeys: verdicts p50 306-309 s after it), and the Relay takes p50 40-54 s, p90 70-90 s a
+# hop. In 90 + 90 + 90 s (citizen -> us, the round, us -> citizen) the offers land inside that
+# even on p90 hops. Partners answer slowly (21/11, 8 h, 117 rounds: offers p50 399 s after our
+# request, 14 of 257 within 90 s, 41 within 180 s): a longer round buys few offers and loses the
+# fallback past the close. A later partner offer still reaches the citizen (_partner_answer).
+_PARTNER_ROUND = 90.0
+# U is due the same agenda day (one real minute is one agenda hour, and confirm -> hold still
+# takes hours): half the round.
+_PARTNER_ROUND_U = 45.0
 _PARTNER_ROUNDS = 3
 
 
@@ -1509,14 +1528,15 @@ def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) 
 async def _ask_partners(
     city: City, chat: list[Message], citizen: str, procedure: str, priority: str | None, key: str,
     lang: str = "it",
-) -> tuple[list[Message], bool]:
-    """Once per need: the search criteria, and nothing about the citizen, to the facilities of
-    the other ASSTs that offer the service. Then a short wait for their answers."""
+) -> tuple[list[Message], bool, bool]:
+    """Once per need (again after the citizen turned our offers down): the search criteria, and
+    nothing about the citizen, to the facilities of the other ASSTs that offer the service. One look
+    at the case after, never a wait. (chat, a round was sent, now or before; it was sent now)."""
 
     agent = city.agent_id
     service = _SERVICES.get(procedure)
     if not service:
-        return chat, False
+        return chat, False, False
     rounds = _partner_rounds(chat, agent)
     if not rounds or (len(rounds) < _PARTNER_ROUNDS and _refused_since(chat, citizen, rounds[-1])):
         try:
@@ -1568,48 +1588,74 @@ async def _ask_partners(
             except Exception:  # noqa: BLE001 - CapError or an httpx timeout: the next partner still gets it
                 CAL.mark(partner, "DOWN")  # never the same message again
         if not reached:
-            return chat, False
+            return chat, False, False
         notice = _phrase(chat, "partners")
         if not protocol.exact(chat, agent, notice):
+            sent = _sent(key)
+            pending = sent.pending  # the notice is not the replacement the citizen is owed
             await _say(city, citizen, notice)
+            sent.pending = pending
+        # A partner may answer at once; any later answer opens a turn of its own (_partner_answer).
+        chat = await _until(city, chat[-1].need_id if chat else None, chat, lambda rows: True, tries=1)
+        return chat, True, True
+    return chat, True, False
 
-    def answered(rows: list[Message]) -> bool:
-        asked = _asked_partners(rows, agent)
-        heard = {row.sender for row in _partner_rows(rows, agent)}
-        # One partner's slots are enough, unless the citizen needs a language: then a slot whose
-        # doctor speaks it, or every partner's answer.
-        slots = [slot for slot in _partner_slots(rows, agent) if _partner_speaks(slot, lang)]
-        return bool(slots) or (bool(asked) and set(asked) <= heard)
 
-    if not answered(chat):
-        # The citizen chooses from our first offers message (R:95) and waits minutes for it:
-        # a partner's answer is worth some seconds more than a Ledger read.
-        chat = await _until(city, chat[-1].need_id if chat else None, chat, answered,
-                            deadline=time.monotonic() + _PARTNER_WAIT)
-    return chat, True
+def _round_left(chat: list[Message], agent: str, priority: str | None) -> float | None:
+    """Real seconds the latest round to the partners still waits: 0.0 once every partner asked in
+    it has answered or its cap has passed (_PARTNER_ROUND); None when the history shows no round.
+    By the request's sent_at against _wall(), so a restarted pod reads it from the case too."""
+
+    asks = [row for row in chat if row.sender == agent and row.recipient.startswith("agent:")
+            and first_word(row.text) == "need.request" and fields_of(row.text).get("request_id")]
+    if not asks:
+        return None
+    request = fields_of(asks[-1].text)["request_id"]
+    asked = [row for row in asks if fields_of(row.text)["request_id"] == request]
+    # An answer is an offer or a cancel: the partners' acks carry the request_id too (21/11, 6 h:
+    # info 140 of 140, ack 17 of 17, ricevuto 56 of 492) and say nothing about their slots.
+    heard = {row.sender for row in _partner_rows(chat, agent) if words(row.text) & {"offer", "cancel"}}
+    if {row.recipient for row in asked} <= heard:
+        return 0.0
+    at = protocol.when(asked[0].sent_at or "")
+    cap = _PARTNER_ROUND_U if priority == "U" else _PARTNER_ROUND
+    return 0.0 if at is None else max(0.0, cap - (_wall() - at).total_seconds())
 
 
 async def _try_partners(
     city: City, message: Message, chat: list[Message], citizen: str, number: str, priority: str | None,
     procedure: str, lang: str, now: datetime, born: datetime | None, no: case.Refusals,
-    skip: set[str] | frozenset[str], replacing: bool,
+    skip: set[str] | frozenset[str], replacing: bool, again: bool,
 ) -> bool:
-    """Ask the ring and offer what fits. False: nothing from the partners (yet), go on alone."""
+    """Ask the ring and offer what fits. True: the turn is done (partner offers sent, or the round
+    still running: the citizen heard so, and the answers or _ring take the case on). False: the
+    round is over with nothing that fits, or no partner took it: go on alone."""
 
     key = message.need_id or message.msg_id
-    chat, asked = await _ask_partners(city, chat, citizen, procedure, priority, key, lang)
+    chat, asked, fresh = await _ask_partners(city, chat, citizen, procedure, priority, key, lang)
     if not asked:
         return False
     slots = _partner_fit(chat, city.agent_id, key, procedure, priority, lang, now, born, no, skip)
-    if not slots:
+    if slots:
+        await _offer(city, key, citizen, _spread(slots, key), number, priority, replacing, chat, "partner_offers")
+        return True
+    left = _round_left(chat, city.agent_id, priority)
+    if left is None:  # sent in this very turn, the history does not show it yet
+        left = _PARTNER_ROUND_U if priority == "U" else _PARTNER_ROUND
+    if left <= 0:
         return False
-    await _offer(city, key, citizen, _spread(slots, key), number, priority, replacing, chat, "partner_offers")
+    if not fresh:  # the citizen writing again while the partners have not answered (R:248)
+        await _waiting(city, message, chat, key, citizen, [], again=again)
+    if key not in _RINGS:
+        _RINGS[key] = asyncio.ensure_future(_ring(city, message, key, left))
     return True
 
 
 async def _partner_answer(city: City, message: Message, chat: list[Message], key: str) -> None:
-    """A partner's answer that arrived after our turn stopped waiting: offer its slots once,
-    unless the citizen is already being booked or already holds partner offers."""
+    """A partner's answer: its fitting slots in one offers message, once, unless the citizen is
+    already being booked or already holds partner offers. Nothing that fits: the case runs on, and
+    once the round is over it gets what it would without the partners (relaxed alternative or
+    waiting list; a citizen holding offers keeps them)."""
 
     agent = city.agent_id
     citizen = protocol.citizen(chat)
@@ -1622,13 +1668,33 @@ async def _partner_answer(city: City, message: Message, chat: list[Message], key
     reply = case.prescription(chat, agent, number) if number else None
     _round_trip(chat, agent)
     now = _now(chat)
-    if not number or reply is None or not reply.get("procedure") or reply.get("patient", citizen) != citizen or now is None:
+    if number and reply is not None and reply.get("procedure") and reply.get("patient", citizen) == citizen and now is not None:
+        no = case.refusals(chat, agent, calendar.gender)
+        lang = case.lang(chat, _heard, doctor=True)
+        slots = _partner_fit(chat, agent, key, reply["procedure"], reply.get("priority"), lang, now, _born(chat), no, offered)
+        if slots:
+            await _offer(city, key, citizen, _spread(slots, key), number, reply.get("priority"), False, chat, "partner_offers")
+            return
+    await _advance_alone(city, message, chat, key, replacing=False)
+
+
+async def _ring(city: City, message: Message, key: str, wait: float) -> None:
+    """The end of a partner round nobody closed (R2's pattern, reusing the turn's City): after
+    ``wait`` real seconds, run the case again. It offers what the partners gave, or goes on alone."""
+
+    try:
+        await asyncio.sleep(wait)
+        if _RINGS.get(key) is asyncio.current_task():
+            del _RINGS[key]  # the run below may start the next timer (a round not over yet)
+        chat = await city.history(need_id=message.need_id)
+        _learn(chat, city.agent_id)
+        if not _closed(chat, city.agent_id, message.need_id):
+            await _advance(city, message, chat, replacing=False)
+    except Exception:  # noqa: BLE001 - background work: nothing may escape, the next message resumes
         return
-    no = case.refusals(chat, agent, calendar.gender)
-    lang = case.lang(chat, _heard, doctor=True)
-    slots = _partner_fit(chat, agent, key, reply["procedure"], reply.get("priority"), lang, now, _born(chat), no, offered)
-    if slots:
-        await _offer(city, key, citizen, _spread(slots, key), number, reply.get("priority"), False, chat, "partner_offers")
+    finally:
+        if _RINGS.get(key) is asyncio.current_task():
+            del _RINGS[key]
 
 
 # --- conversation ------------------------------------------------------------------------------

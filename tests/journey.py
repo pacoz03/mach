@@ -363,6 +363,8 @@ class Agent:
                         setattr(m, k, 0)
                 if hasattr(m, "_LLM_TIMEOUT"):  # il modello "timeout" non deve fermare la suite
                     m._LLM_TIMEOUT = 0.2
+                if hasattr(m, "_PARTNER_ROUND"):  # il giro dai partner (90 s, U 45 s) nemmeno: qui i partner tacciono
+                    m._PARTNER_ROUND, m._PARTNER_ROUND_U = 0.3, 0.1
             self.main = mod.main
         except Exception as exc:  # un brain rotto non deve fermare gli altri scenari
             self.error = f"{type(exc).__name__}: {exc}"
@@ -554,6 +556,18 @@ class Citizen:
             self.checkin(fac, f["booking_id"], f.get("ledger_ref", ""))
 
 
+class Rings(dict):
+    """_RINGS del centro: ogni timer va anche in testa ai task che il bus aspetta."""
+
+    def __init__(self, tasks: list) -> None:
+        super().__init__()
+        self.tasks = tasks
+
+    def __setitem__(self, key, task) -> None:
+        super().__setitem__(key, task)
+        self.tasks.insert(0, task)
+
+
 class Bus:
     def __init__(self, sc: dict, ledger_turns: bool) -> None:
         self.agents = {a.id: a for a in (Agent(f) for f in FOLDERS)}  # ricaricati a ogni scenario
@@ -605,6 +619,11 @@ class Bus:
         # sc["pods"]=2: un secondo ospedale con i suoi globali (_GATES, _BOUNCED, _WORLD...), i turni si alternano
         self.pods = [self.agents[self.hosp], Agent("hospital")] if sc.get("pods") == 2 else []
         self.pod_turns = 0
+        # Il timer del giro dai partner del centro (_RINGS) scatta dopo il turno: il bus lo aspetta, per
+        # ultimo (prima le risposte dei partner degli scenari, che arrivano prima della fine del giro).
+        for a in self.agents.values():
+            if a.main is not None and "_RINGS" in a.main.__globals__:
+                a.main.__globals__["_RINGS"] = Rings(self.tasks)
 
     def name(self, party: str) -> str:
         return self.agents[party].folder if party in self.agents else party
@@ -3039,6 +3058,154 @@ SCENARIOS.update({
     # Il consultorio, stessa attesa (_on_checkin, senza messaggio d'attesa già su HEAD).
     "consultorio_checkin_lento": dict(start=GINECOLOGIA, ledger_turns=True, setup=slow_checkin(0.5),
                                       expect=[wrote("checkin", "R:234"), checkin_first("family_counseling")]),
+})
+
+
+# --- Centro prenotazioni e ASST partner: con S vuoto da noi, anche dopo un intoppo sull'hold, il giro dai
+# partner parte subito e niente alternativa rilassata né lista d'attesa finché non finisce (città 21/11
+# dalle 07:56: offerte dei partner per 47 casi, 17 arrivate al cittadino, 19 liste d'attesa dopo un'offerta;
+# 14 verdetti su 21 no_booking con S non vuoto). Qui il giro dura RING s invece di 90 (_PARTNER_ROUND), e il
+# vecchio tetto nel turno (30 s) varrebbe RING/3.
+
+RING = 2.0
+RING_DOC = "asst-giambellino-h1"  # medico di un'ASST partner: fuori dal nostro registry
+RING_SLOT = "W01QQQ-asst-giambellino-h1-20261124-1500"  # martedì 15:00, dentro la finestra B
+RING_OFFER = (f"offer offer_id=of-{RING_SLOT} slot_id={RING_SLOT} doctor_id={RING_DOC} facility={{me}} procedure=VIS-FIS "
+              "agenda_date=2026-11-24T15:00:00+00:00 agenda_day=tue expiry=2026-11-24T15:00:00+00:00 priority=B "
+              "request_id={rid} Buongiorno, ecco la nostra disponibilità.")
+RING_NONE = "cancel reason=no_availability request_id={rid} Mi dispiace, nessuna disponibilità."
+RING_ACK = "ricevuto request_id={rid} Abbiamo ricevuto la richiesta, verifichiamo."  # città 21/11: info, ack, ricevuto
+RING_U_RX = "RX-U9"
+
+
+def ring(answers: dict[int, tuple[float, str] | list[tuple[float, str]]], round_s: float = RING, u_round: float = RING / 4):
+    """I partner pubblicati della fisiatria (_KNOWN_PARTNERS del centro, in ordine) con l'indice in ``answers``
+    rispondono al need.request del centro dopo (secondi, testo), o con una lista di queste coppie; {rid} è il
+    request_id, {me} il loro id. Gli altri tacciono. Il giro del centro dura ``round_s`` s, ``u_round`` per la U."""
+    def setup(b: Bus) -> None:
+        bc = b.ids["booking_centre"]
+        brain = b.agents[bc].main.__globals__
+        brain["_PARTNER_ROUND"], brain["_PARTNER_ROUND_U"] = round_s, u_round
+        b.partners, b.ring_answers, add = list(brain["_KNOWN_PARTNERS"]["hospital.physiatry"]), [], b.add
+
+        async def later(delay: float, me: str, text: str, need: str) -> None:
+            await asyncio.sleep(delay)
+            b.ring_answers.append(b.add(me, bc, {"text": text}, need))
+            b.queue.append(b.ring_answers[-1])
+
+        def adding(sender, to, body, need=NEED, conv=None, kind="chat") -> Message:
+            m = add(sender, to, body, need, conv, kind)
+            if sender == bc and to in b.partners and m.text.startswith("need.request"):
+                got = answers.get(b.partners.index(to), [])
+                for delay, text in got if isinstance(got, list) else [got]:
+                    reply = text.format(rid=fields(m.text)["request_id"], me=to)
+                    b.tasks.append(asyncio.create_task(later(delay, to, reply, need)))
+            return m
+        b.add = adding
+    return setup
+
+
+def skips_ring_offers(b: Bus) -> None:
+    """Il cittadino non sceglie le offerte di un partner: la prenotazione nell'altra ASST è dell'arena
+    (partner_finestra_piena), qui conta che l'offerta arrivi."""
+    react = b.citizen.react
+
+    def reacting(m: Message) -> None:
+        if not (act(m) == "offer" and any(o.get("facility") in b.partners for o in parse_offers(m.text))):
+            react(m)
+    b.citizen.react = reacting
+
+
+def taken_but(slot_id: str):
+    """Ogni altro slot di fisiatria è già preso: S ha solo ``slot_id`` e oltre la finestra non c'è nulla."""
+    def setup(b: Bus) -> None:
+        for s in b.ledger.slots.values():
+            if s["procedure"] == "VIS-FIS" and s["slot_id"] != slot_id:
+                b.ledger.holds[f"H-ALTRA-{s['slot_id']}"] = dict(
+                    hold_id=f"H-ALTRA-{s['slot_id']}", slot_id=s["slot_id"], need_id=None, state="committed")
+    return setup
+
+
+def _to_citizen(b: Bus) -> list[tuple[int, Message]]:
+    return [(i, m) for i, m in enumerate(b.log) if m.sender == b.ids["booking_centre"] and m.recipient == CIT]
+
+
+def ring_offered_first(b: Bus) -> str | None:
+    """Il primo messaggio di offerte del centro al cittadino porta lo slot del partner (il cittadino sceglie
+    dal primo, R:95): nessuna alternativa rilassata né lista d'attesa prima."""
+    first = next((m for _, m in _to_citizen(b) if act(m) == "offer"), None)
+    if first is None or RING_SLOT not in {o.get("slot_id") for o in parse_offers(first.text)}:
+        return f"primo messaggio di offerte «{first.text[:90] if first else ''}», atteso lo slot del partner {RING_SLOT}"
+
+
+def ring_after_hiccup(b: Bus) -> str | None:
+    """Dopo il cancel dell'offerta il cui hold è saltato, mai la lista d'attesa: il messaggio di offerte che
+    segue porta lo slot del partner (R:682, R:676)."""
+    said = [m for _, m in _to_citizen(b)]
+    if any("waiting_list=true" in m.text.split() for m in said):
+        return "lista d'attesa al cittadino con uno slot del partner in arrivo"
+    cancel = next((i for i, m in enumerate(said) if act(m) == "cancel"), None)
+    if cancel is None:
+        return "nessun cancel al cittadino: l'hold non è saltato"
+    nxt = next((m for m in said[cancel + 1:] if act(m) == "offer"), None)
+    if nxt is None or RING_SLOT not in {o.get("slot_id") for o in parse_offers(nxt.text)}:
+        return f"dopo il cancel «{nxt.text[:90] if nxt else ''}», atteso lo slot del partner {RING_SLOT}"
+
+
+def ring_then_fallback(after: float = 0.0, within: float | None = None):
+    """Con S vuoto il centro chiede subito ai partner e lo dice al cittadino; la prima offerta (alternativa
+    rilassata o lista d'attesa) parte dopo l'ultima risposta dei partner, almeno ``after`` s dopo il giro
+    (il tetto, se tacciono) ed entro ``within`` s (se rispondono tutti, non si aspetta il tetto)."""
+    def check(b: Bus) -> str | None:
+        bc = b.ids["booking_centre"]
+        asks = [m for m in b.log if m.sender == bc and m.text.startswith("need.request")]
+        if not asks:
+            return "S vuoto e nessun need.request ai partner (R:676)"
+        said = _to_citizen(b)
+        offer = next(((i, m) for i, m in said if act(m) == "offer"), None)
+        if offer is None:
+            return "nessuna offerta al cittadino dopo il giro dai partner"
+        if not any("strutture partner" in m.text for i, m in said if i < offer[0]):
+            return "il cittadino non ha saputo del giro dai partner prima dell'offerta (R:248)"
+        last = max((b.log.index(m) for m in getattr(b, "ring_answers", [])), default=-1)
+        if offer[0] < last:
+            return "offerta al cittadino prima dell'ultima risposta dei partner"
+        took = b.stamp[offer[1].msg_id] - b.stamp[asks[0].msg_id]
+        if took < after or (within is not None and took >= within):
+            return f"offerta {took:.2f} s dopo il giro dai partner, attesa tra {after} e {within} s"
+    return check
+
+
+SCENARIOS.update({
+    # Niente da noi entro la finestra B; un partner risponde a metà giro (45 s in città, oltre i vecchi 30 s)
+    # con uno slot che va: è il primo messaggio di offerte, senza l'alternativa rilassata prima.
+    "booking_partner_tardivo": dict(start=BACK, full_days=2, setup=setups(ring({0: (RING / 2, RING_OFFER)}), skips_ring_offers),
+                                    expect=[ring_offered_first, ring_then_fallback(within=RING)]),
+    # Il solo slot in S va a un'altra ASST tra l'offerta e l'hold (SLOT_TAKEN), oltre la finestra non c'è nulla
+    # (città: 30 liste d'attesa così, tutte B o D): lo slot del partner al posto della lista d'attesa.
+    "booking_partner_dopo_intoppo": dict(start=BACK, steal="S-h1-01-10",
+                                         setup=setups(taken_but("S-h1-01-10"), ring({0: (RING / 4, RING_OFFER)}), skips_ring_offers),
+                                         expect=[ring_after_hiccup]),
+    # Tutti i partner rispondono no_availability, a scaglioni: l'alternativa rilassata solo dopo l'ultimo,
+    # senza aspettare il tetto del giro.
+    "booking_partner_tutti_no": dict(start=BACK, full_days=2,
+                                     setup=ring({i: (0.1 * (i + 1), RING_NONE) for i in range(7)}, round_s=3 * RING),
+                                     expect=[ring_then_fallback(within=2 * RING), wrote("checkin", "R:234")]),
+    # I partner tacciono: l'alternativa rilassata solo allo scadere del giro (in background), mai prima.
+    "booking_partner_muti": dict(start=BACK, full_days=2, setup=ring({}, round_s=RING / 2),
+                                 expect=[ring_then_fallback(after=RING / 2), wrote("checkin", "R:234")]),
+    # Tutti i partner mandano subito un ack col request_id, poi uno solo risponde no_availability e gli altri
+    # tacciono (città, N-...0001510014): un ack non è una risposta, il giro dura fino al tetto.
+    "booking_partner_solo_ack": dict(
+        start=BACK, full_days=2,
+        setup=ring({i: [(0.05 * (i + 1), RING_ACK), *([(RING / 4, RING_NONE)] if i == 0 else [])] for i in range(7)},
+                   round_s=RING / 2),
+        expect=[ring_then_fallback(after=RING / 2)]),
+    # Priorità U (scadenza in giornata): il giro dura _PARTNER_ROUND_U, più corto di quello di B.
+    "booking_partner_muti_u": dict(
+        start=("booking_centre", f"Buongiorno, vorrei prenotare. prescription_number={RING_U_RX} lang=it"), full_days=1,
+        setup=setups(seeded_rx(RING_U_RX, CIT, "VIS-FIS", "U"), ring({}, round_s=3 * RING, u_round=RING / 4)),
+        expect=[ring_then_fallback(after=RING / 4, within=3 * RING)]),
 })
 
 
