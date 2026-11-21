@@ -477,11 +477,14 @@ async def _desk(city: City, message: Message, chat: list[Message]) -> None:
 class _Gate:
     """One need's lock and how many turns hold it or wait for it."""
 
-    __slots__ = ("lock", "turns")
+    __slots__ = ("lock", "turns", "wake")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.turns = 0
+        # The latest Ledger answer that arrived while another turn held the lock: the holder
+        # runs once more for it, instead of one queued turn per answer.
+        self.wake: Message | None = None
 
 
 class _Sent:
@@ -534,6 +537,12 @@ async def _advance(
     gate = _GATES.get(key)
     if gate is None:
         gate = _GATES[key] = _Gate()
+    if message.sender == LEDGER and not partner and not replacing and gate.lock.locked():
+        # Local study 21/11 (Ledger at 25 s): each Ledger answer opened a turn that queued on the
+        # lock, then polled ~12 s on its own; the citizen's next message waited behind them all
+        # (up to 115 s). The turn holding the lock reads the case again and handles it.
+        gate.wake = message
+        return
     gate.turns += 1
     waited = gate.lock.locked()
     try:
@@ -551,6 +560,12 @@ async def _advance(
                 reads, sent.reread = sent.reread, []
                 for read in reads:
                     await _say(city, LEDGER, read)
+            while gate.wake is not None:
+                wake, gate.wake = gate.wake, None
+                chat = await _until(city, wake.need_id, chat, lambda rows: True)
+                if all(row.msg_id != wake.msg_id for row in chat):
+                    chat = [*chat, wake]
+                await _advance_alone(city, wake, chat, key, replacing=False)
     finally:
         gate.turns -= 1
         if gate.turns == 0 and _GATES.get(key) is gate:
@@ -1189,6 +1204,10 @@ _MAX_PARTNERS = 3
 # x _PULL_PAUSE: one minute. The partners promise 10 seconds, but their own Ledger read takes
 # about 12 and none answered within our old 12 (39 rings, one offer). The citizen waits 16 minutes.
 _PARTNER_TRIES = 240
+# Each try is also a history read (~0.22 s live): 240 tries took ~113 s (live: "asking the
+# partners" -> offer, median 98 s) for one partner offer in 39 rings. A partner answering later
+# still reaches the citizen through _partner_answer.
+_PARTNER_WAIT = 30.0
 _PARTNER_ROUNDS = 3
 
 
@@ -1430,7 +1449,8 @@ async def _ask_partners(
     if not answered(chat):
         # The citizen chooses from our first offers message (R:95) and waits minutes for it:
         # a partner's answer is worth some seconds more than a Ledger read.
-        chat = await _until(city, chat[-1].need_id if chat else None, chat, answered, _PARTNER_TRIES)
+        chat = await _until(city, chat[-1].need_id if chat else None, chat, answered, _PARTNER_TRIES,
+                            deadline=time.monotonic() + _PARTNER_WAIT)
     return chat, True
 
 
@@ -2158,11 +2178,15 @@ async def _until(
     chat: list[Message],
     ready: Callable[[list[Message]], bool],
     tries: int = _PULL_TRIES,
+    deadline: float | None = None,
 ) -> list[Message]:
-    """Re-read the case until ``ready`` or the short wait ends. The push may never arrive."""
+    """Re-read the case until ``ready`` or the short wait ends. The push may never arrive.
+    ``deadline``: time.monotonic() after which no more reads, even with tries left."""
 
     fresh = chat
     for attempt in range(tries):
+        if attempt and deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             fresh = await city.history(need_id=need_id)
         except CapError:
