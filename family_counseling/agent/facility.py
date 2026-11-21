@@ -260,6 +260,10 @@ async def handle(role: str, need: Need, city: City) -> None:
         # turn ends well inside custody.ack's ~5 s wait for the renew (1.0.9 deploys failed there).
         # The consultorio too: 1.0.6 answered it live (21/11, TARGET_NOT_VISIBLE to t05/osp-x).
         return
+    global _RECALLED
+    if not _CLOCK and not _RECALLED:
+        _RECALLED = True
+        _background(_recall_clock())  # never awaited: one memory read per process, off the turn
     if role == "family_counseling" and message.sender.startswith("agent:"):
         try:
             chat = await asyncio.wait_for(city.history(need_id=message.need_id), timeout=1.0)
@@ -620,11 +624,39 @@ def _ledger(chat: list[Message], head: str) -> dict[str, str] | None:
         if new is not None and (old is None or new >= old):
             _CLOCK.clear()
             _CLOCK.update(found)
+            anchor = {key: found.get(key, "") for key in _ANCHOR}
+            if all(anchor.values()) and (
+                anchor != _NOTED.get("anchor") or time.monotonic() - _NOTED["at"] > _NOTE_EVERY
+            ):
+                _NOTED.update(anchor=anchor, at=time.monotonic())
+                tools.note("city:clock", "anchor", anchor, ttl_seconds=_CLOCK_TTL)
     return found
 
 
 # The agenda reply with the latest agenda_now this process read (_ledger keeps it).
 _CLOCK: dict[str, str] = {}
+# A restarted pod has no _CLOCK until its own agenda reply (live 21/11: 2-4 min, 16 partner requests
+# got no_availability), so _ledger shares the reply's anchor in team memory (city:clock) and the
+# first turn reads it back in the background (_recall_clock). The anchor stayed one all night (1856
+# replies, 4 agents, 21/11 22:30-02:14 UTC). Our own Ledger reply always replaces it.
+# ponytail: a city rebase or pause reaches a restarted pod only once some facility notes the new
+# anchor; _CLOCK_TTL caps how long an anchor nobody renews is read.
+_ANCHOR = ("epoch_real", "epoch_agenda", "rate", "paused")
+_CLOCK_TTL = 1800
+_NOTE_EVERY = 300.0  # seconds between notes of the same anchor, to keep it inside _CLOCK_TTL
+_NOTED: dict = {}
+_RECALLED = False
+
+
+async def _recall_clock() -> None:
+    """Cold start: the clock anchor another of our pods noted, unless a Ledger reply came first.
+    One _city_now cannot read (missing field, paused) leaves us cold, as before."""
+
+    anchor = tools.fact(await tools.context(), "city:clock", "anchor")
+    if not _CLOCK and isinstance(anchor, dict):
+        _CLOCK.update({key: str(anchor.get(key, "")) for key in _ANCHOR})
+        if _city_now() is None:
+            _CLOCK.clear()
 
 
 def _city_now() -> datetime | None:

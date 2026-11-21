@@ -667,6 +667,8 @@ class Bus:
         # {hold_id}/{ledger_ref} sono quelli della prenotazione annullata.
         # sc["booking_cancel"]: a prenotazione fatta il centro annulla la visita per il cittadino.
         sc = self.citizen.sc
+        if sc.get("setup"):  # sc["setup"](bus): stub e push propri dello scenario, prima del primo turno
+            sc["setup"](self)
         # sc["push"]: prima della richiesta arrivano all'ospedale, ciascuna come turno suo, le risposte
         # tardive del Ledger (world e agenda) a un caso vecchio, come in città il 21/11 alle 02:33.
         if sc.get("push"):
@@ -1858,6 +1860,54 @@ SCENARIOS.update({
     # arriva subito dagli slot già letti, non dopo il Ledger.
     "booking_rifiuto_subito": dict(start=BACK, handoff=True, refuse_first="past", slow_agenda=8.0, expect=[
         answered_fast(2.0), wrote("checkin", "R:234")]),
+})
+
+
+# --- Orologio della città dopo un riavvio: l'ancora di agenda dalla memoria condivisa (city:clock)
+
+ANCHOR = ("epoch_real", "epoch_agenda", "rate", "paused")
+
+
+def memory_clock(b: Bus) -> None:
+    """Pod appena riavviato (città 21/11 03:01-03:06, 1.0.10): _CLOCK vuoto, ogni agenda risponde
+    dopo 5 s, una pagina di world già arrivata come push. La memoria condivisa ha l'ancora annotata
+    da un altro pod; tools.context è finto (la memoria resta spenta), tools.note registra."""
+    hosp, old = b.ids["hospital"], "N-2026-11-23-0009"
+    b.add(hosp, LEDGER, {"text": "world procedure=VIS-FIS page=1"}, old)
+    b.queue.append(b.add(LEDGER, hosp, {"text": real_page(b.ledger)}, old))
+    b.ledger.agendas = 1  # sc["slow_agenda"] vale dalla seconda: qui anche la prima è lenta
+    anchor = {k: v for k, v in fields(b.ledger.read("agenda", {})).items() if k in ANCHOR}
+    tools, b.notes = b.agents[hosp].mods["tools"], []
+
+    async def context(*_, **__):
+        return {"facts": {"city:clock": {"anchor": {"value": anchor, "source": "agent"}}}}
+
+    tools.context = context
+    tools.note = lambda *args, **kw: b.notes.append((args, kw))
+
+
+def clock_noted(b: Bus) -> str | None:
+    """Ogni risposta di agenda letta dall'ospedale dà al più una nota city:clock con la sua ancora."""
+    hosp = b.ids["hospital"]
+    replies = [fields(m.text) for m in b.log if m.sender == LEDGER and m.recipient == hosp and m.text.startswith("agenda ")]
+    got = [args[2] for args, _ in getattr(b, "notes", []) if args[:2] == ("city:clock", "anchor")]
+    want = [{k: f[k] for k in ANCHOR} for f in replies]
+    if not got or any(g not in want for g in got) or len(got) > len(replies):
+        return f"hospital: note city:clock {got} per {len(replies)} risposte di agenda, attese le loro ancore"
+
+
+SCENARIOS.update({
+    # world e agenda lenti come in città: senza l'ancora in memoria R-50 riceve cancel no_availability
+    # dopo 4 s. race: la rete cede il loop, come in città, e la lettura della memoria parte nel push.
+    "cross_asst_orologio_memoria": dict(
+        start=("hospital", XFIS.format(rid="R-50", extra=" lang=it")), foreign=True, setup=memory_clock,
+        slow_agenda=5.0, slow_world=5.0, race=True, expect=[cross_reply("R-50", "B"), cross_fast("R-50", 1.0)]),
+    # Una risposta di agenda vera: l'ospedale la annota una volta, non a ogni rilettura della history.
+    "cross_asst_orologio_nota": dict(
+        start=("hospital", XFIS.format(rid="R-51", extra="")), foreign=True,
+        setup=lambda b: setattr(b.agents[b.ids["hospital"]].mods["tools"], "note",
+                                lambda *a, **kw: b.__dict__.setdefault("notes", []).append((a, kw))),
+        expect=[cross_reply("R-51", "B"), clock_noted]),
 })
 
 
