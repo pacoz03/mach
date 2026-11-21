@@ -49,6 +49,9 @@ create table if not exists public.episodes (
 -- Un messaggio tra due nostri agenti ha lo stesso msg_id ai due capi: uno per lato.
 create unique index if not exists episodes_msg on public.episodes (msg_id, agent);
 alter table public.episodes drop constraint if exists episodes_msg_id_key;  -- vecchio unique (msg_id)
+-- in: sent_at del mittente (suo orologio). at - sent_at = ritardo del Relay; sent_at della risposta
+-- del Ledger - at della nostra richiesta = ritardo del Ledger (docs/refactor/misure.sql).
+alter table public.episodes add column if not exists sent_at timestamptz;
 create index if not exists episodes_need on public.episodes (need_id, at);
 create index if not exists episodes_citizen on public.episodes (citizen, at);
 
@@ -208,20 +211,28 @@ declare
   state jsonb;
   pair text[];
   touched integer := 0;
+  sent timestamptz;
 begin
+  -- sent_at arriva dentro p_fields (tools.py): la firma non cambia, così un pod vecchio funziona
+  -- con questo schema e uno nuovo con lo schema di prima. Esce da fields e quindi dai fatti.
+  begin
+    sent := (p_fields ->> 'sent_at')::timestamptz;
+  exception when others then
+    sent := null;
+  end;
   -- Solo campi scalari, mai dati personali; dal cittadino solo i campi del percorso.
   select coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) into f
     from jsonb_each(coalesce(p_fields, '{}'::jsonb)) e
-   where e.key <> all(personal)
+   where e.key <> all(personal) and e.key <> 'sent_at'
      and (p_direction = 'out' or p_peer not like 'citizen:%' or e.key = any(citizen_keys));
 
   insert into public.episodes
     (msg_id, at, agent, version, direction, peer, need_id, citizen, act, fields, body,
-     latency_ms, error)
+     latency_ms, error, sent_at)
   values
     (p_msg_id, coalesce(p_at, now()), p_agent, p_version, p_direction, p_peer, p_need_id,
      p_citizen, coalesce(p_act, ''), f,
-     case when p_direction = 'out' then left(p_body, 2000) end, p_latency_ms, p_error)
+     case when p_direction = 'out' then left(p_body, 2000) end, p_latency_ms, p_error, sent)
   on conflict (msg_id, agent) do nothing;
   if not found then
     return 'duplicate';

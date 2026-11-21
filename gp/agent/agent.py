@@ -13,7 +13,7 @@ from hashlib import sha256
 from pathlib import Path
 from weakref import WeakValueDictionary
 
-from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, clinical, understood
+from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, Peer, clinical, understood
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -306,6 +306,7 @@ async def main(need: Need, city: City) -> None:
     _HEARD.set("")  # never the words or language of a previous turn
     _LANG.set(None)
     if message.sender == LEDGER:
+        tools.start_turn(inbound)  # the team's trace (episodes): timings per turn
         first = message.text.split()[:1]
         if message.need_id and first in (["prescribed"], ["refused"], ["prescription"]):
             async with _case_lock(message.need_id):
@@ -318,6 +319,7 @@ async def main(need: Need, city: City) -> None:
                     await _notify(city, history, request)
         return
     if message.sender == BOOKING_CENTRE:
+        tools.start_turn(inbound)
         if message.need_id and (number := _no_slots_number(message)):
             async with _case_lock(message.need_id):
                 await _follow_up_booking(city, message.need_id, number)
@@ -335,10 +337,11 @@ async def main(need: Need, city: City) -> None:
         return
     if clinical(text):
         raise OutOfScope()
+    tools.start_turn(inbound)  # after the clinical refusal, never before (AGENT.md)
     old = message.body.get("prescription_number")
     if isinstance(old, str) and old and not message.body.get("symptom_code"):
         if not message.need_id:
-            await city.say(message.sender, "Non riesco ad associare la richiesta a un percorso.")
+            await _say(city, message.sender, "Non riesco ad associare la richiesta a un percorso.")
             return
         async with _case_lock(message.need_id):
             history = await city.history(need_id=message.need_id)
@@ -393,7 +396,7 @@ async def main(need: Need, city: City) -> None:
         await _tell(city, message.sender, ASK_REASON[_reply_lang(lang)])
         return
     if not message.need_id:
-        await city.say(message.sender, "Non riesco ad associare la richiesta a un percorso.")
+        await _say(city, message.sender, "Non riesco ad associare la richiesta a un percorso.")
         return
     async with _case_lock(message.need_id):
         await _prescribe(city, message, message.need_id, code, lang)
@@ -407,7 +410,7 @@ async def _escalate(city: City, message: Message, lang: str) -> None:
     async with _case_lock(message.need_id or message.msg_id):
         history = await city.history(need_id=message.need_id) if message.need_id else []
         if not any(_sent(history, city.agent_id, message.sender, text) for text in ESCALATION.values()):
-            await city.say(message.sender, ESCALATION[_reply_lang(lang)])
+            await _say(city, message.sender, ESCALATION[_reply_lang(lang)])
 
 
 def _reply_lang(lang: str | None) -> str:
@@ -777,9 +780,9 @@ async def _renew(
         ask = f"prescription prescription_number={old}"
         if not _sent(history, city.agent_id, LEDGER, ask):
             try:
-                await city.say(LEDGER, ask)
+                await _say(city, LEDGER, ask)
             except CapError:
-                await city.say(patient, LEDGER_REFUSAL)
+                await _say(city, patient, LEDGER_REFUSAL)
                 return
             history = await city.history(need_id=need_id)  # a quick Ledger has already answered
             found = _ledger_rx(history, old)
@@ -856,13 +859,14 @@ async def _issue(
     asked = _previous_prescription(history, city.agent_id, number=request.number) is None
     if asked:
         try:
-            await city.say(
+            await _say(
+                city,
                 LEDGER,
                 f"prescribe patient={request.patient} procedure={request.procedure} "
                 f"priority={request.priority} {extra}prescription_number={request.number}",
             )
         except CapError:
-            await city.say(request.patient, LEDGER_REFUSAL)
+            await _say(city, request.patient, LEDGER_REFUSAL)
             return
         history = await city.history(need_id=need_id)  # a quick Ledger has already answered
 
@@ -936,7 +940,7 @@ async def _notify(
         answer = request.head
     if answer == LEDGER_REFUSAL:
         if not _sent(history, city.agent_id, request.patient, answer):
-            await city.say(request.patient, answer)
+            await _say(city, request.patient, answer)
         return True
     if not any(
         row.sender == city.agent_id and row.recipient == request.patient and row.text.startswith(answer + " ")
@@ -960,7 +964,7 @@ async def _tell(city: City, patient: str, text: str, history: list[Message] | No
         # Their own words, not a bare "data.response purpose=booking": tokens say no language.
         words = (re.sub(r"\S+=\S+", "", row.text or "") for row in reversed(history) if row.sender == patient)
         heard = next((said for said in words if len(re.findall(r"[^\W\d_]{2,}", said)) >= 3), "")
-    await city.say(patient, await tools.localize(city, text, heard, _LANG.get()))
+    await _say(city, patient, await tools.localize(city, text, heard, _LANG.get()))
 
 
 def _no_slots_number(message: Message) -> str | None:
@@ -1022,7 +1026,8 @@ async def _handoff(
         peers = [peer for peer in await city.find("booking_centre") if peer.agent_id == BOOKING_CENTRE]
         if len(peers) != 1:
             return False
-        await city.say(
+        await _say(
+            city,
             peers[0],
             f"{HANDOFF} citizen={request.patient} prescription_number={request.number} "
             f"procedure={request.procedure} priority={request.priority} lang={lang} notify_if=no_slots "
@@ -1040,6 +1045,19 @@ async def _handoff(
         return True
     except Exception:  # CapError (TARGET_NOT_VISIBLE...) or network: no retry, the citizen still hears from us
         return False
+
+
+async def _say(city: City, to: Peer | str, text: str) -> str:
+    """city.say, recorded in the team's trace (tools.said, never blocks). Raises what it raises."""
+
+    recipient = to.agent_id if isinstance(to, Peer) else to
+    try:
+        msg_id = await city.say(to, text)
+    except Exception as exc:
+        tools.said(recipient, text, error=getattr(exc, "code", None) or type(exc).__name__)
+        raise
+    tools.said(recipient, text, msg_id)
+    return msg_id
 
 
 def _sent(history: list[Message], agent_id: str, recipient: str, text: str) -> bool:

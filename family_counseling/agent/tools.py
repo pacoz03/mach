@@ -50,6 +50,12 @@ _TURN: ContextVar[tuple[float, str | None, str | None]] = ContextVar(
     "turn", default=(0.0, None, None)
 )
 _OPS = ("hold", "commit", "cancel", "checkin", "report", "prescribe", "prescription")
+# Le parole d'atto del protocollo (city_sdk.city._ACTS). Da un cittadino ogni altra prima parola
+# è testo suo ("mal", "cuore", "palpitazioni"): non si salva.
+_ACTS = frozenset(
+    "need.request offer confirm cancel prescription consent data.request data.response checkin "
+    "report booking.receipt escalate.emergency hold case.closed".split()
+)
 
 
 # --- identità e parsing ------------------------------------------------------------------------
@@ -182,6 +188,13 @@ def observe(message: Any) -> None:
 
     sender = getattr(message, "sender", "") or ""
     act, fields = parse(getattr(message, "text", "") or "")
+    if sender.startswith("citizen:") and act not in _ACTS:
+        act = ""
+    # Orologio del mittente: separa il ritardo del Ledger da quello del Relay (misure.sql). Va in
+    # p_fields, che ogni versione di observe() accetta: lo schema nuovo lo sposta nella colonna.
+    sent_at = getattr(message, "sent_at", "")
+    if isinstance(sent_at, str) and sent_at:
+        fields["sent_at"] = sent_at
     role, version = me()
     _, _, turn_citizen = _TURN.get()
     _background("observe", {
