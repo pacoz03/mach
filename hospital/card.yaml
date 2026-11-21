@@ -1,7 +1,7 @@
 agent_id: agent:m6py14a1ej77
 team: team:the-promptfather-s
 name: hospital
-version: 1.0.20
+version: 1.0.22
 cap_versions:
   - "1.0"
 profiles:
