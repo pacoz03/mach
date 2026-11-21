@@ -2713,6 +2713,8 @@ async def _welcome(
             facts = _slot_facts(chat, agent, entry["slot"])
             at = protocol.when(facts.get("at", ""))
             en = _english(chat)
+            # Collaboration (review): our GP hears it first, unasked, and the citizen reads it.
+            gp = await _tell_gp(city, chat, booking_id, entry["slot"], facts, at)
             parts = ["booking.receipt", token]
             if entry["ledger_ref"]:
                 parts.append(f"ledger_ref={entry['ledger_ref']}")
@@ -2737,7 +2739,10 @@ async def _welcome(
                     f"it the receipt. Your booking code is "
                     f"{booking_id}. On the day, as soon as you arrive ({window}), write to me "
                     f"that you are here with the code {booking_id}: I will register your arrival "
-                    "and you need do nothing else. If the time no longer suits you, tell your "
+                    "and you need do nothing else. "
+                    + ("On my own initiative I have also let your GP know about this booking, so "
+                       "your doctor is up to date. " if gp else "")
+                    + "If the time no longer suits you, tell your "
                     "booking centre and it can move the visit. If you feel worse in the meantime, "
                     "contact your GP; in an emergency call 112. For any question, just write to "
                     "me here."
@@ -2756,13 +2761,15 @@ async def _welcome(
                     f"mandato la ricevuta. Il suo codice di prenotazione è "
                     f"{booking_id}. Il giorno della visita, appena arriva ({window}), mi scriva "
                     f"che è qui con il codice {booking_id}: registro io il suo arrivo e non deve "
-                    "fare altro. Se l'orario non le va più bene, lo dica al centro prenotazioni: "
+                    "fare altro. "
+                    + ("Di mia iniziativa ho anche avvisato il suo medico di base di questa "
+                       "prenotazione, così è aggiornato. " if gp else "")
+                    + "Se l'orario non le va più bene, lo dica al centro prenotazioni: "
                     "può spostare la visita. Se nel frattempo si sente peggio, si rivolga al suo "
                     "medico di base; in emergenza chiami il 112. Per qualsiasi domanda mi scriva "
                     "pure qui, sono a sua disposizione."
                 )
             await _say(city, citizen, " ".join(parts) + " " + note)
-            await _tell_gp(city, chat, booking_id, entry["slot"], facts, at)
 
 
 async def _tell_gp(
@@ -2772,19 +2779,23 @@ async def _tell_gp(
     slot: str,
     facts: dict[str, str],
     at: datetime | None,
-) -> None:
-    """Unrequested, once, right after the welcome: our own GP learns the visit is booked.
+) -> bool:
+    """Unrequested, once, right before the welcome: our own GP learns the visit is booked.
+    True when the GP has it (now or earlier), so the welcome can say so (review: collaboration
+    is judged on what the citizen reads).
     Only for our booking centre's bookings: another ASST's citizen is not our GP's patient
     (over-disclosure, R:243). Best effort: only if the Index lists our GP, no retry, never raises."""
 
     sender, _, number = _booking_of(chat, city.agent_id, slot) if slot else ("", "", None)
-    if sender != _OUR_BOOKING or not number or protocol.we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
-        return
+    if sender != _OUR_BOOKING or not number:
+        return False
+    if protocol.we(chat, city.agent_id, f"booking_id={booking_id}", to=_OUR_GP, word="data.response"):
+        return True
     try:
         if not any(peer.agent_id == _OUR_GP for peer in await city.find("gp")):
-            return
-    except Exception:  # CapError or network: the citizen already heard from us
-        return
+            return False
+    except Exception:  # CapError or network: the welcome goes without it
+        return False
     parts = ["data.response", "purpose=booking", f"booking_id={booking_id}", f"prescription_number={number}"]
     if facts.get("procedure"):
         parts.append(f"procedure={facts['procedure']}")
@@ -2793,12 +2804,12 @@ async def _tell_gp(
     if at:
         parts.append(f"agenda_date={facts['at']}")
     when = f" per {_in_words(at, False)}" if at else ""
-    await _say(
+    return await _say(
         city,
         _OUR_GP,
         " ".join(parts)
         + f" Buongiorno collega, la informo che il suo paziente con questa ricetta è prenotato "
-        f"da noi{when}: la prenotazione {booking_id} è confermata sul Ledger. Gli ho già inviato "
+        f"da noi{when}: la prenotazione {booking_id} è confermata sul Ledger. Gli invio ora "
         "il codice e le istruzioni per l'arrivo. Se le serve altro sono a disposizione, grazie!",
     )
 
