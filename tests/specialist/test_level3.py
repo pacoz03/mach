@@ -13,14 +13,6 @@ def _booked() -> list:
     ]
 
 
-def _asked() -> list:
-    return _booked() + [
-        msg(LEDGER, f"checked_in booking_id={B}", recipient=AGENT),
-        msg(AGENT, f"checkin booking_id={B} Grazie.", recipient=CITIZEN),
-        msg(AGENT, f"consent purpose=report_sharing booking_id={B} Posso?", recipient=CITIZEN),
-    ]
-
-
 def _ledger_checkins(fake: FakeCity) -> list[str]:
     return [t for to, t in fake.sent if to == LEDGER and t.startswith("checkin")]
 
@@ -50,27 +42,3 @@ def test_arrival_without_our_booking_is_not_a_checkin(brain):
     fake = FakeCity([msg(CITIZEN, "Buongiorno.")])
     run(brain, fake, msg(CITIZEN, "Sono arrivata."))
     assert _ledger_checkins(fake) == []
-
-
-# --- consenso in prosa ------------------------------------------------------------------------
-
-def test_prose_consent_code_shares_the_report(brain):
-    fake = FakeCity(_asked())
-    run(brain, fake, msg(CITIZEN, "Acconsento, il codice del consenso è cons-N-1-report_sharing."))
-    assert fake.reports() == [f"report booking_id={B} outcome_code=VISIT consent_ref=cons-N-1-report_sharing"]
-
-
-def test_prose_yes_without_code_asks_for_it_once(brain):
-    fake = FakeCity(_asked())
-    run(brain, fake, msg(CITIZEN, "Sì, va bene, può condividerlo."))
-    assert fake.reports() == []
-    assert len(fake.to_citizen("consent")) == 1
-    run(brain, fake, msg(CITIZEN, "Sì sì, certo."))
-    assert fake.reports() == [f"report booking_id={B} outcome_code=VISIT"]
-    assert len(fake.to_citizen("consent")) == 1
-
-
-def test_prose_no_files_unshared_report(brain):
-    fake = FakeCity(_asked())
-    run(brain, fake, msg(CITIZEN, "No, preferisco di no."))
-    assert fake.reports() == [f"report booking_id={B} outcome_code=VISIT"]

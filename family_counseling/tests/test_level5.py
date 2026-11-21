@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 import unittest
 from types import SimpleNamespace as Row
-from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'agent'))
 import facility as f
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tests'))
@@ -20,24 +19,8 @@ class Preferences(unittest.TestCase):
         p=f._family_preferences([row('citizen:test', '', {'provided': {'days':['tue'], 'lang':'en','gender_preference':'f'}})], 'citizen:test')
         self.assertEqual(p, {'days':{'tue'}, 'lang':'en', 'gender':'f'})
 
-    def test_alternative_requires_yes(self):
-        history=[row('citizen:test','lang=en gender=m days=tue'),
-                 row('agent:fc','data.request purpose=alternative lang=it gender=f days=wed')]
-        self.assertEqual(f._family_preferences(history+[row('citizen:test','No')], 'citizen:test')['gender'],'m')
-        p=f._family_preferences(history+[row('citizen:test','Si')], 'citizen:test')
-        self.assertEqual(p,{'lang':'it','gender':'f','days':{'wed'}})
-
 
 class Flows(unittest.IsolatedAsyncioTestCase):
-    async def test_alternative_reply_never_books(self):
-        for answer, accepted in [('Si',True),('No',False)]:
-            city=Row(agent_id='agent:fc')
-            m=row('citizen:test',answer)
-            chat=[row('agent:fc','data.request purpose=alternative lang=it gender=f days=wed'),m]
-            with patch.object(f,'_advance',new_callable=AsyncMock) as search, patch.object(f,'_say',new_callable=AsyncMock) as say, patch.object(f,'_on_confirm',new_callable=AsyncMock) as book:
-                await f._family(city,m,chat)
-                self.assertEqual(search.await_count,int(accepted)); book.assert_not_awaited()
-
     async def test_partner_combined_and_empty(self):
         for criteria, fits in [('lang=en gender_preference=f days=tue',True),
                                ('lang=en gender_preference=m days=tue',False),

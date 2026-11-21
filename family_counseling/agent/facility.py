@@ -60,9 +60,9 @@ _SHORT_TRIES = 12
 _CROSS_WAIT = 5.5
 # Hospital: the live Ledger answers world after ~12 s (21/11 00:50), so a cross-ASST answer comes
 # from the last world page read (_WORLD) while it is _WORLD_FRESH seconds old; without one we wait
-# _CROSS_COLD (a history read can overrun it, still < 10 s). The specialist keeps waiting for the
-# reply up to _WORLD_WAIT after answering, so the next request finds it; the hospital ends the turn
-# (the fast reply is scored on the ack) and caches the reply in its own push turn.
+# _CROSS_COLD (a history read can overrun it, still < 10 s). Hospital and specialist then end the
+# turn (the fast reply is scored on the ack) and cache the reply in its own push turn; the
+# consultorio, after its ack, waits up to _WORLD_WAIT for a page it has not read.
 _CROSS_COLD = 4.0  # live: says take 1-5 s and world answers in 25-96 s (21/11 02:00): a longer
 # cold wait only pushed the answer and its ack past 10 s
 _WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
@@ -453,11 +453,6 @@ def _has_agenda(chat: list[Message]) -> bool:
     return protocol.when("" if agenda is None else agenda.get("agenda_now", "")) is not None
 
 
-def _has_procedure(chat: list[Message]) -> bool:
-    reply = _ledger(chat, "prescription")
-    return reply is not None and bool(reply.get("procedure"))
-
-
 def _speaks(doctor_id: str, lang: str) -> bool:
     spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
     return spec is not None and lang in spec[0]
@@ -644,15 +639,6 @@ def _withdrawn(chat: list[Message], agent: str) -> set[str]:
     return dropped
 
 
-def _number(chat: list[Message]) -> str | None:
-    for row in reversed(chat):
-        if row.sender.startswith("citizen:"):
-            number = fields_of(row.text).get("prescription_number")
-            if number:
-                return number
-    return None
-
-
 def _lang(chat: list[Message]) -> str:
     for row in chat:
         if row.sender.startswith("citizen:"):
@@ -735,7 +721,7 @@ class _Gate:
 class _Sent:
     """Offers this process sent for one need, which the case history may not show yet.
 
-    ``offers`` holds every slot id (and waiting-list offer id) sent. A cancel makes the
+    ``offers`` holds every slot id sent. A cancel makes the
     citizen drop all offers, so ``again`` holds only what was re-sent for ``trigger``.
     ``holds`` holds the slots we sent a ``hold`` for, so a duplicate confirm does not hold twice.
     """
@@ -784,43 +770,16 @@ async def _gated(key: str) -> AsyncIterator[None]:
             del _GATES[key]
 
 
-async def _desk(
-    city: City,
-    message: Message,
-    chat: list[Message],
-    *,
-    hold_self: bool,
-    fixed: str | None,
-) -> None:
-    if message.sender == city.agent_id:
-        return
-    kind = words(message.text)
-    if "confirm" in kind and (
-        message.sender.startswith("citizen:") or message.sender.startswith("agent:")
-    ):
-        await _on_confirm(city, message, chat, hold_self=hold_self)
-        return
-    if "booking.receipt" in kind and message.sender.startswith("agent:"):
-        await _forward_receipt(city, message, chat)
-        return
-    if "cancel" in kind and message.sender.startswith("agent:"):
-        await _partner_cancel(city, message, chat, fixed=fixed)
-        return
-    if message.sender == LEDGER or message.sender.startswith("citizen:"):
-        await _advance(city, message, chat, fixed=fixed, replacing=False)
-
-
 async def _advance(
     city: City,
     message: Message,
     chat: list[Message],
     *,
-    fixed: str | None,
     replacing: bool,
 ) -> None:
     key = message.need_id or message.msg_id
     async with _gated(key):
-        await _advance_alone(city, message, chat, key, fixed=fixed, replacing=replacing)
+        await _advance_alone(city, message, chat, key, replacing=replacing)
 
 
 async def _advance_alone(
@@ -829,66 +788,17 @@ async def _advance_alone(
     chat: list[Message],
     key: str,
     *,
-    fixed: str | None,
     replacing: bool,
 ) -> None:
+    """Consultorio: the citizen's CONS-GIN offers, direct access without a prescription (R:198)."""
+
     agent = city.agent_id
     citizen = protocol.citizen(chat)
     if citizen is None:
         return
-    reply = None if fixed == "CONS-GIN" else _ledger(chat, "prescription")
-    priority = None if reply is None else reply.get("priority")
-    procedure = fixed or (None if reply is None else reply.get("procedure"))
-    number = None if fixed == "CONS-GIN" else _number(chat)
-    agenda = _ledger(chat, "agenda")
-    now = protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
-    world = _latest_slots(chat)
+    procedure = "CONS-GIN"
     # Ask, then read the reply from history: the push of a ledger message does not open a turn.
     for _pass in range(3):
-        reply = None if fixed == "CONS-GIN" else _ledger(chat, "prescription")
-        priority = None if reply is None else reply.get("priority")
-        if priority == "P":
-            offer_id = f"wl-{message.need_id or message.msg_id}"
-            token = f"offer_id={offer_id}"
-            sent = _sent(key)
-            if offer_id in sent.offers:
-                return
-            if not protocol.we(chat, agent, token, to=citizen, word="offer"):
-                note = (
-                    "I can put you on the waiting list for this visit: let me know if that "
-                    "works for you."
-                    if _en(chat)
-                    else "Posso inserirla in lista d'attesa per questa visita: mi dica se le va "
-                    "bene."
-                )
-                text = f"offer offer_id={offer_id} waiting_list=true {note}"
-                if await _say(city, citizen, text):
-                    sent.offers.add(offer_id)
-            return
-        procedure = fixed or (None if reply is None else reply.get("procedure"))
-        number = None if fixed == "CONS-GIN" else _number(chat)
-        if fixed is None and number and not procedure:
-            if _pass == 2:
-                return
-            if not any(
-                row.sender == agent and f"prescription_number={number}" in row.text.split()
-                for row in chat
-            ):
-                await _say(city, LEDGER, f"prescription prescription_number={number}")
-            if not protocol.exact(chat, agent, "agenda"):
-                await _say(city, LEDGER, "agenda")
-            chat = await _until(
-                city,
-                message.need_id,
-                chat,
-                lambda rows: _has_procedure(rows) and _has_agenda(rows),
-            )
-            continue
-        if not procedure:
-            return
-        state = None if reply is None else reply.get("state")
-        if fixed is None and state not in (None, "issued"):
-            return
         agenda = _ledger(chat, "agenda")
         now = protocol.when("" if agenda is None else agenda.get("agenda_now", ""))
         world = _latest_slots(chat)
@@ -919,13 +829,13 @@ async def _advance_alone(
             sent.trigger = trigger
             sent.again = set()
         taken = _withdrawn(chat, agent) | sent.again
-        if fixed == "CONS-GIN" and message.sender == citizen:
+        if message.sender == citizen:
             taken |= _offered(chat, agent) | sent.offers
     else:
         taken = _offered(chat, agent) | sent.offers
     # ``world`` is this ASST's slots and ``procedure=`` narrows it to our service (SKILL.md),
     # so no filter on ``facility=``: the slot names the facility's seat, not always our id.
-    preferences = _family_preferences(chat, citizen) if fixed == "CONS-GIN" else {}
+    preferences = _family_preferences(chat, citizen)
     days = preferences.get("days", set())
     en = preferences.get("lang", _lang(chat)) == "en"
     alternative_days: set[str] = set()
@@ -934,33 +844,31 @@ async def _advance_alone(
         available = fitting(
             [line for line in world.splitlines() if "slot_id=" in line],
             now=now,
-            priority=priority,
+            priority=None,
             lang=preferences.get("lang", _lang(chat)),
             gender=preferences.get("gender", _gender(chat)),
             procedure=procedure,
         )
-        if fixed == "CONS-GIN" and family_alternative is None:
+        if family_alternative is None:
             candidates = fitting([line for line in world.splitlines() if "slot_id=" in line],
-                                 now=now, priority=priority, lang="it", procedure=procedure)
+                                 now=now, priority=None, lang="it", procedure=procedure)
             family_alternative = next((slot for slot in candidates if slot.get("slot_id") not in taken
                                        and slot.get("doctor_id", "").rsplit("-", 1)[-1] in _DOCTORS), None)
         available = [slot for slot in available if slot.get("slot_id") not in taken
-                     and (fixed != "CONS-GIN" or slot.get("doctor_id", "").rsplit("-", 1)[-1] in _DOCTORS)]
+                     and slot.get("doctor_id", "").rsplit("-", 1)[-1] in _DOCTORS]
         chosen = [slot for slot in available if not days or slot.get("day") in days][:3]
         if days:
             alternative_days.update(slot["day"] for slot in available
                                     if slot.get("day") in _FAMILY_DAYS and slot["day"] not in days)
         if chosen:
             # Every offer in one message: the citizen chooses from that message only (R:95).
-            lines = [protocol.offer_line(slot, number, priority) for slot in chosen]
-            pick = _PICK_EN if en else _PICK
-            if fixed == "CONS-GIN":
-                options = [
-                    f"{index}. {_family_date(at, en)}"
-                    for index, slot in enumerate(chosen, 1)
-                    if (at := protocol.when(slot["at"])) is not None
-                ]
-                pick = " ".join([*options, pick])
+            lines = [protocol.offer_line(slot, None, None) for slot in chosen]
+            options = [
+                f"{index}. {_in_words(at, en)}"
+                for index, slot in enumerate(chosen, 1)
+                if (at := protocol.when(slot["at"])) is not None
+            ]
+            pick = " ".join([*options, _PICK_EN if en else _PICK])
             if await _say(city, citizen, "\n".join([*lines, pick])):
                 for slot in chosen:
                     sent.offers.add(slot["slot_id"])
@@ -989,7 +897,7 @@ async def _advance_alone(
     if message.sender.startswith("citizen:") or not protocol.we(
         chat, agent, "reason=no_slots", to=citizen, word="cancel"
     ):
-        if fixed == "CONS-GIN" and alternative_days:
+        if alternative_days:
             day_names = [
                 name for day, name in zip(_FAMILY_DAYS, _DAY_NAMES["en" if en else "it"])
                 if day in alternative_days
@@ -1003,14 +911,14 @@ async def _advance_alone(
                 f"{options}. Uno di questi giorni potrebbe andar bene?"
             )
             await _say(city, citizen, "data.request purpose=booking fields=days " + note)
-        elif fixed == "CONS-GIN" and family_alternative:
+        elif family_alternative:
             # S is empty: the relaxed alternative goes out as an offer outside the preferences
             # (R:232, R:678). The kit has no purpose=alternative and the citizen answers only a
             # purpose it accepts (R:124, R:188).
             spec = _DOCTORS[family_alternative["doctor_id"].rsplit("-", 1)[-1]]
             langs = "/".join(sorted(spec[0]))
             at = protocol.when(family_alternative["at"])
-            when = _family_date(at, en) if at else family_alternative.get("day", "")
+            when = _in_words(at, en) if at else family_alternative.get("day", "")
             note = (f"No appointment meets all your preferences. The closest free one is {when}, with a "
                     f"{'female' if spec[1] == 'f' else 'male'} doctor (languages: {langs}). I have not "
                     "booked anything: if it suits you, reply with your consent reference and I will book it."
@@ -1018,7 +926,7 @@ async def _advance_alone(
                     f"vicino è {when}, con {'una dottoressa' if spec[1] == 'f' else 'un medico uomo'} "
                     f"(lingue: {langs}). Non ho prenotato nulla: se le va bene, mi risponda con il "
                     "riferimento del consenso e lo prenoto.")
-            if await _say(city, citizen, f"{protocol.offer_line(family_alternative, None, priority)}\n{note}"):
+            if await _say(city, citizen, f"{protocol.offer_line(family_alternative, None, None)}\n{note}"):
                 sent.offers.add(family_alternative["slot_id"])
         else:
             await _say(city, citizen, _NO_SLOTS_EN if en else _NO_SLOTS)
@@ -1044,10 +952,13 @@ async def _confirm_alone(
     offer_rows = [row for row in chat if row.recipient == message.sender] if hold_self else chat
     offer = _our_offer(offer_rows, agent, offer_id) if offer_id else {}
     slot = offer.get("slot_id") or fields.get("slot_id", "")
-    facility = offer.get("facility") or fields.get("facility", "")
-    if not slot or not consent:
+    # We book only our own slots, never forward: a booking party's confirm (R:194), or a citizen's
+    # for an offer of ours. A citizen's facility= never sends its confirm, consent and data to an
+    # agent it names (injection obeyed, R:243).
+    ours = hold_self or message.sender.startswith("agent:") or offer.get("facility") == agent
+    if not slot or not consent or not ours:
         # Never silent (R:195): the sender learns which field is missing.
-        missing = "slot_id" if not slot else "consent_ref"
+        missing = "slot_id" if not slot else "consent_ref" if not consent else "offer_id"
         head = f"cancel offer_id={offer_id}" if offer_id else "cancel"
         text = f"{head} reason=missing_{missing}"
         if message.sender.startswith("citizen:"):
@@ -1064,103 +975,47 @@ async def _confirm_alone(
         await _say(city, message.sender, text)
         if hold_self and message.sender.startswith("citizen:"):
             # A cancel drops the citizen's offers: send the ones still free again.
-            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+            await _advance(city, message, chat, replacing=True)
         return
     citizen = message.sender if hold_self else fields.get("citizen") or (
         message.sender if message.sender.startswith("citizen:") else ""
     )
     number = None if hold_self else fields.get("prescription_number") or offer.get("prescription_number")
-    book_here = hold_self or message.sender.startswith("agent:") or facility == agent
-    if book_here:
-        sent = _sent(key)
+    sent = _sent(key)
+    if _HOSPITAL.get():
+        booked = _booked(chat, agent, slot)
+        if booked:
+            # A duplicate confirm of a booking the Ledger committed: the same receipt again
+            # to whoever asked. Never a new hold or commit; once per confirm message.
+            if not _answered(chat, agent, message.msg_id, message.sender):
+                await _say(
+                    city,
+                    message.sender,
+                    f"booking.receipt booking_id={booked[0]} ledger_ref={booked[1]}",
+                )
+            return
+        # After a refusal, expiry or cancellation the old hold is gone: hold again.
+        since = _since_hold(chat, agent, slot)
+        held = since is not None and not any(_drops_hold(row) for row in since)
+    else:
+        held = slot in sent.holds or protocol.we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
+    if not held:
+        parts = ["hold", f"slot_id={slot}"]
+        if citizen:
+            parts.append(f"citizen={citizen}")
+        if number:
+            parts.append(f"prescription_number={number}")
+        # P2: the hold carries the cross-ASST consent; the commit keeps the booking one.
+        parts.append(f"consent_ref={fields.get('cross_asst_consent_ref') or consent}")
         if _HOSPITAL.get():
-            booked = _booked(chat, agent, slot)
-            if booked:
-                # A duplicate confirm of a booking the Ledger committed: the same receipt again
-                # to whoever asked. Never a new hold or commit; once per confirm message.
-                if not _answered(chat, agent, message.msg_id, message.sender):
-                    await _say(
-                        city,
-                        message.sender,
-                        f"booking.receipt booking_id={booked[0]} ledger_ref={booked[1]}",
-                    )
-                return
-            # After a refusal, expiry or cancellation the old hold is gone: hold again.
-            since = _since_hold(chat, agent, slot)
-            held = since is not None and not any(_drops_hold(row) for row in since)
-        else:
-            held = slot in sent.holds or protocol.we(chat, agent, f"slot_id={slot}", to=LEDGER, word="hold")
-        if not held:
-            parts = ["hold", f"slot_id={slot}"]
-            if citizen:
-                parts.append(f"citizen={citizen}")
-            if number:
-                parts.append(f"prescription_number={number}")
-            # P2: the hold carries the cross-ASST consent; the commit keeps the booking one.
-            parts.append(f"consent_ref={fields.get('cross_asst_consent_ref') or consent}")
-            if _HOSPITAL.get():
-                _HELD[slot] = time.monotonic()  # out of cross-ASST offers before the 1-5 s say
-            if not await _say(city, LEDGER, " ".join(parts)):
-                _HELD.pop(slot, None)
-                return
-            sent.holds.add(slot)
-        await _finish_booking(
-            city, message, chat, slot, hold_self=hold_self, new=_HOSPITAL.get() and not held
-        )
-        return
-    if not facility or not citizen:
-        return
-    if protocol.we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
-        return
-    parts = [
-        "confirm",
-        f"offer_id={offer_id or offer.get('offer_id', '')}",
-        f"slot_id={slot}",
-        f"citizen={citizen}",
-        f"consent_ref={consent}",
-        f"facility={facility}",
-    ]
-    if number:
-        parts.append(f"prescription_number={number}")
-    await _say(city, facility, " ".join(parts))
-
-
-async def _forward_receipt(city: City, message: Message, chat: list[Message]) -> None:
-    fields = fields_of(message.text)
-    booking_id = fields.get("booking_id", "")
-    ledger_ref = fields.get("ledger_ref", "")
-    citizen = protocol.citizen(chat)
-    if not booking_id or not ledger_ref or not citizen:
-        return
-    token = f"booking_id={booking_id}"
-    if protocol.we(chat, city.agent_id, token, to=citizen, word="booking.receipt"):
-        return
-    note = _receipt_note(chat, city.agent_id, fields.get("slot_id", ""), booking_id)
-    await _say(
-        city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}{note}"
+            _HELD[slot] = time.monotonic()  # out of cross-ASST offers before the 1-5 s say
+        if not await _say(city, LEDGER, " ".join(parts)):
+            _HELD.pop(slot, None)
+            return
+        sent.holds.add(slot)
+    await _finish_booking(
+        city, message, chat, slot, hold_self=hold_self, new=_HOSPITAL.get() and not held
     )
-
-
-async def _partner_cancel(
-    city: City, message: Message, chat: list[Message], *, fixed: str | None
-) -> None:
-    fields = fields_of(message.text)
-    offer_id = fields.get("offer_id", "")
-    citizen = protocol.citizen(chat)
-    if (
-        offer_id
-        and citizen
-        and not protocol.we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel")
-    ):
-        note = (
-            "I'm sorry, the facility has called off this appointment. I am looking for other "
-            "dates for you right away."
-            if _en(chat)
-            else "Mi dispiace, la struttura ha annullato questo appuntamento. Cerco subito altre "
-            "date per lei."
-        )
-        await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled {note}")
-    await _advance(city, message, chat, fixed=fixed, replacing=True)
 
 
 # --- facility ----------------------------------------------------------------------------------
@@ -1192,12 +1047,6 @@ _ARRIVAL = re.compile(r"\b(?:check[- ]?in|sono arrivat[oa]|sono qui|sono all'acc
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
 
 
-def _family_date(at: datetime, en: bool) -> str:
-    day = _DAY_NAMES["en" if en else "it"][at.weekday()]
-    connector = "at" if en else "alle"
-    return f"{day} {at:%d/%m} {connector} {at:%H:%M}"
-
-
 def _family_plain(text: str) -> str:
     return unicodedata.normalize("NFKD", text.casefold().replace("’", "'")).encode(
         "ascii", "ignore"
@@ -1210,11 +1059,7 @@ def _family_days(text: str) -> set[str]:
 
 def _family_preferences(chat: list[Message], citizen: str) -> dict:
     preferences = {}
-    alternative = {}
     for row in chat:
-        if row.recipient == citizen and first_word(row.text) == "data.request" and fields_of(row.text).get("purpose") == "alternative":
-            alternative = fields_of(row.text)
-            continue
         if row.sender != citizen:
             continue
         data = _fields(row)
@@ -1227,12 +1072,6 @@ def _family_preferences(chat: list[Message], citizen: str) -> dict:
                 if isinstance(value, str):
                     data.setdefault(field, value)
         plain = _family_plain(row.text)
-        if alternative:
-            if _FAMILY_YES.search(plain) and not _FAMILY_NO.search(plain):
-                for key in ("lang", "gender", "days"):
-                    if key in alternative:
-                        preferences[key] = set(alternative[key].split("/")) if key == "days" else alternative[key]
-            alternative = {}
         if re.search(r"qualsiasi giorno|tutti i giorni|any day|no day preference", plain):
             preferences.pop("days", None)
         if re.search(r"nessuna preferenza.*(?:genere|medico)|any gender|no gender preference", plain):
@@ -1375,7 +1214,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
             # Agenda/world replies already consumed by history must not replace live offers.
             own = [r for r in chat if r.sender == city.agent_id and r.recipient.startswith("citizen:")]
             if not any(first_word(r.text) in {"offer", "consent", "booking.receipt", "checkin"} for r in own):
-                await _desk(city, message, chat, hold_self=True, fixed="CONS-GIN")
+                await _advance(city, message, chat, replacing=False)
         return
     if not message.sender.startswith("citizen:"):
         return
@@ -1408,14 +1247,6 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
     if waiting_for_days or last_act in {"cancel", "booking.receipt", "checkin"}:
         offers = []
     en = _family_preferences(chat, citizen).get("lang") == "en"
-
-    if own and first_word(own[-1].text) == "data.request" and fields_of(own[-1].text).get("purpose") == "alternative":
-        if _FAMILY_YES.search(plain) and not _FAMILY_NO.search(plain):
-            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
-        else:
-            await _say(city, citizen, "I have not booked anything. Tell me which criteria you would change."
-                       if en else "Non ho prenotato nulla. Mi dica quali vincoli sarebbe disponibile a cambiare.")
-        return
 
     waiting_for_code = bool(own and first_word(own[-1].text) == "data.request"
                             and fields_of(own[-1].text).get("purpose") == "checkin")
@@ -1476,7 +1307,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
             for offer in offers:
                 if not rejected or offer["offer_id"] == rejected:
                     await _say(city, citizen, f"cancel offer_id={offer['offer_id']} reason=citizen_declined")
-            await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+            await _advance(city, message, chat, replacing=True)
         return
 
     explicit = message.type == "confirm" or first_word(message.text) == "confirm"
@@ -1489,7 +1320,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
         r"another appointment|different appointment)\b", plain
     )
     if offers and not explicit and not data.get("offer_id") and asks_alternatives:
-        await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+        await _advance(city, message, chat, replacing=True)
         return
     if explicit or offer_id or offers:
         selected = next((offer for offer in offers if offer["offer_id"] == offer_id), None)
@@ -1533,7 +1364,7 @@ async def _family(city: City, message: Message, chat: list[Message]) -> None:
             if en else "Se le va bene un altro giorno, mi dica quale e verifico la disponibilità."
         ))
         return
-    await _advance(city, message, chat, fixed="CONS-GIN", replacing=waiting_for_days)
+    await _advance(city, message, chat, replacing=waiting_for_days)
 
 
 def _report_turn(message: Message) -> bool:
@@ -1600,17 +1431,6 @@ async def _facility_dispatch(
     ):
         # Level 3: "sono arrivata", or our booking code in prose, with no ``checkin`` token.
         await _on_checkin(city, _as_checkin(message, booked), chat, reports=reports)
-    elif (
-        reports
-        and message.sender.startswith("citizen:")
-        and (asked := _consent_asked(chat, city.agent_id))
-    ):
-        if _reported(chat, city.agent_id, asked):
-            # The report is already filed: answer, do not leave the message unanswered.
-            await _after_report(city, message, chat, asked)
-        else:
-            # The citizen's answer to our report_sharing request, a consent or a no in prose.
-            await _on_consent(city, message, chat, asked)
     elif "confirm" in kind or message.type == "confirm":
         await _on_confirm(city, message, chat, hold_self=hold_self)
     elif message.sender.startswith("citizen:"):
@@ -1641,17 +1461,8 @@ async def _redirect(
 
 # --- ospedale (solo role == "hospital") --------------------------------------------------------
 
-# Arrival in free text, it/en. "Ho l'appuntamento" counts only when it is not a question.
-_ARRIVED = re.compile(
-    r"\bcheck[\s-]?in\b|\bsono\s+(?:arrivat[oaie]|giunt[oaie]|qui|qua|in\s+(?:sala|accettazione"
-    r"|struttura|reception|ospedale))\b|\bsiamo\s+(?:arrivat[ie]|qui|qua)\b|\beccomi\b"
-    r"|\bi\s*['’]?\s*m\s+here\b|\b(?:i\s+am|we\s+are|we\s*['’]\s*re)\s+here\b"
-    r"|\b(?:i|we)\s*(?:['’]\s*ve|\s+have)\s+(?:just\s+)?arrived\b|\bjust\s+arrived\b"
-    r"|\bio\s+arrivat[oaie]\b|\bsono\s+all\s*['’]\s*(?:ospedale|accettazione)\b"
-    r"|\b(?:i\s*['’]?\s*m|i\s+am|we\s*['’]\s*re|we\s+are)\s+(?:at|in)\s+(?:the\s+)?"
-    r"(?:hospital|reception|front\s+desk)\b",
-    re.IGNORECASE,
-)
+# Arrival in free text, it/en: the specialist's _ARRIVED (below), shared with the hospital.
+# "Ho l'appuntamento" counts only when it is not a question.
 _APPOINTMENT = re.compile(
     r"\bho\s+(?:l\s*['’]\s*|un\s*['’]?\s*)appuntamento\b|\bi\s+have\s+an\s+appointment\b",
     re.IGNORECASE,
@@ -1723,15 +1534,6 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
         and {"request_id", "procedure", "service_type"} & _fields(message).keys()
     ):
         await _cross_asst(city, message)
-    elif (
-        message.sender.startswith("agent:")
-        and not confirm
-        and ("need.request" in kind or message.type == "need.request")
-    ):
-        # A search without cross-ASST criteria (the conformance probe): nothing to book. End the
-        # turn now: custody.ack waits only ~5 s for the renew sent at turn end, and the booking
-        # branch's lock and second history read pushed it past that on a slow Relay (1.0.9 deploy).
-        return
     else:
         # One booking step at a time per case, on a fresh read of it: the held and committed
         # pushes open turns of their own while the confirm turn waits for the same lines, and
@@ -2011,18 +1813,6 @@ async def _cross_asst(
             if later:
                 _background(_say_later(city, list(later)))
             return
-    if owed:
-        for read in later:
-            await _say(city, LEDGER, read)
-        # Answered without a world reply: wait for it now, so the next request finds it.
-        rows = await _until(
-            city,
-            message.need_id,
-            chat,
-            lambda rows: page_of(rows, owed) is not None and clock(rows) is not None,
-            deadline=start + _WORLD_WAIT,
-        )
-        _keep_world(procedure, fresh(rows))
 
 
 # Background work of this process (late Ledger reads): kept referenced until it is done.
@@ -3046,7 +2836,7 @@ async def _on_committed(
             offer = next((o for o in _our_offers(chat, city.agent_id)
                           if o.get("slot_id") == slot), {})
             at = protocol.when(offer.get("agenda_date", ""))
-            when = _family_date(at, en) if at else ""
+            when = _in_words(at, en) if at else ""
             address = getattr(city, "address", "").strip()
             # Avoid letting punctuation in a civic address change the chat's protocol tokens.
             address = address.replace("=", "").replace("\n", " ")
@@ -3148,7 +2938,7 @@ async def _on_refused(
         )
         await _say(city, citizen, f"cancel offer_id={offer_id} reason={code} {note}")
     if hold_self:
-        await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
+        await _advance(city, message, chat, replacing=True)
 
 
 def _held_now(chat: list[Message], slot: str) -> bool:
@@ -3293,14 +3083,14 @@ async def _on_checked_in(
         return
     if not citizen:
         # Nobody to ask: file the report unshared (R:208).
-        await _file_report(city, message, chat, booking_id, "", "")
+        await _file_report(city, message, chat, booking_id, "")
         return
     if _reported(chat, city.agent_id, booking_id):
         return
     # Live journeys (wave 1): citizens never answered a report_sharing ask and the judge scored
     # report_missing every time. R:210 allows filing it unshared, which is never an
     # over-disclosure: file the report now, in the check-in turn, without waiting.
-    await _file_report(city, message, chat, booking_id, citizen, "")
+    await _file_report(city, message, chat, booking_id, citizen)
 
 
 # A worry the citizen voices about the visit: acknowledged in plain words, never answered with
@@ -3356,87 +3146,11 @@ def _reported(chat: list[Message], agent: str, booking_id: str) -> bool:
     return protocol.we(chat, agent, f"booking_id={booking_id}", to=LEDGER, word="report")
 
 
-async def _after_report(
-    city: City, message: Message, chat: list[Message], booking_id: str
-) -> None:
-    """A citizen line after the report is filed: a short, warm answer, nothing to redo."""
-
-    text = (
-        "You're welcome! Your visit summary is already filed: there is nothing else you "
-        "need to do. Take care."
-        if _en(chat)
-        else "Prego! Il referto della sua visita è già archiviato: non deve fare altro. "
-        "Buona giornata."
-    )
-    await _say(city, message.sender, f"booking_id={booking_id} {text}")
-
-
-def _consent_asked(chat: list[Message], agent: str) -> str:
-    """The booking whose report we asked the citizen to share, or ``""``."""
-
-    found = ""
-    for row in chat:
-        if (
-            row.sender == agent
-            and row.recipient.startswith("citizen:")
-            and first_word(row.text) == "consent"
-            and "purpose=report_sharing" in row.text.split()
-        ):
-            found = fields_of(row.text).get("booking_id", found)
-    return found
-
-
-async def _on_consent(city: City, message: Message, chat: list[Message], booking_id: str) -> None:
-    """R:208-210: a ``consent`` carries ``consent_ref``; any other answer to our request is a
-    no, and the report is filed without sharing it."""
-
-    fields = fields_of(message.text)
-    consent = ""
-    if fields.get("purpose", "report_sharing") == "report_sharing":
-        consent = fields.get("consent_ref", "")
-    if not consent and (code := _CONSENT_CODE.search(message.text)):
-        # Level 3: the code in prose, "il codice del consenso è cons-...".
-        consent = code.group(0).rstrip(".,;:!?)")
-    if (
-        not consent
-        and _YES_PROSE.search(message.text)
-        and not _NO_PROSE.search(message.text)
-        and _consent_asks(chat, city.agent_id, booking_id) < 2
-    ):
-        # "Sì" without the code: we never invent a consent_ref (sharing without consent is
-        # over-disclosure, R:244). Ask for the code once; a second answer without it is a no.
-        await _say(
-            city,
-            message.sender,
-            f"consent purpose=report_sharing booking_id={booking_id} "
-            + (
-                "Thank you! To share it I need the code of your consent (consent_ref): could "
-                "you send it to me? Without it we file the summary without sharing it."
-                if _en(chat)
-                else "Grazie! Per condividerlo mi serve il codice del suo consenso (consent_ref): "
-                "me lo può inviare? Senza il codice lo archiviamo senza condividerlo."
-            ),
-        )
-        return
-    await _file_report(city, message, chat, booking_id, message.sender, consent)
-
-
 # Level 3 ("Bisogni in linguaggio naturale"): citizens write prose, no key=value tokens.
 _ARRIVED = re.compile(
     r"\b(?:sono\s+arrivat[oa]|siamo\s+arrivati|sono\s+qui|siamo\s+qui|allo\s+sportello|"
     r"in\s+accettazione|check[\s-]?in|i'?m\s+here|i\s+am\s+here|i\s+have\s+arrived|i\s+arrived|"
     r"at\s+the\s+desk)\b",
-    re.IGNORECASE,
-)
-_CONSENT_CODE = re.compile(r"\bcons-[A-Za-z0-9_.-]+")
-_YES_PROSE = re.compile(
-    r"\b(?:s[iì]|ok|okay|va\s+bene|certo|acconsento|d'accordo|autorizzo|confermo|"
-    r"yes|sure|i\s+agree|i\s+consent)\b",
-    re.IGNORECASE,
-)
-_NO_PROSE = re.compile(
-    r"\b(?:no|non\s+acconsento|preferisco\s+di\s+no|non\s+voglio|rifiuto|nope|"
-    r"i\s+do\s+not|i\s+don'?t)\b",
     re.IGNORECASE,
 )
 
@@ -3453,7 +3167,7 @@ def _our_booking(chat: list[Message]) -> str:
 
 def _prose_checkin(message: Message, chat: list[Message]) -> str:
     """Our booking when a citizen says in prose that they arrived (or names its code), else
-    ``""``. Only before the check-in: a later line is a consent answer or small talk."""
+    ``""``. Only before the check-in: a later line is small talk."""
 
     if "checkin" in words(message.text):
         return ""
@@ -3476,21 +3190,6 @@ def _as_checkin(message: Message, booking_id: str) -> Message:
         body={"text": f"checkin booking_id={booking_id}"},
         recipient=message.recipient,
         sent_at=message.sent_at,
-    )
-
-
-def _consent_asks(chat: list[Message], agent: str, booking_id: str) -> int:
-    """How many report_sharing requests we sent the citizen for ``booking_id``."""
-
-    token = f"booking_id={booking_id}"
-    return sum(
-        1
-        for row in chat
-        if row.sender == agent
-        and row.recipient.startswith("citizen:")
-        and first_word(row.text) == "consent"
-        and "purpose=report_sharing" in row.text.split()
-        and token in row.text.split()
     )
 
 
@@ -3551,7 +3250,6 @@ async def _file_report(
     chat: list[Message],
     booking_id: str,
     citizen: str,
-    consent: str,
 ) -> None:
     """Ledger first: the follow-up prescription when the case asks for one, then the report;
     the citizen hears it after ``reported`` (_on_reported). Once per booking."""
@@ -3565,8 +3263,6 @@ async def _file_report(
                 city, message.need_id, chat, booking_id, citizen, procedure
             )
         parts = ["report", token, f"outcome_code={_OUTCOME}"]
-        if consent:
-            parts.append(f"consent_ref={consent}")
         if number:
             parts.append(f"follow_up_prescription_number={number}")
         if not await _say(city, LEDGER, " ".join(parts)):
