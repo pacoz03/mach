@@ -2055,7 +2055,8 @@ SCENARIOS.update({
     "booking_margine_ledger_lento": dict(start=BACK, ledger_rtt=270, expect=[
         offers_ahead(4.5), wrote("checkin", "R:234")]),
     # 2. Due cittadini allo stesso momento: slot diversi a ciascuno, nessun hold rifiutato.
-    "booking_slot_condivisi": dict(start=BACK, others=1, expect=[distinct_offers, wrote("checkin", "R:234")]),
+    # late_hours=9 (Ledger a lun 17:00): col margine di 16 h, da lun 08:00 la finestra B ha solo i 4 slot di martedì.
+    "booking_slot_condivisi": dict(start=BACK, others=1, late_hours=9, expect=[distinct_offers, wrote("checkin", "R:234")]),
     # 3. Il cittadino rifiuta le tre offerte (reason=past); agenda dal Ledger dopo 8 s: la risposta
     # arriva subito dagli slot già letti, non dopo il Ledger.
     "booking_rifiuto_subito": dict(start=BACK, handoff=True, refuse_first="past", slow_agenda=8.0, expect=[
@@ -2351,7 +2352,8 @@ ROSSO_EN = "severe chest pain since this morning"
 SCENARIOS.update({
     # Il secondo cittadino arriva dopo la risposta di world al primo, con world ormai a 3 s: le sue
     # offerte partono nel turno delle sue preferenze dalla pagina già letta, su slot diversi.
-    "booking_world_in_cache": dict(start=BACK, handoff=True, setup=later_citizen, expect=[
+    # late_hours=9 (Ledger a lun 17:00): col margine di 16 h, da lun 08:00 la finestra B ha solo i 4 slot di martedì.
+    "booking_world_in_cache": dict(start=BACK, handoff=True, late_hours=9, setup=later_citizen, expect=[
         offered_on_turn(LATER, 2.0), distinct_offers, wrote("checkin", "R:234")]),
     # Red flag scritta al centro dopo il passaggio del gp per palpitazioni: escalation prima di tutto,
     # poi silenzio anche quando arriva la risposta di world (--ledger-turns).
@@ -2656,7 +2658,7 @@ def offer_first(b: Bus) -> str | None:
     offers = parse_offers(first.text)
     if not offers or any(not o.get("offer_id") or not o.get("slot_id") for o in offers):
         return "offerta senza offer_id= o slot_id="
-    # B: S sono due giorni (lun, mar), quindi tre offerte toccano due giorni e due medici.
+    # B: S sono due giorni (mar, mer dalle 17 di lun), quindi tre offerte toccano due giorni e due medici.
     days = {o.get("agenda_day") or o.get("day") for o in offers}
     doctors = {o.get("doctor_id") for o in offers}
     if len(offers) > 1 and (len(days) < 2 or len(doctors) < 2):
@@ -2683,7 +2685,8 @@ SCENARIOS.update({
     "booking_passaggio_subito": dict(start=BACK, handoff=True, setup=slow_rx_read(3.0),
                                      expect=[offered_after_handoff(2.0), wrote("checkin", "R:234")]),
     # 0b. Nessun giro di domande sulle preferenze prima della prima offerta (dal vivo 4-6 minuti).
-    "booking_offerta_senza_domande": dict(start=BACK, handoff=True, expect=[offer_first, wrote("checkin", "R:234")]),
+    # late_hours=9 (Ledger a lun 17:00): col margine di 16 h, da lun 08:00 la finestra B ha solo i 4 slot di martedì.
+    "booking_offerta_senza_domande": dict(start=BACK, handoff=True, late_hours=9, expect=[offer_first, wrote("checkin", "R:234")]),
     # 1. Le prime due pagine sono piene (free=0): le pagine 2..4 partono nello stesso turno. Solo con
     # --ledger-turns: world in ritardo riapre il caso solo con la sua risposta come turno.
     "booking_pagine_insieme": dict(start=BACK, handoff=True, full_days=9, slow_world=1.0, ledger_turns=True,
@@ -2774,7 +2777,8 @@ SCENARIOS.update({
     "booking_riserva_senza_p3": dict(start=BACK, late_hours=3, reserve_marked=True, expect=[
         no_reserve_to_citizen, wrote("checkin", "R:234")]),
     # Il cittadino sceglie 16 ore di agenda dopo l'offerta: niente confirm per uno slot passato.
-    "booking_scelta_tardiva": dict(start=BACK, setup=chooses_late(16), expect=[
+    # late_hours=9 (Ledger a lun 17:00): col margine di 16 h, da lun 08:00 la finestra B ha solo i 4 slot di martedì.
+    "booking_scelta_tardiva": dict(start=BACK, late_hours=9, setup=chooses_late(16), expect=[
         stale_not_confirmed, told("booking_centre", "cancel", "reason=slot_expired", cite="journey 099"),
         wrote("checkin", "R:234")]),
 })
@@ -3386,6 +3390,87 @@ SCENARIOS.update({
         never_told("booking_centre", "entro la scadenza della priorità non ci sono posti", cite="R:80, R:91"),
         wrote("checkin", "R:234")]),
 })
+
+
+# --- Centro prenotazioni, livello 6 (città 21/11, no_booking −1 con S di 208-520 slot): il cittadino conferma,
+# circa 5 minuti dopo la struttura annulla (facility_cancelled) e il centro diceva «sto controllando altri posti
+# liberi», poi taceva aspettando world (3-6 minuti); il giudice chiude il percorso senza un'offerta. E le
+# offerte a 3,2-4,7 ore di agenda: dall'offerta all'esito del commit passano 13-16 minuti reali (16 ore).
+
+
+def taken(*slot_ids: str):
+    """Questi slot sono già prenotati da un'altra ASST (world li elenca con free=0)."""
+    def setup(b: Bus) -> None:
+        for sid in slot_ids:
+            b.ledger.holds[f"H-ALTRA-{sid}"] = dict(hold_id=f"H-ALTRA-{sid}", slot_id=sid, need_id=None, state="committed")
+    return setup
+
+
+def cancel_arrives_late(hours: float, slow_world: float):
+    """Il cancel della struttura arriva al centro ``hours`` ore di agenda dopo il confirm (l'orologio del centro
+    salta avanti lì) e da quel momento world risponde dopo ``slow_world`` s (città: 3-6 minuti)."""
+    def setup(b: Bus) -> None:
+        bc, hosp, deliver, late = b.ids["booking_centre"], b.ids["hospital"], b.deliver, []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + timedelta(minutes=hours if late else 0)
+
+        async def delivering(m: Message) -> None:
+            if not late and m.sender == hosp and m.recipient == bc and act(m) == "cancel":
+                late.append(m)
+                b.ledger.slow_world = slow_world
+            await deliver(m)
+
+        b.agents[bc].main.__globals__["datetime"], b.deliver = Clock, delivering
+    return setup
+
+
+SEARCHING = ("Sto controllando altri posti liberi", "I am checking other free slots")
+
+
+def reoffered_in_cancel_turn(b: Bus) -> str | None:
+    """Nel turno del cancel dell'offerta confermata il cittadino riceve almeno un'offerta nuova, diversa da quella
+    annullata; mai «sto controllando altri posti liberi» da solo."""
+    said = [m for _, m in _to_citizen(b)]
+    if any(s in m.text for m in said for s in SEARCHING):
+        return "«sto controllando altri posti liberi» al cittadino: una promessa senza offerta"
+    cancel = next((m for m in said if act(m) == "cancel" and has(m.text, ("reason=facility_cancelled",))), None)
+    if cancel is None:
+        return "nessun cancel reason=facility_cancelled al cittadino: l'hold non è saltato"
+    lost = fields(cancel.text).get("offer_id")
+    new = [o for m in said if act(m) == "offer" and b.turn_of[m.msg_id] == b.turn_of[cancel.msg_id]
+           for o in parse_offers(m.text) if o.get("offer_id") != lost and o.get("waiting_list") != "true"]
+    if not new:
+        return f"nessuna offerta nuova nel turno del cancel di {lost}"
+
+
+def offered_today(b: Bus) -> str | None:
+    """Il primo messaggio di offerte del centro porta solo slot del giorno di agenda del Ledger (U, R:91)."""
+    first = next((m for _, m in _to_citizen(b) if act(m) == "offer"), None)
+    days = {o.get("agenda_date", "")[:10] for o in parse_offers(first.text)} if first else set()
+    if days != {b.ledger.now.date().isoformat()}:
+        return f"prima offerta per i giorni {sorted(days)}, attesa solo oggi {b.ledger.now.date()} (U)"
+
+
+# Della prima pagina di world della fisiatria restano liberi solo lun 10, lun 15 (h1) e mer 15 (h2).
+PAGE1_TAKEN = ("S-h1-01-10", "S-h3-01-10", "S-h1-01-15", "S-h3-01-15", "S-h1-02-10", "S-h2-02-10", "S-h1-02-15")
+
+SCENARIOS.update({
+    # Ginocchio (D): il confirm, l'hold rifiutato, il cancel della struttura 54 ore di agenda dopo (lun 08 → mer 14),
+    # world lento da lì. Le offerte nuove vengono dal calendario in memoria nel turno del cancel.
+    "booking_riofferta_dopo_annullo": dict(
+        start=KNEE, refuse_holds=1, setup=setups(taken(*PAGE1_TAKEN), cancel_arrives_late(54, 1.0)),
+        expect=[reoffered_in_cancel_turn, wrote("commit", "R:682")]),
+    # Nessuna offerta entro 16 ore di agenda dall'ora del Ledger (lun 08:00): niente lun 10 né lun 15.
+    "booking_margine_16h": dict(start=BACK, expect=[offers_ahead(16), wrote("checkin", "R:234")]),
+    # U (scadenza in giornata, R:91): oltre 16 ore non c'è nulla, quindi gli slot di oggi, mai la lista d'attesa.
+    "booking_margine_u": dict(
+        start=("booking_centre", "Buongiorno, vorrei prenotare. prescription_number=RX-U8 lang=it"),
+        setup=seeded_rx("RX-U8", CIT, "VIS-FIS", "U"), expect=[offered_today, wrote("commit", "R:91")]),
+})
+
 
 def transcript(b: Bus) -> None:
     for m in b.log:

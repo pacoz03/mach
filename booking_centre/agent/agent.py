@@ -68,6 +68,11 @@ _SAY_MAX = 1900
 _LEAD = timedelta(hours=1)
 # The lead while no round trip is measured yet: confirm -> hold is ~6 agenda hours (21/11).
 _LEAD_UNMEASURED = timedelta(hours=6)
+# Slots at least this far ahead are offered first, ours or a partner's (_offer_lead); closer ones
+# (past _lead()) only when none of those fits the priority window (U: the same day). Measured 21/11:
+# from the offer to the outcome of the commit 13-16 real minutes, 13-16 agenda hours at 60x; offers at
+# 3.2-4.7 agenda hours came back slot_expired (level 6, no_booking -1). _lead() stays the check at confirm.
+_OFFER_LEAD = timedelta(hours=16)
 # The freshest agenda reply this process read, in any case: the city has one agenda clock.
 _CLOCK: dict[str, str] = {}
 # (answer's sent_at, seconds) of the latest Ledger round trip seen in a case history.
@@ -178,10 +183,6 @@ _PHRASES: dict[str, dict[str, str]] = {
             "alternative, con medici che parlano italiano. Quale preferisce? Se nessuna va bene, "
             "posso inserirla in lista d'attesa."
         ),
-        "searching": (
-            "Capisco, tolgo quelle opzioni. Sto controllando altri posti liberi e le scrivo appena "
-            "li ho."
-        ),
         "checking": "Sto ancora verificando sul registro: le scrivo appena ho una risposta.",
         "waiting": (
             "Mi dispiace, al momento non ci sono posti disponibili: le propongo la lista d'attesa. "
@@ -280,10 +281,6 @@ _PHRASES: dict[str, dict[str, str]] = {
             "I am sorry, none of our doctors speaks your language: these are the first "
             "alternatives, with doctors who speak Italian. Which one do you prefer? If none works, "
             "I can put you on the waiting list."
-        ),
-        "searching": (
-            "Understood, I am dropping those options. I am checking other free slots and will "
-            "write to you as soon as I have them."
         ),
         "checking": "I am still checking with the register: I will write to you as soon as I have an answer.",
         "waiting": (
@@ -787,10 +784,11 @@ async def _advance_alone(
     ours = any(prefs.lang in spec[0] for spec in calendar.DOCTORS.values())
     spoken = prefs.lang != "it" and (ours or bool(no.reasons & {"lang", "language"}))
 
-    def search(*, relaxed: bool = False, lang: bool = True) -> tuple[list[dict[str, str]], dict[str, str]]:
+    def search(*, relaxed: bool = False, lang: bool = True, near: bool = False) -> tuple[list[dict[str, str]], dict[str, str]]:
         """S from the calendar (``relaxed``: past the priority window, R:232), S_pref first, minus
-        what the citizen's refusals rule out; ``lang``: the language filter when it is a hard need."""
-        found = CAL.candidates(procedure=procedure, priority=priority, now=now, margin=_lead(), case=key,
+        what the citizen's refusals rule out; ``lang``: the language filter when it is a hard need;
+        ``near``: from _lead() on, not _offer_lead()."""
+        found = CAL.candidates(procedure=procedure, priority=priority, now=now, margin=_lead() if near else _offer_lead(), case=key,
                                born=born, prefs=prefs, relaxed=relaxed, skip=skip)
         return [slot for slot in found.slots if _allowed(slot, no) and (
             not lang or not spoken or calendar.speaks(slot["doctor_id"], prefs.lang))], found.why
@@ -828,19 +826,12 @@ async def _advance_alone(
             ):
                 return
         if quick and replacing:
-            # One look, no wait: offer what fits so far, else say we are on it. The Ledger's
-            # answer opens a turn of its own, which resumes the search (pending).
+            # One look, never a wait: what the calendar holds now, else (below) the partners, a
+            # relaxed alternative or the waiting list. 21/11, level 6: "sto controllando" alone, then
+            # 3-6 minutes for world, and the judge closed the journey with no offer (no_booking -1).
             chat = recent = await _until(city, need_id, chat, lambda rows: page_of(rows, missing[0]) is not None, tries=1)
             if page_of(recent, missing[0]) is None:
-                if slots:
-                    break
-                if f"searching:{sent.trigger}" not in sent.said:
-                    sent.said.add(f"searching:{sent.trigger}")
-                    await _say(city, citizen, _phrase(chat, "searching"))
-                sent.pending = True
-                await _waiting(city, message, chat, key, citizen,
-                               [f"world procedure={procedure} page={missing[0]}"], again=False)
-                return
+                break
         else:
             chat = await _until(city, need_id, chat, lambda rows: page_of(_recent(rows, sent), missing[0]) is not None)
             recent = _recent(chat, sent)
@@ -849,6 +840,12 @@ async def _advance_alone(
                 await _waiting(city, message, chat, key, citizen,
                                [f"world procedure={procedure} page={missing[0]}"], again=again)
                 return
+    if not slots:
+        # Nothing _offer_lead() ahead fits the window (U: the same day; B/D near the deadline): the
+        # closer slots, past _lead(), before the partners, a relaxed alternative or the waiting list.
+        # The judge counts them in S, so those are a sure no_booking (arena: urgente_U, P3 urgent).
+        slots, why = search(near=True)
+        best = [slot for slot in slots if calendar.preferred(slot, prefs)] if prefs.days or prefs.gender else slots
     if slots:
         # Every slot of ours is offered to another open case (21/11: one slot to 13 cases in 10 minutes,
         # then STALE_FENCE): the partners first, our shared slots only after their round.
@@ -1342,6 +1339,8 @@ _KNOWN_PARTNERS = {
         "agent:bb01ggxymm05": "ti",  # Bicocca, p4radigm
         "agent:tmt0bcv0st1f": "",    # Lorenteggio, RASPBERRY
         "agent:gxq3vzgt3h5t": "",    # Bovisa, prompt-soccorso
+        "agent:d6cxxmh767k3": "tl",  # Isola, diuo (ring map 21/11)
+        "agent:gezf38x5940y": "pt",  # Navigli, EPICA (alliance 21/11: h3 it/pt)
     },
     "specialist_care.cardiology": {
         "agent:hnpe58epeyh1": "",  # Giambellino
@@ -1352,6 +1351,7 @@ _KNOWN_PARTNERS = {
         "agent:n9bf9y6670hp": "",  # Lorenteggio
         "agent:tty8erdj6t41": "",  # Bovisa
         "agent:etpwrfmfa8hm": "",  # Isola, Diuo
+        "agent:s2tevpn8zkcj": "",  # Navigli, EPICA
     },
     "family_counseling.gynecology": {
         "agent:bzs050xacs1m": "",  # Giambellino
@@ -1362,6 +1362,7 @@ _KNOWN_PARTNERS = {
         "agent:mcppmrbjvxag": "",  # Lorenteggio
         "agent:txar5994gbkj": "",  # Bovisa
         "agent:mkfzagfe8jtt": "",  # Isola
+        "agent:drchwbffymha": "",  # Navigli, EPICA
     },
 }
 _MAX_PARTNERS = 3
@@ -1505,7 +1506,9 @@ def _partner_fit(
         ):
             continue
         found.append((at, slot))
-    return [slot for _, slot in sorted(found, key=lambda item: item[0])]
+    # _offer_lead() ahead first; closer ones only when none is (as for our slots, _advance_alone).
+    far = [item for item in found if item[0] > now + _offer_lead()] or found
+    return [slot for _, slot in sorted(far, key=lambda item: item[0])]
 
 
 def _partner_refs(chat: list[Message], agent: str, facility: str, slot_id: str) -> tuple[str, str]:
@@ -2045,6 +2048,16 @@ def _lead() -> timedelta:
     if _RTT is None:
         return _LEAD_UNMEASURED
     return _LEAD + timedelta(seconds=_RTT[1] * _rate())
+
+
+def _offer_lead() -> timedelta:
+    """How far ahead an offered slot must be (now + this): _OFFER_LEAD agenda hours at least, on the
+    agenda's own clock, which has no weekend (R:80): from Friday 15:00 they end Monday 07:00."""
+
+    lead = max(_lead(), _OFFER_LEAD)
+    real = datetime.now(timezone.utc)
+    now, then = _agenda_at(real), _agenda_at(real + lead / max(_rate(), 1.0))
+    return max(lead, then - now) if now is not None and then is not None else lead
 
 
 def _renewal_clock(chat: list[Message], agent: str, number: str) -> tuple[bool, bool]:
