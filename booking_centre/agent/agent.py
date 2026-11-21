@@ -48,7 +48,7 @@ from mach.safety import red_flag  # noqa: E402  (red flag in 6 lingue con la neg
 #   _CLOCK    b  freshest agenda answer of any case; replaced by a newer one, no TTL (c: city:clock)
 #   _RTT      b  latest Ledger round trip, one value
 #   CAL       b  the slot calendar (mach.calendar): world rows by version, a day past their slot;
-#                claims (offer 600 s, confirm 1200 s); the Ledger's marks; facilities DOWN 600 s
+#                claims (offer 1200 s, confirm 1200 s); the Ledger's marks; facilities DOWN 600 s
 #   _LEARNED  b  msg_ids CAL has seen, LRU _LEARNED_MAX
 #   _PAGES    b  (procedure, page) -> world page: fresh 240 s on read, never evicted (~4x8 keys)
 #   _RULES    b  rules of the latest answer of any case, no TTL (c: city:rules)
@@ -813,8 +813,8 @@ async def _advance_alone(
         # Offered once three slots no other case holds are known (wave W01QQQ: one slot to 23
         # citizens), or the pages left are past the priority window, or none is left.
         unshared = [slot for slot in best if not CAL.shared(slot["slot_id"], key)]
-        if best and (len(unshared) >= _MAX_OFFERS or not missing or "deadline" in why.values()):
-            await _offer(city, key, citizen, _spread(best, key), number, priority, replacing, chat, opening)
+        if unshared and (len(unshared) >= _MAX_OFFERS or not missing or "deadline" in why.values()):
+            await _offer(city, key, citizen, _spread(unshared, key), number, priority, replacing, chat, opening)
             return
         if not missing:
             break
@@ -850,6 +850,10 @@ async def _advance_alone(
                                [f"world procedure={procedure} page={missing[0]}"], again=again)
                 return
     if slots:
+        # Every slot of ours is offered to another open case (21/11: one slot to 13 cases in 10 minutes,
+        # then STALE_FENCE): the partners first, our shared slots only after their round.
+        if all(CAL.shared(slot["slot_id"], key) for slot in slots) and await partners():
+            return
         await _offer(city, key, citizen, _spread(best or slots, key), number, priority, replacing, chat, opening)
         return
     # S is empty on every page, also after a hold hiccup: the partners first (R:676, the answer may
@@ -1161,6 +1165,12 @@ async def _on_confirm(
         return
     if protocol.we(chat, agent, f"slot_id={slot}", to=facility, word="confirm"):
         return
+    # Two turns of the same confirm (21/11 07:35: two deliveries 22 ms apart, outside the case lock)
+    # both pass the history check above: the confirm leaves once. No await from here to the say.
+    said = _sent(key).said
+    if f"confirm:{slot}" in said:
+        return
+    said.add(f"confirm:{slot}")
     theirs, request = _partner_refs(chat, agent, facility, slot)
     booking_consent = consent
     if facility not in _OUR_FACILITIES:
@@ -2136,7 +2146,7 @@ def _answered(chat: list[Message], agent: str, message: Message) -> bool:
 # what the rules leave open, under a short timeout, and its answer is checked against closed
 # lists and our own offers. It reads the citizen; it never writes a token or a fact.
 
-_LLM_TIMEOUT = 3.0
+_LLM_TIMEOUT = 2.0  # team decision (21/11): an LLM wait holds the turn; past it, the rules alone
 _LANGS = frozenset("it en sq es fr de pt ro pl uk ru ar zh hi bn ur tr tl".split())
 _HEARD_MAX = 4096
 # msg_id -> what the model read in that citizen message (this process only; rules need no cache).

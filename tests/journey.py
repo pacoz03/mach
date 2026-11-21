@@ -3329,6 +3329,64 @@ SCENARIOS.update({
         expect=[first_round_offered]),
 })
 
+
+# --- Centro prenotazioni, 21/11: lo stesso slot a 13 casi in 10 minuti (le offerte deboli riempivano anche con
+# slot già offerti ad altri casi aperti, poi STALE_FENCE), il confirm doppio a 22 ms, la scadenza B o D che
+# contava anche sabato e domenica (B nati giovedì o venerdì: 38 su 41 alternativa rilassata, 0 ricevute).
+
+
+def ring_before_shared(b: Bus) -> str | None:
+    """Uno slot già offerto a un altro caso aperto va a un secondo caso solo dopo il giro dai partner."""
+    bc, holder = b.ids["booking_centre"], {}
+    for i, m in enumerate(b.log):
+        if m.sender == bc and m.recipient.startswith("citizen:") and act(m) == "offer":
+            for o in parse_offers(m.text):
+                first = holder.setdefault(o.get("slot_id"), m.recipient)
+                if first != m.recipient and not any(
+                        x.sender == bc and x.text.startswith("need.request") and x.need_id == m.need_id for x in b.log[:i]):
+                    return f"{o.get('slot_id')} offerto a {m.recipient}, già offerto a {first}, senza chiedere ai partner"
+
+
+def double_confirm(b: Bus) -> None:
+    """Il confirm del cittadino arriva due volte al centro nello stesso istante (città 21/11 07:35, 07:44,
+    07:52: 22 ms): due turni insieme, fuori dal lock del caso (race: la rete cede il loop)."""
+    bc, say, done = b.ids["booking_centre"], b.citizen.say, []
+
+    def saying(to: str, text: str, kind: str = "chat", need: str | None = None, **body: str) -> None:
+        if to != bc or not text.startswith("confirm") or done:
+            return say(to, text, kind, need, **body)
+        done.append(text)
+        for _ in range(2):
+            m = b.add(CIT, to, body or {"text": text}, need=need or b.citizen.need, kind=kind)
+            b.tasks.append(asyncio.create_task(b.deliver(m)))
+    b.citizen.say = saying
+
+
+def one_confirm_per_slot(b: Bus) -> str | None:
+    """Alla struttura arriva un solo confirm per slot (un secondo hold fa avanzare il fence: STALE_FENCE)."""
+    bc, facilities = b.ids["booking_centre"], {b.ids[f] for f in FACILITIES}
+    sent = Counter(fields(m.text).get("slot_id") for m in b.log
+                   if m.sender == bc and m.recipient in facilities and m.text.startswith("confirm"))
+    twice = {slot: n for slot, n in sent.items() if n > 1}
+    if not sent or twice:
+        return f"confirm alla struttura per slot: {dict(sent)}, atteso uno solo"
+
+
+SCENARIOS.update({
+    "booking_slot_scarsi": dict(start=BACK, others=1, setup=taken_but("S-h1-01-10"), expect=[ring_before_shared]),
+    "booking_slot_scarsi_ring": dict(start=BACK, others=1,
+        setup=setups(taken_but("S-h1-01-10"), ring({0: (RING / 4, RING_OFFER)}), skips_ring_offers),
+        expect=[ring_before_shared, distinct_offers]),
+    # Lo stesso confirm due volte insieme: un solo confirm alla struttura, e la prenotazione va.
+    "booking_confirm_doppio": dict(start=BACK, race=True, setup=double_confirm, expect=[
+        one_confirm_per_slot, wrote("checkin", "R:234")]),
+    # B nato venerdì 08:00 di agenda, venerdì pieno: la scadenza è martedì (R:80, niente sabato e domenica di
+    # agenda; R:91), quindi lunedì è dentro S. Prima: domenica, S vuoto, alternativa rilassata (os-1).
+    "booking_b_nato_venerdi": dict(start=BACK, late_days=4, full_days=1, expect=[
+        never_told("booking_centre", "entro la scadenza della priorità non ci sono posti", cite="R:80, R:91"),
+        wrote("checkin", "R:234")]),
+})
+
 def transcript(b: Bus) -> None:
     for m in b.log:
         text = m.text or f"<{m.type}> {dict(m.body)}"
