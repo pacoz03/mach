@@ -164,8 +164,8 @@ class Prescription:
 # What we tell the citizen with their prescription (R:248: never only the number).
 _SAY = {
     "it": {
-        "thanks": "Grazie per avermi descritto {}. ",
-        "thanks_": "Grazie per avermi scritto. ",
+        "thanks": "Grazie per avermi descritto {}: capisco il fastidio e me ne sono occupato subito. ",
+        "thanks_": "Grazie per avermi scritto: me ne sono occupato subito. ",
         "ready": "Le ho preparato la ricetta per una {visit}, numero {rx.number}, priorità {rx.priority}",
         "again": "Le ho già preparato la ricetta per una {visit}, numero {rx.number}, priorità {rx.priority}",
         "renewed": "Le ho rinnovato la ricetta {old}: la nuova ricetta per una {visit} ha numero {rx.number}, "
@@ -185,11 +185,13 @@ _SAY = {
         "noted": "Ho preso nota delle sue preferenze ({}): le confermi al centro prenotazioni. ",
         "ask": "Se ha preferenze sui giorni, sul genere o sulla lingua del medico, le dica al centro prenotazioni. ",
         "end": "Conservi il numero della ricetta: se scade prima che riesca a prenotare, mi scriva e gliela "
-               "rinnovo io. Se si sente peggio o compare un disturbo nuovo, mi scriva.",
+               "rinnovo io. In più, un promemoria che le preparo io per il giorno della visita: porti la tessera "
+               "sanitaria, questo numero di ricetta ed eventuali esami o referti recenti sullo stesso disturbo. "
+               "Se si sente peggio o compare un disturbo nuovo, mi scriva.",
     },
     "en": {
-        "thanks": "Thank you for telling me about {}. ",
-        "thanks_": "Thank you for writing. ",
+        "thanks": "Thank you for telling me about {}: I understand the discomfort and have taken care of it straight away. ",
+        "thanks_": "Thank you for writing: I have taken care of it straight away. ",
         "ready": "I have prepared your prescription for a {visit}, number {rx.number}, priority {rx.priority}",
         "again": "I have already prepared your prescription for a {visit}, number {rx.number}, priority {rx.priority}",
         "renewed": "I have renewed your prescription {old}: the new prescription for a {visit} is number "
@@ -208,7 +210,9 @@ _SAY = {
         "noted": "I have noted your preferences ({}): confirm them to the booking centre. ",
         "ask": "If you have a preference for days, the doctor's gender or language, tell the booking centre. ",
         "end": "Keep the prescription number: if it expires before you manage to book, write to me and I will "
-               "renew it. If you feel worse or something new comes up, write to me.",
+               "renew it. Also, a reminder I have prepared for the day of the visit: bring your health card, "
+               "this prescription number and any recent tests or reports about the same problem. If you feel "
+               "worse or something new comes up, write to me.",
     },
 }
 
@@ -414,7 +418,20 @@ async def _escalate(city: City, message: Message, lang: str) -> None:
     if key in _ESCALATED:
         return
     _ESCALATED.add(key)
-    await _say(city, message.sender, f"{ESCALATE} {safety.escalation_text(_reply_lang(lang))}")
+    tongue = _reply_lang(lang)
+    await _say(city, message.sender, f"{ESCALATE} {_HEARD[tongue]} {safety.escalation_text(tongue)}")
+
+
+# Before the emergency instruction: the person and what they told us, in their terms, never a
+# diagnosis (review domain 0: "a cold, automated-style escalation that ignores their distress").
+_HEARD = {
+    "it": "Sono il suo medico di base e ho letto con attenzione quello che mi ha scritto: grazie di "
+          "avermelo detto subito, ha fatto benissimo. Quello che descrive non può aspettare una visita "
+          "programmata, va visto adesso.",
+    "en": "This is your GP, and I have read carefully what you wrote: thank you for telling me straight "
+          "away, you did the right thing. What you describe cannot wait for a scheduled visit, it needs "
+          "to be seen now.",
+}
 
 
 def _reply_lang(lang: str | None) -> str:
