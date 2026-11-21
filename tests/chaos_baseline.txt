@@ -10,6 +10,7 @@
 # 2026-11-21 giro dei partner nel booking: 173 (1 risolta, say_tnv turns gp_nessun_posto, due giri su due; 4 nuove in booking_partner_dopo_intoppo: redeliver gemelle di ospedale_slot_rubato (l'ospedale ripete l'hold); two_pods: due pod leggono la history prima dell'offerta dell'altro e mandano due volte la stessa offerta del partner (_sent per pod), in città il booking ha un solo pod)
 # 2026-11-21 lingue rare (giro dei partner nello stesso turno anche a pod appena riavviato, risposte dei giri vecchi, niente offerta doppia): 188 (0 risolte; 15 nuove, tutte nei 2 scenari aggiunti booking_lingua_rara*: con redeliver, ledger_late, ledger_reorder e hostile il need.request ai partner parte lo stesso ma in un altro turno, e lo scenario controlla il turno esatto; two_pods: offerta doppia tra due pod (_sent per pod), in città un solo pod; ledger_lost: «hospital muto dopo checkin», gemella delle 20 della riga sopra; hostile plain riavvio: il testo ostile prende il posto del lang=sw)
 # 2026-11-21 scadenze feriali, slot condivisi dopo i partner, un confirm per slot: 194 (0 risolte; 6 nuove, tutte negli scenari aggiunti booking_slot_scarsi*, booking_confirm_doppio, solo con restart e two_pods: claim e _sent vivono nella memoria del pod, quindi un pod riavviato o un secondo pod non vede l'offerta o il confirm dell'altro caso; in città il booking ha un solo pod)
+# 2026-11-21 riofferta nello stesso turno, margine di 16 h come preferenza, scadenze in ore di calendario, partner Isola/EPICA: 208 (10 risolte lasciate finché una seconda corsa non le conferma; 12 nuove: 8 gemelle di righe già qui: redeliver booking_riofferta_dopo_annullo come ospedale_slot_rubato (l'ospedale ripete l'hold); say_tnv booking_margine_16h e booking_slot_scarsi_ring come booking_ricetta_muta (l'ospedale rimanda la ricevuta); say_tnv booking_riofferta_dopo_annullo e hostile booking_margine_u come booking_rifiuto_subito (offerta rimandata, uguale su master); ledger_lost gp_preferenze «hospital muto dopo checkin» come le 20 della finestra del richiedente (con days=mon e 16 h il booking legge 4 pagine e la risposta persa cade sul checkin); 3 say_tnv turns già rosse su master 6b98bb0 (ospedale_hold_scaduto, gp_rinnovo_a_parole_lento, ospedale_annullo_dal_centro: commit di Giuseppe dopo 7eaff04)
 clock_lost plain consultorio_alternativa_offerta
 clock_lost plain consultorio_annullata
 clock_lost plain consultorio_senza_ricetta
@@ -19,6 +20,7 @@ clock_lost turns consultorio_checkin_lento
 clock_lost turns consultorio_senza_ricetta
 hostile plain booking_lingua_rara
 hostile plain booking_lingua_rara_riavvio
+hostile plain booking_margine_u
 hostile plain booking_rifiuto_giorno
 hostile plain booking_rifiuto_subito
 hostile plain checkin_codice_prosa
@@ -26,6 +28,7 @@ hostile plain gp_rinnovo_a_parole_lento
 hostile plain richiesta_clinica
 hostile turns booking_lingua_rara
 hostile turns booking_lingua_rara_riavvio
+hostile turns booking_margine_u
 hostile turns booking_rifiuto_giorno
 hostile turns booking_rifiuto_subito
 hostile turns checkin_codice_prosa
@@ -64,6 +67,7 @@ ledger_lost plain facility_cancel
 ledger_lost plain gp_alternativa_primo_posto
 ledger_lost plain gp_grazie_prima_del_ledger
 ledger_lost plain gp_lingua_es
+ledger_lost plain gp_preferenze
 ledger_lost plain gp_preferenze_falsi
 ledger_lost plain gp_secondo_sintomo
 ledger_lost plain gp_stesso_sintomo
@@ -87,6 +91,7 @@ ledger_lost turns gp_alternativa_primo_posto
 ledger_lost turns gp_grazie_prima_del_ledger
 ledger_lost turns gp_ledger_lento_en
 ledger_lost turns gp_lingua_es
+ledger_lost turns gp_preferenze
 ledger_lost turns gp_preferenze_falsi
 ledger_lost turns gp_secondo_sintomo
 ledger_lost turns gp_stesso_sintomo
@@ -112,6 +117,7 @@ ledger_reorder turns p1_rinnovo_prenota_cittadino
 redeliver plain booking_lingua_rara
 redeliver plain booking_lingua_rara_riavvio
 redeliver plain booking_partner_dopo_intoppo
+redeliver plain booking_riofferta_dopo_annullo
 redeliver plain checkin_rifiutato
 redeliver plain facility_cancel
 redeliver plain gp_rinnovo_p1_lento
@@ -127,6 +133,7 @@ redeliver plain p1_rinnovo_prenota_cittadino
 redeliver turns booking_lingua_rara
 redeliver turns booking_lingua_rara_riavvio
 redeliver turns booking_partner_dopo_intoppo
+redeliver turns booking_riofferta_dopo_annullo
 redeliver turns checkin_rifiutato
 redeliver turns facility_cancel
 redeliver turns gp_rinnovo_p1_lento
@@ -152,6 +159,7 @@ say_tnv plain booking_redirect_pagina_due
 say_tnv plain booking_ricetta_muta
 say_tnv plain ospedale_annullata
 say_tnv plain ospedale_rehold
+say_tnv turns booking_margine_16h
 say_tnv turns booking_offerta_senza_domande
 say_tnv turns booking_orologio_vecchio
 say_tnv turns booking_redirect_pagina_due
@@ -159,6 +167,8 @@ say_tnv turns booking_ricetta_inesistente
 say_tnv turns booking_ricetta_muta
 say_tnv turns booking_rifiuto_giorno
 say_tnv turns booking_rifiuto_subito
+say_tnv turns booking_riofferta_dopo_annullo
+say_tnv turns booking_slot_scarsi_ring
 say_tnv turns booking_world_in_cache
 say_tnv turns cardiologia_referto
 say_tnv turns checkin_conferma_prosa
@@ -170,13 +180,16 @@ say_tnv turns cross_asst_finestra
 say_tnv turns cross_asst_orologio_nota
 say_tnv turns cross_asst_push_reale
 say_tnv turns cross_asst_riavvio
+say_tnv turns gp_rinnovo_a_parole_lento
 say_tnv turns gp_rinnovo_altrui
 say_tnv turns gp_rinnovo_inesistente
 say_tnv turns gp_rinnovo_ledger_lento
 say_tnv turns gp_rinnovo_riscritto
 say_tnv turns ospedale_annullata
+say_tnv turns ospedale_annullo_dal_centro
 say_tnv turns ospedale_annullo_lento
 say_tnv turns ospedale_commit_unico
+say_tnv turns ospedale_hold_scaduto
 say_tnv turns ospedale_rehold
 say_tnv turns ospedale_scritture_lente
 say_tnv turns ospedale_slot_rubato

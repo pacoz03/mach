@@ -3206,7 +3206,7 @@ SCENARIOS.update({
     # Tutti i partner rispondono no_availability, a scaglioni: l'alternativa rilassata solo dopo l'ultimo,
     # senza aspettare il tetto del giro.
     "booking_partner_tutti_no": dict(start=BACK, full_days=2,
-                                     setup=ring({i: (0.1 * (i + 1), RING_NONE) for i in range(7)}, round_s=3 * RING),
+                                     setup=ring({i: (0.1 * (i + 1), RING_NONE) for i in range(16)}, round_s=3 * RING),  # tutti i pubblicati
                                      expect=[ring_then_fallback(within=2 * RING), wrote("checkin", "R:234")]),
     # I partner tacciono: l'alternativa rilassata solo allo scadere del giro (in background), mai prima.
     "booking_partner_muti": dict(start=BACK, full_days=2, setup=ring({}, round_s=RING / 2),
