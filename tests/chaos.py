@@ -47,6 +47,25 @@ import journey as J  # noqa: E402
 from city_sdk.city import LEDGER, CapError  # noqa: E402
 from httpx import ReadTimeout  # noqa: E402  (city.say in città: httpx.ReadTimeout dal Relay, http.py:29)
 
+# CHAOS_MIX=1: squadra mista come `v2/tests/arena.py --set mix`: booking_centre di v2/ (con v2/core.py e
+# shared/tools.py freschi), gli altri quattro della radice, in una copia temporanea fatta dal processo padre
+# (i worker la trovano in CHAOS_MIX_DIR). Gli scenari e chaos_baseline.txt sono della squadra v1: solo indicativo.
+if os.environ.get("CHAOS_MIX"):
+    if not os.environ.get("CHAOS_MIX_DIR"):
+        import atexit
+        import shutil
+        import tempfile
+        _mix = Path(tempfile.mkdtemp(prefix="chaos_mix_"))
+        atexit.register(shutil.rmtree, _mix, True)
+        for _f in J.FOLDERS:
+            shutil.copytree(J.REPO / ("v2" if _f == "booking_centre" else "") / _f, _mix / _f,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        for _m in (J.REPO / "v2" / "core.py", J.REPO / "shared" / "tools.py"):
+            shutil.copy(_m, _mix / "booking_centre" / "agent")
+        os.environ["CHAOS_MIX_DIR"] = str(_mix)
+    J.REPO = Path(os.environ["CHAOS_MIX_DIR"])
+    J.AGENT_DIRS = {str(J.REPO / f / "agent") for f in J.FOLDERS}
+
 SEED = 2026
 BASELINE = Path(__file__).resolve().parent / "chaos_baseline.txt"
 FAULTS = {

@@ -1,6 +1,6 @@
 """Arena: gli agenti correnti (radice del repo) contro i nuovi (v2/), con la rubrica della gara.
 
-    ~/.local/share/uv/tools/city-cli/bin/python -B v2/tests/arena.py [--set old|new|both] [-k nome] [-l 1..8] [-v] [--json out.json]
+    ~/.local/share/uv/tools/city-cli/bin/python -B v2/tests/arena.py [--set old|new|mix|both|all] [-k nome] [-l 1..8] [-v] [--json out.json]
 
 I due set fanno gli stessi percorsi simulati. Bus, Ledger finto e caricamento dei brain sono quelli
 di tests/journey.py, caricato per percorso: qui cambiano solo i suoi globali REPO e AGENT_DIRS (old =
@@ -11,7 +11,8 @@ come è fatto un brain.
 Ogni scenario gira due volte: con le risposte del Ledger che aprono un turno (come in città, il
 punteggio che conta) e con le risposte visibili solo nella history. Il set nuovo si prova in una
 copia temporanea fatta come v2/sync.sh (core.py, facility.py e shared/tools.py accanto a ogni brain).
-`--set both` lancia un processo per set. R:<riga> = mach-hackathon-kit/docs/kit/e19-rules.md.
+`--set both` lancia un processo per set. `mix` = i quattro agenti della radice con il booking_centre
+di v2 (squadra mista); `--set all` confronta old, new e mix. R:<riga> = mach-hackathon-kit/docs/kit/e19-rules.md.
 Codice d'uscita 0, salvo arena rotta.
 
 Limiti della città finta: l'agenda non scorre (solo wait_days, late_hours e fault_hours la spostano);
@@ -54,7 +55,7 @@ def load(name: str, path: Path):
 J = load("journey", ROOT / "tests" / "journey.py")
 KIT = load("kit_example_agent", ROOT / "mach-hackathon-kit" / "templates" / "examples" / "agent.py")
 
-SETS = {"old": ROOT, "new": ROOT / "v2"}
+SETS = {"old": ROOT, "new": ROOT / "v2", "mix": ROOT / "v2"}  # mix: dalla radice tutti tranne booking_centre
 CIT, NEED = J.CIT, J.NEED
 PARTNER = "agent:h6r1v45esk77"  # ospedale dell'ASST Giambellino: un id che le squadre hanno pubblicato
 XBC, XCIT, XNEED = J.FOREIGN, "citizen:X-1", "N-2026-11-23-0901"  # centro e cittadino di un'altra ASST
@@ -141,12 +142,16 @@ def phrase(p: dict) -> str:
     return p["say"] or PROSE.get((key, p["lang"]), PROSE[key, "it"])
 
 
-def stage(tmp: Path) -> tuple[Path, list[str]]:
+def stage(tmp: Path, mix: bool = False) -> tuple[Path, list[str]]:
     """Il set nuovo come dopo v2/sync.sh, ma in una copia temporanea (v2/ non si tocca): in ogni
     <agente>/agent/ i moduli della radice di v2 (core.py, facility.py per le tre strutture) e
-    shared/tools.py, sempre freschi. Restituisce anche le copie che in v2/ mancano o sono vecchie."""
+    shared/tools.py, sempre freschi. Restituisce anche le copie che in v2/ mancano o sono vecchie.
+    mix: solo il booking_centre da v2, gli altri quattro come sono nella radice."""
     src, stale = SETS["new"], []
     for f in J.FOLDERS:
+        if mix and f != BC:
+            shutil.copytree(ROOT / f, tmp / f, ignore=shutil.ignore_patterns("__pycache__"))
+            continue
         if (src / f).exists():
             shutil.copytree(src / f, tmp / f, ignore=shutil.ignore_patterns("__pycache__"))
         (tmp / f / "agent").mkdir(parents=True, exist_ok=True)
@@ -916,7 +921,7 @@ def run_set(name: str, args) -> dict:
     for k in ("CITY_ENV", "TEAM_MEMORY"):  # memoria condivisa ed Exa spente, come in journey.py
         os.environ.pop(k, None)
     tmp = tempfile.TemporaryDirectory()
-    J.REPO, stale = stage(Path(tmp.name)) if name == "new" else (SETS[name], [])
+    J.REPO, stale = stage(Path(tmp.name), name == "mix") if name != "old" else (SETS[name], [])
     J.AGENT_DIRS = {str(root / f / "agent") for root in (*SETS.values(), J.REPO) for f in J.FOLDERS}
     imports = {}
     for f in J.FOLDERS:  # un brain che non si carica va detto, non fa cadere l'arena
@@ -924,7 +929,7 @@ def run_set(name: str, args) -> dict:
             imports[f] = short(J.Agent(f).error)
         except (Exception, SystemExit) as exc:
             imports[f] = short(f"{type(exc).__name__}: {exc}")
-    print(f"=== set {name}: {SETS[name]} ===")
+    print(f"=== set {name}: {SETS[name]}" + (" (solo booking_centre, gli altri dalla radice)" if name == "mix" else "") + " ===")
     print("brain: " + " · ".join(f"{f} {'ok' if not e else 'NON SI CARICA (' + e[:110] + ')'}" for f, e in imports.items()))
     if stale:
         print(f"nota: provati i sorgenti freschi di v2/ e shared/tools.py; in v2/ mancano o sono vecchie {len(stale)} copie "
@@ -956,12 +961,12 @@ def run_set(name: str, args) -> dict:
 
 def compare(old: dict, new: dict, verbose: bool) -> list[dict]:
     """Tabella fianco a fianco e scenari in cui i due set danno punti diversi."""
-    so, sn = old["summary"], new["summary"]
-    print("\n=== confronto old (radice) contro new (v2/) ===")
+    so, sn, A, B = old["summary"], new["summary"], old["set"], new["set"]
+    print(f"\n=== confronto {A} contro {B} ===")
     broken = [f for f, e in new["imports"].items() if e]
     if broken:
-        print(f"ATTENZIONE: nel set new non si caricano {', '.join(broken)}: i loro punti mancano (porta d'ingresso vuota: -4)")
-    print(f"{'':<44}{'old':>6}{'new':>6}{'delta':>7}")
+        print(f"ATTENZIONE: nel set {B} non si caricano {', '.join(broken)}: i loro punti mancano (porta d'ingresso vuota: -4)")
+    print(f"{'':<44}{A:>6}{B:>6}{'delta':>7}")
 
     def show(label: str, a: int, b: int) -> None:
         print(f"{label:<44}{a:>+6d}{b:>+6d}{b - a:>+7d}")
@@ -983,28 +988,29 @@ def compare(old: dict, new: dict, verbose: bool) -> list[dict]:
 
     for name, r in sides["old"].items():
         if points(r) != points(sides["new"].get(name)):
-            diff.append(dict(name=name, level=r["level"], old=points(r), new=points(sides["new"].get(name))))
+            diff.append(dict(name=name, level=r["level"], **{A: points(r), B: points(sides["new"].get(name))}))
     print(f"\nscenari diversi: {len(diff)} su {len(sides['old'])}  (punti con i turni del Ledger / solo history)")
     for d in diff:
-        print(f"  L{d['level']} {d['name']:<27} old {d['old']:<8} new {d['new']}")
-        for tag in ("old", "new"):
+        print(f"  L{d['level']} {d['name']:<27} {A} {d[A]:<8} {B} {d[B]}")
+        for tag, label in (("old", A), ("new", B)):  # sides tiene A come "old" e B come "new"
             res = sides[tag].get(d["name"])
             for v in violations(res["modes"]["turns"]) if res else []:
-                print(f"      {tag} - {v}")
+                print(f"      {label} - {v}")
             if verbose and res:
-                print("\n".join(f"      {tag} | {t}" for t in res["modes"]["turns"]["transcript"]))
+                print("\n".join(f"      {label} | {t}" for t in res["modes"]["turns"]["transcript"]))
     return diff
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--set", choices=("old", "new", "both"), default="both", help="quale set di agenti (default: tutti e due)")
+    ap.add_argument("--set", choices=("old", "new", "mix", "both", "all"), default="both",
+                    help="quale set di agenti (default: old e new; all: anche mix)")
     ap.add_argument("-k", help="solo gli scenari il cui nome contiene questo testo")
     ap.add_argument("-l", type=int, help="solo gli scenari di questo livello (1-8)")
     ap.add_argument("-v", action="store_true", help="trascritto degli scenari con violazioni o diversi tra i set")
     ap.add_argument("--json", help="scrive i risultati (righe, note, trascritti) in questo file")
     args = ap.parse_args()
-    if args.set != "both":
+    if args.set not in ("both", "all"):
         out = run_set(args.set, args)
         if args.json:
             Path(args.json).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1014,7 +1020,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         flags = [*(["-k", args.k] if args.k else []), *(["-l", str(args.l)] if args.l else []), *(["-v"] if args.v else [])]
         procs = {s: subprocess.Popen([sys.executable, "-B", __file__, "--set", s, "--json", f"{tmp}/{s}.json", *flags],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for s in ("old", "new")}
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                 for s in ("old", "new", *(["mix"] if args.set == "all" else []))}
         got, code = {}, 0
         for s, proc in procs.items():
             try:
@@ -1029,9 +1036,11 @@ def main() -> int:
             else:
                 code = max(code, 1)
                 print(f"set {s}: nessun risultato (processo uscito con {proc.returncode}): confronto impossibile")
-    diff = compare(got["old"], got["new"], args.v) if len(got) == 2 else []
+    pairs = [("old", "new"), *([("new", "mix"), ("old", "mix")] if args.set == "all" else [])]
+    diff = {f"{a}_{b}": compare(got[a], got[b], args.v) for a, b in pairs if a in got and b in got}
     if args.json:
-        Path(args.json).write_text(json.dumps({**got, "diff": diff}, ensure_ascii=False, indent=1), encoding="utf-8")
+        Path(args.json).write_text(json.dumps({**got, "diff": diff.get("old_new", []), "diffs": diff}, ensure_ascii=False, indent=1),
+                                   encoding="utf-8")
     return code
 
 
