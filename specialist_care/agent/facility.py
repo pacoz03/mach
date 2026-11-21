@@ -61,7 +61,8 @@ _CROSS_WAIT = 5.5
 # _CROSS_COLD (a history read can overrun it, still < 10 s). The specialist keeps waiting for the
 # reply up to _WORLD_WAIT after answering, so the next request finds it; the hospital ends the turn
 # (the fast reply is scored on the ack) and caches the reply in its own push turn.
-_CROSS_COLD = 7.0  # live 1.0.7: each Ledger say takes 1-5 s, 8.5 s gave cancels at 10.7 s
+_CROSS_COLD = 4.0  # live: says take 1-5 s and world answers in 25-96 s (21/11 02:00): a longer
+# cold wait only pushed the answer and its ack past 10 s
 _WORLD_FRESH = 300.0  # 5 real minutes = 5 agenda hours at 60x
 _WORLD_WAIT = 20.0
 # (procedure, page) -> (time.monotonic() of the read, world reply text).
@@ -400,19 +401,29 @@ _BOUNCE_TTL = 60.0
 # is scored on that ack (< 10 s); live writes take ~30 s each (21/11 00:36: hold -> held 30 s,
 # commit -> committed 30 s), so the held push commits and the committed push sends the receipt,
 # in turns of their own (_hospital: book: lock, fresh history).
-_BOOK_BUDGET = 7.0
+_BOOK_BUDGET = 5.0  # + a 1-5 s say for the commit, still < 10 s
 # Hospital: time.monotonic() at which this turn stops waiting on the Ledger (handle); else None.
 _BOOK_BY: ContextVar[float | None] = ContextVar("book_by", default=None)
 
 
 async def _say(city: City, to: str, text: str) -> bool:
     key = (getattr(city.inbound, "need_id", None) or "", to, text)
-    if _HOSPITAL.get() and time.monotonic() - _BOUNCED.get(key, float("-inf")) < _BOUNCE_TTL:
+    # Only a citizen can stay invisible (another ASST's): the Ledger and agents bounce only while
+    # the hospital is down, and messages to us bounce then too, so a later turn means it is back.
+    citizen = to.startswith("citizen:")
+    if _HOSPITAL.get() and citizen and time.monotonic() - _BOUNCED.get(key, float("-inf")) < _BOUNCE_TTL:
         return False
     try:
-        msg_id = await city.say(to, text)
+        try:
+            msg_id = await city.say(to, text)
+        except CapError:
+            raise
+        except Exception:  # noqa: BLE001 - hospital: one retry on a timeout (only a 4xx is final)
+            if not _HOSPITAL.get():
+                raise
+            msg_id = await city.say(to, text)
     except CapError as exc:
-        if _HOSPITAL.get() and exc.code == "TARGET_NOT_VISIBLE":
+        if _HOSPITAL.get() and citizen and exc.code == "TARGET_NOT_VISIBLE":
             now = time.monotonic()
             for old in [k for k, at in _BOUNCED.items() if now - at >= _BOUNCE_TTL]:
                 del _BOUNCED[old]
@@ -1790,7 +1801,10 @@ async def _hospital(city: City, message: Message, chat: list[Message]) -> None:
                     await asyncio.gather(_ask_slots(city, message, chat), booking)
                 else:
                     await booking
-        if confirm or (message.sender == LEDGER and head in {"held", "committed"}):
+        by = _BOOK_BY.get()
+        late = confirm and by is not None and time.monotonic() > by
+        # Past the budget the confirm turn ends: the held/committed push sends the welcome (once).
+        if (confirm and not late) or (message.sender == LEDGER and head in {"held", "committed"}):
             # Proactive (judge: "physical address + register arrival by chat"): the welcome names
             # our door; it already says how to register the arrival by chat. Without a street,
             # _welcome's own default text.
