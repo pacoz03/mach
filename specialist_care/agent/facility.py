@@ -238,7 +238,13 @@ async def handle(role: str, need: Need, city: City) -> None:
     message = city.inbound
     if message is None:
         return
-    chat = await city.history(need_id=message.need_id)
+    if role == "family_counseling" and message.sender.startswith("agent:"):
+        try:
+            chat = await asyncio.wait_for(city.history(need_id=message.need_id), timeout=1.0)
+        except (CapError, TimeoutError):
+            chat = []
+    else:
+        chat = await city.history(need_id=message.need_id)
     street = _own_street(city)
     if street and _asks_address(message):
         await city.say(message.sender, f"address={street}")
@@ -287,6 +293,12 @@ async def handle(role: str, need: Need, city: City) -> None:
                     place_en="the cardiology clinic where your visit will take place",
                 )
     elif role == "family_counseling":
+        # As the specialist: a late agenda/world answer, as its own Ledger turn, refreshes the
+        # city clock and the CONS-GIN cache that partner requests are answered from.
+        if message.sender == LEDGER and first_word(message.text) == "agenda":
+            _ledger([message], "agenda")
+        if message.sender == LEDGER and _keep_world_reply(message):
+            return
         await _family(city, message, chat)
 
 
@@ -1784,13 +1796,16 @@ async def _cross_asst(
     async with _gated(key):
         sent = _sent(key)
         try:
-            chat = await city.history(need_id=message.need_id)
-        except CapError:
+            chat = await asyncio.wait_for(city.history(need_id=message.need_id), timeout=1.0) if procedures == ("CONS-GIN",) else await city.history(need_id=message.need_id)
+        except (CapError, TimeoutError):
             chat = []
         agent = city.agent_id
-        if sent.offers or _answered(chat, agent, message.msg_id, sender) or tag and any(
+        completed_chat = [row for row in chat if not (
+            procedures == ("CONS-GIN",) and row.sender == agent and row.recipient == sender
+            and first_word(row.text) not in {"offer", "cancel", "booking.receipt"})]
+        if sent.offers or _answered(completed_chat, agent, message.msg_id, sender) or tag and any(
             row.sender == agent and row.recipient == sender and tag in row.text.split()
-            for row in chat
+            for row in completed_chat
         ):
             return
         procedure = fields.get("procedure") or procedures[0]
@@ -1806,6 +1821,8 @@ async def _cross_asst(
             # The specialist gets the same search (2 world pages, city clock, relaxed dates);
             # only the hospital's rare-language (h3) step stays its own.
             rich = hospital or procedures == _CARDIOLOGY
+            family = procedures == ("CONS-GIN",)
+            use_cache = rich or family
             known = {row.msg_id for row in chat}
 
             def fresh(rows: list[Message]) -> list[Message]:
@@ -1813,7 +1830,7 @@ async def _cross_asst(
 
             def clock(rows: list[Message]) -> datetime | None:
                 agenda = _ledger(fresh(rows), "agenda")  # a fresh reply also refreshes _CLOCK
-                cached = _city_now() if rich else None
+                cached = _city_now() if use_cache else None
                 return cached or _when("" if agenda is None else agenda.get("agenda_now", ""))
 
             def page_of(rows: list[Message], page: int) -> str | None:
@@ -1822,7 +1839,7 @@ async def _cross_asst(
 
             def warm(page: int) -> str | None:
                 # Hospital, specialist: a fresh cached page and a known city clock answer at once.
-                hit = _WORLD.get((procedure, page)) if rich else None
+                hit = _WORLD.get((procedure, page)) if use_cache else None
                 if hit is None or time.monotonic() - hit[0] > _WORLD_FRESH or not _city_now():
                     return None
                 return hit[1]
@@ -1830,6 +1847,8 @@ async def _cross_asst(
             if warm(1) is not None:
                 later.append("agenda")  # a say to the Ledger takes 1-5 s live: after the answer
             else:
+                if family:
+                    await _say(city, sender, f"request_id={rid} Ricevuto: sto verificando le disponibilità sul registro. Non ho ancora un esito.")
                 await _say(city, LEDGER, "agenda")
             page = 1
             found: list[dict[str, str]] = []
@@ -1849,12 +1868,23 @@ async def _cross_asst(
                         lambda rows, page=page: page_of(rows, page) is not None
                         and clock(rows) is not None,
                         tries=_SHORT_TRIES,
-                        deadline=deadline if rich else None,
+                        deadline=deadline if use_cache else None,
                     )
                     world = page_of(rows, page)
-                    if rich:
+                    if use_cache:
                         _keep_world(procedure, fresh(rows))
                         owed = owed if world else page
+                if family and (world is None or clock(rows) is None):
+                    # A slow Ledger is not evidence of no availability. Acknowledge, then
+                    # keep ownership of the request and send the real result when it arrives.
+                    rows = await _until(city, message.need_id, chat,
+                                        lambda rs: page_of(rs, page) is not None and clock(rs) is not None,
+                                        deadline=start + _WORLD_WAIT)
+                    world = page_of(rows, page)
+                    _keep_world(procedure, fresh(rows))
+                    if world is None or clock(rows) is None:
+                        _LOG.info("care.family.availability_pending", extra={"request_id": rid})
+                        return
                 now = clock(rows) or (_day_after(world) if rich and world else None)
                 if world is None or now is None:
                     break
@@ -1929,7 +1959,12 @@ async def _cross_asst(
             )
         # Marked even if the say fails: a redelivery is not a retry after a 4xx.
         sent.offers.add(key)
-        await _say(city, sender, text)
+        delivered = await _say(city, sender, text)
+        if procedures == ("CONS-GIN",):
+            _LOG.info("care.family.cross_reply", extra={"request_id": rid,
+                      "elapsed_seconds": round(time.monotonic() - start, 3),
+                      "delivered": delivered, "cached": bool(later),
+                      "result": "offer" if chosen else "no_availability"})
         if owed and not hospital:
             # Specialist: the fast reply (+1, R:246) is measured on the ack, sent at the end of
             # the turn: end it now. The late reads go out in the background, and the Ledger's
@@ -1937,18 +1972,18 @@ async def _cross_asst(
             if later:
                 _background(_say_later(city, list(later)))
             return
-        if owed:
-            for read in later:
-                await _say(city, LEDGER, read)
-            # Answered without a world reply: wait for it now, so the next request finds it.
-            rows = await _until(
-                city,
-                message.need_id,
-                chat,
-                lambda rows: page_of(rows, owed) is not None and clock(rows) is not None,
-                deadline=start + _WORLD_WAIT,
-            )
-            _keep_world(procedure, fresh(rows))
+    if owed:
+        for read in later:
+            await _say(city, LEDGER, read)
+        # Answered without a world reply: wait for it now, so the next request finds it.
+        rows = await _until(
+            city,
+            message.need_id,
+            chat,
+            lambda rows: page_of(rows, owed) is not None and clock(rows) is not None,
+            deadline=start + _WORLD_WAIT,
+        )
+        _keep_world(procedure, fresh(rows))
 
 
 # Background work of this process (late Ledger reads): kept referenced until it is done.
